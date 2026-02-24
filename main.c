@@ -130,6 +130,7 @@ static volatile float g_ppm_correction = 0.0f;
 static volatile uint8_t g_cw_test_mode = 0;  // 1 = CW test active (blocks normal Core1 operation)
 static volatile int8_t g_tx_power_max_dbm = PWR_MAX_DBM;  // Runtime TX power limit
 static volatile uint8_t g_tx_enabled = 1;  // TX enable flag (for GUI TX button)
+static volatile uint8_t g_tx_live = 0;  // 1 when radio is currently transmitting RF
 
 // --- Hilbert ---
 #define HILBERT_TAPS        247
@@ -628,6 +629,7 @@ static void sx_test_cw(void) {
     
     // Start CW
     sx_start_tx_continuous_wave();
+    g_tx_live = 1;
     sleep_ms(5);  // Give chip time to start TX
     uint8_t status = sx_get_status();
     cdc_printf("Status after CW: 0x%02X (mode=%d)\r\n", status, (status >> 5) & 0x07);
@@ -644,6 +646,7 @@ static void sx_test_cw(void) {
 static void sx_stop_cw(void) {
 #if CFG_TUD_CDC
     gpio_put(PIN_TX_EN, 0);
+    g_tx_live = 0;
 #if USE_TCXO_MODULE
     sx_set_standby_xosc();
 #else
@@ -988,7 +991,7 @@ static void cfg_print(void) {
 
     cdc_printf(
         "CFG:\r\n"
-        "  freq=%.1f Hz (target)  ppm=%.3f  tx=%s  txpwr=%d dBm\r\n"
+        "  freq=%.1f Hz (target)  ppm=%.3f  tx=%s  txlive=%s  txpwr=%d dBm\r\n"
         "  corrected=%.1f Hz  base_steps=%lu  fine=%.1f Hz (auto)\r\n"
         "  enable bp=%u eq=%u comp=%u\r\n"
         "  bp_lo=%.1f bp_hi=%.1f bp_stages=%u (%u dB/oct)\r\n"
@@ -996,7 +999,7 @@ static void cfg_print(void) {
         "  eq_high_hz=%.1f eq_high_db=%.1f\r\n"
         "  comp_thr=%.1f ratio=%.2f att=%.2fms rel=%.2fms makeup=%.1f knee=%.1f outlim=%.3f\r\n"
         "  amp_gain=%.3f amp_min_a=%.9f\r\n",
-        g_target_freq_hz, g_ppm_correction, g_tx_enabled ? "ON" : "OFF", g_tx_power_max_dbm,
+        g_target_freq_hz, g_ppm_correction, g_tx_enabled ? "ON" : "OFF", g_tx_live ? "ON" : "OFF", g_tx_power_max_dbm,
         corrected, (unsigned long)get_base_steps(), fine,
         c.enable_bandpass, c.enable_eq, c.enable_comp,
         c.bp_lo_hz, c.bp_hi_hz, c.bp_stages, c.bp_stages * 12,
@@ -1014,6 +1017,7 @@ static void cmd_help(void) {
         "  get\r\n"
         "  diag          - show SX1280 status\r\n"
         "  tx 0|1        - enable/disable TX (SSB modulation)\r\n"
+        "  txlive        - show if RF carrier is currently active\r\n"
         "  cw            - start CW test transmission\r\n"
         "  stop          - stop CW transmission\r\n"
         "  freq <Hz>     - set frequency with sub-Hz precision (e.g. freq 2400100050.5)\r\n"
@@ -1071,7 +1075,13 @@ static void cdc_handle_line(char *line) {
             return; 
         }
         g_tx_enabled = v;
+        if (!g_tx_enabled) g_tx_live = 0;
         cdc_printf("OK tx=%s\r\n", g_tx_enabled ? "ON" : "OFF");
+        return;
+    }
+
+    if (streqi(argv[0], "txlive")) {
+        cdc_printf("OK txlive=%u\r\n", (unsigned)g_tx_live);
         return;
     }
 
@@ -1344,6 +1354,7 @@ static void core1_radio_apply_loop(void) {
                     else         sx_set_standby_rc();
 #endif
                     last_tx_on = (bool)c.tx_on;
+                    g_tx_live = last_tx_on ? 1u : 0u;
                 }
 
                 if (c.freq_steps != last_steps) {
