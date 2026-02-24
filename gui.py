@@ -302,6 +302,7 @@ class SX1280ControlApp(ttk.Frame):
         # Connection
         self.port_var = tk.StringVar()
         self.status_var = tk.StringVar(value="⚫ Disconnected")
+        self.tx_live_var = tk.StringVar(value="⚪ IDLE")
         
         # RF
         self.freq_mhz_var = tk.DoubleVar(value=self.config.freq_hz / 1_000_000)
@@ -429,6 +430,20 @@ class SX1280ControlApp(ttk.Frame):
                                     command=self._toggle_tx, relief="raised", bd=3)
         self.tx_button.pack(side="left", padx=5)
         self._update_tx_button()
+
+        self.tx_live_label = tk.Label(
+            tx_btn_frame,
+            textvariable=self.tx_live_var,
+            width=10,
+            font=("TkDefaultFont", 10, "bold"),
+            relief="groove",
+            bd=2,
+            padx=8,
+            pady=3,
+            bg="#dddddd",
+            fg="black"
+        )
+        self.tx_live_label.pack(side="left", padx=(8, 5))
         
         # Scroll tuning toggle
         self.scroll_tune_cb = ttk.Checkbutton(tx_btn_frame, text="🖱️ Scroll Tune (50 Hz/step)", 
@@ -743,8 +758,10 @@ class SX1280ControlApp(ttk.Frame):
             self.worker.connect(port)
             self.status_var.set(f"🟢 Connected: {port}")
             self._log(f"Connected to {port}", "info")
+            self._set_tx_live(False)
             # Request current config
             self.master.after(500, lambda: self._send_cmd_safe("get"))
+            self.master.after(700, self._poll_tx_live)
         except Exception as e:
             messagebox.showerror("Connection failed", str(e))
             self.status_var.set("🔴 Connection failed")
@@ -752,7 +769,21 @@ class SX1280ControlApp(ttk.Frame):
     def _disconnect(self):
         self.worker.disconnect()
         self.status_var.set("⚫ Disconnected")
+        self._set_tx_live(False)
         self._log("Disconnected", "info")
+
+    def _set_tx_live(self, is_live: bool):
+        if is_live:
+            self.tx_live_var.set("🔴 LIVE")
+            self.tx_live_label.config(bg="#d60000", fg="white")
+        else:
+            self.tx_live_var.set("⚪ IDLE")
+            self.tx_live_label.config(bg="#dddddd", fg="black")
+
+    def _poll_tx_live(self):
+        if self.worker.is_connected():
+            self._send_cmd_safe("txlive")
+            self.master.after(250, self._poll_tx_live)
 
     # === Command Methods ===
     
@@ -1106,6 +1137,12 @@ class SX1280ControlApp(ttk.Frame):
             while True:
                 line = self.rx_queue.get_nowait()
                 self._log(line, "recv")
+                if line.startswith("OK txlive="):
+                    self._set_tx_live(line.rstrip().endswith("1"))
+                else:
+                    m = re.search(r"\btxlive=(ON|OFF)\b", line)
+                    if m:
+                        self._set_tx_live(m.group(1) == "ON")
         except queue.Empty:
             pass
         self.master.after(50, self._poll_rx)
