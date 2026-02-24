@@ -1,0 +1,501 @@
+diff --git a/gui.py b/gui.py
+index ebb72b2e200331b84bbf12087c32b9217c14f39d..a33bcbdbd79d30a03776030136534ac7fafd3309 100644
+--- a/gui.py
++++ b/gui.py
+@@ -1,45 +1,58 @@
+ #!/usr/bin/env python3
+ """
+ SX1280 QO-100 SSB TX Control GUI
+ ================================
+ Modern, responsive GUI for controlling the SX1280 SDR transmitter.
+ Supports all CDC commands and real-time parameter adjustment.
+ 
+ Author: SP8ESA
+ License: CC BY-NC 4.0
+ """
+ 
+ import tkinter as tk
+ from tkinter import ttk, messagebox
+ import threading
+ import time
+ import queue
+ import re
+ from dataclasses import dataclass
+ from typing import Optional, Callable
+ 
++
++MORSE_CODE_MAP = {
++    "A": ".-", "B": "-...", "C": "-.-.", "D": "-..", "E": ".",
++    "F": "..-.", "G": "--.", "H": "....", "I": "..", "J": ".---",
++    "K": "-.-", "L": ".-..", "M": "--", "N": "-.", "O": "---",
++    "P": ".--.", "Q": "--.-", "R": ".-.", "S": "...", "T": "-",
++    "U": "..-", "V": "...-", "W": ".--", "X": "-..-", "Y": "-.--",
++    "Z": "--..", "0": "-----", "1": ".----", "2": "..---", "3": "...--",
++    "4": "....-", "5": ".....", "6": "-....", "7": "--...", "8": "---..",
++    "9": "----.", "/": "-..-.", "?": "..--..", ".": ".-.-.-", ",": "--..--",
++    "=": "-...-", "+": ".-.-.", "-": "-....-", "(": "-.--.", ")": "-.--.-",
++}
++
+ # ---- serial
+ try:
+     import serial
+     import serial.tools.list_ports
+     HAS_SERIAL = True
+ except ImportError:
+     serial = None
+     HAS_SERIAL = False
+ 
+ 
+ # ============================================================
+ # CONFIGURATION DATACLASS
+ # ============================================================
+ 
+ @dataclass
+ class TxConfig:
+     """Mirrors the firmware's audio_cfg_t structure"""
+     # RF
+     freq_hz: float = 2_400_400_000.0  # Now supports sub-Hz precision
+     ppm: float = 0.0
+     tx_power_dbm: int = 13  # Max TX power on SX1280 chip (-18 to +13 dBm)
+     tx_enabled: bool = True
+     
+     # Enables
+     enable_bp: bool = True
+@@ -236,115 +249,125 @@ class LabeledScale(ttk.Frame):
+         else:
+             text = self.format_str.format(v)
+         self.value_label.config(text=text)
+ 
+ 
+ # ============================================================
+ # MAIN APPLICATION
+ # ============================================================
+ 
+ class SX1280ControlApp(ttk.Frame):
+     """Main application window"""
+     
+     # RF limits for QO-100 uplink
+     FREQ_MIN_HZ = 2_400_000_000
+     FREQ_MAX_HZ = 2_400_500_000
+     FREQ_STEP_HZ = 100
+ 
+     def __init__(self, master: tk.Tk):
+         super().__init__(master)
+         self.master = master
+         
+         # State
+         self.config = TxConfig()
+         self.rx_queue: queue.Queue = queue.Queue()
+         self.worker = SerialWorker(self.rx_queue)
++        self.cw_stop_evt = threading.Event()
++        self.cw_thread: Optional[threading.Thread] = None
+         
+         # Debouncers (kept for other sliders, but freq/ppm are now immediate)
+         self.debounced_send = Debouncer(master, 150, self._send_cmd_safe)
+         self.freq_debouncer = Debouncer(master, 200, self._send_freq)
+         
+         # Build UI
+         self._create_variables()
+         self._build_ui()
+         
+         # Initialize displays
+         self._update_freq_display()
+         
+         # Global scroll binding for frequency tuning (works anywhere in window)
+         master.bind_all("<Button-4>", self._on_global_scroll)  # Linux scroll up
+         master.bind_all("<Button-5>", self._on_global_scroll)  # Linux scroll down
+         master.bind_all("<MouseWheel>", self._on_global_scroll)  # Windows/macOS
++        master.bind_all("<Escape>", self._on_escape_stop)
+         
+         self._poll_rx()
+         
+         # Pack main frame
+         self.pack(fill="both", expand=True)
+ 
+     def _create_variables(self):
+         """Create all Tk variables"""
+         # Connection
+         self.port_var = tk.StringVar()
+         self.status_var = tk.StringVar(value="⚫ Disconnected")
+         
+         # RF
+         self.freq_mhz_var = tk.DoubleVar(value=self.config.freq_hz / 1_000_000)
+         self.freq_hz_var = tk.StringVar(value=str(self.config.freq_hz))
+         self.ppm_var = tk.DoubleVar(value=0.0)
+         self.txpwr_var = tk.IntVar(value=self.config.tx_power_dbm)
+         self.tx_enabled_var = tk.BooleanVar(value=True)
+         self.scroll_tune_enabled_var = tk.BooleanVar(value=False)  # Scroll tuning on/off
+         
+         # Enables
+         self.en_bp_var = tk.BooleanVar(value=self.config.enable_bp)
+         self.en_eq_var = tk.BooleanVar(value=self.config.enable_eq)
+         self.en_comp_var = tk.BooleanVar(value=self.config.enable_comp)
+         
+         # Bandpass
+         self.bp_lo_var = tk.DoubleVar(value=self.config.bp_lo_hz)
+         self.bp_hi_var = tk.DoubleVar(value=self.config.bp_hi_hz)
+         self.bp_stages_var = tk.IntVar(value=self.config.bp_stages)
+         
+         # EQ
+         self.eq_low_hz_var = tk.DoubleVar(value=self.config.eq_low_hz)
+         self.eq_low_db_var = tk.DoubleVar(value=self.config.eq_low_db)
+         self.eq_high_hz_var = tk.DoubleVar(value=self.config.eq_high_hz)
+         self.eq_high_db_var = tk.DoubleVar(value=self.config.eq_high_db)
+         
+         # Compressor
+         self.comp_thr_var = tk.DoubleVar(value=self.config.comp_thr_db)
+         self.comp_ratio_var = tk.DoubleVar(value=self.config.comp_ratio)
+         self.comp_att_var = tk.DoubleVar(value=self.config.comp_attack_ms)
+         self.comp_rel_var = tk.DoubleVar(value=self.config.comp_release_ms)
+         self.comp_makeup_var = tk.DoubleVar(value=self.config.comp_makeup_db)
+         self.comp_knee_var = tk.DoubleVar(value=self.config.comp_knee_db)
+         self.comp_outlim_var = tk.DoubleVar(value=self.config.comp_out_limit)
+         
+         # Power shaping
+         self.amp_gain_var = tk.DoubleVar(value=self.config.amp_gain)
+         self.amp_min_a_var = tk.StringVar(value=f"{self.config.amp_min_a:.9f}")
+ 
++        # CW text mode
++        self.cw_text_var = tk.StringVar(value="CQ CQ DE SX1280")
++        self.cw_wpm_var = tk.IntVar(value=18)
++        self.cw_preview_char_var = tk.StringVar(value="-")
++        self.cw_preview_symbol_var = tk.StringVar(value="-")
++        self.cw_preview_state_var = tk.StringVar(value="Idle")
++
+     def _build_ui(self):
+         """Build the user interface"""
+         self.master.title("SX1280 QO-100 SSB TX Control")
+         self.master.geometry("900x800")
+         self.master.minsize(600, 500)
+         
+         # Configure grid weights for responsive layout
+         self.columnconfigure(0, weight=1)
+         self.rowconfigure(1, weight=1)
+         
+         # === Connection Bar ===
+         self._build_connection_bar()
+         
+         # === Main Content (Notebook) ===
+         self.notebook = ttk.Notebook(self)
+         self.notebook.grid(row=1, column=0, sticky="nsew", padx=5, pady=5)
+         
+         # Tab 1: RF & DSP
+         self._build_dsp_tab()
+         
+         # Tab 2: TX Control
+         self._build_tx_tab()
+         
+         # Tab 3: Console
+         self._build_console_tab()
+@@ -565,50 +588,80 @@ class SX1280ControlApp(ttk.Frame):
+         ttk.Button(amp_min_frame, text="Set", 
+                    command=lambda: self._send_cmd_safe(f"set amp_min_a {self.amp_min_a_var.get()}")
+                   ).pack(side="left")
+ 
+     def _build_tx_tab(self):
+         """Build the TX control tab"""
+         tab = ttk.Frame(self.notebook, padding=10)
+         self.notebook.add(tab, text="TX Control")
+         
+         tab.columnconfigure(0, weight=1)
+         
+         # === CW Test ===
+         cw_frame = ttk.LabelFrame(tab, text="CW Test Mode", padding=20)
+         cw_frame.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+         
+         ttk.Label(cw_frame, text="Transmit continuous carrier for testing:").pack(anchor="w")
+         
+         btn_frame = ttk.Frame(cw_frame)
+         btn_frame.pack(pady=10)
+         
+         self.cw_btn = ttk.Button(btn_frame, text="▶ Start CW", command=self._start_cw, width=15)
+         self.cw_btn.pack(side="left", padx=10)
+         
+         self.stop_btn = ttk.Button(btn_frame, text="⏹ Stop", command=self._stop_cw, width=15)
+         self.stop_btn.pack(side="left", padx=10)
++
++        ttk.Separator(cw_frame, orient="horizontal").pack(fill="x", pady=10)
++
++        ttk.Label(cw_frame, text="Send CW text (Morse code):").pack(anchor="w", pady=(0, 5))
++
++        cw_text_entry = ttk.Entry(cw_frame, textvariable=self.cw_text_var)
++        cw_text_entry.pack(fill="x", pady=(0, 8))
++        cw_text_entry.bind("<Return>", lambda _e: self._start_cw_text())
++
++        wpm_frame = ttk.Frame(cw_frame)
++        wpm_frame.pack(fill="x", pady=(0, 8))
++        ttk.Label(wpm_frame, text="WPM:").pack(side="left")
++        ttk.Scale(wpm_frame, from_=5, to=40, orient=tk.HORIZONTAL,
++                  variable=self.cw_wpm_var).pack(side="left", fill="x", expand=True, padx=8)
++        ttk.Label(wpm_frame, textvariable=self.cw_wpm_var, width=4).pack(side="left")
++
++        self.cw_text_btn = ttk.Button(cw_frame, text="📡 Send CW Text", command=self._start_cw_text)
++        self.cw_text_btn.pack(anchor="w")
++
++        self.cw_abort_btn = ttk.Button(cw_frame, text="⛔ Abort CW (Esc)", command=self._abort_cw_text)
++        self.cw_abort_btn.pack(anchor="w", pady=(6, 0))
++
++        preview_frame = ttk.LabelFrame(cw_frame, text="CW Live Preview", padding=8)
++        preview_frame.pack(fill="x", pady=(10, 0))
++        ttk.Label(preview_frame, text="Character:").grid(row=0, column=0, sticky="w")
++        ttk.Label(preview_frame, textvariable=self.cw_preview_char_var, width=20).grid(row=0, column=1, sticky="w", padx=(8, 0))
++        ttk.Label(preview_frame, text="Symbol:").grid(row=1, column=0, sticky="w")
++        ttk.Label(preview_frame, textvariable=self.cw_preview_symbol_var, width=20).grid(row=1, column=1, sticky="w", padx=(8, 0))
++        ttk.Label(preview_frame, text="State:").grid(row=2, column=0, sticky="w")
++        ttk.Label(preview_frame, textvariable=self.cw_preview_state_var, width=20).grid(row=2, column=1, sticky="w", padx=(8, 0))
+         
+         # === Quick Commands ===
+         cmd_frame = ttk.LabelFrame(tab, text="Quick Commands", padding=20)
+         cmd_frame.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+         
+         quick_btns = ttk.Frame(cmd_frame)
+         quick_btns.pack()
+         
+         ttk.Button(quick_btns, text="GET Config", command=lambda: self._send_cmd_safe("get"), 
+                    width=15).pack(side="left", padx=5)
+         ttk.Button(quick_btns, text="DIAG", command=lambda: self._send_cmd_safe("diag"),
+                    width=15).pack(side="left", padx=5)
+         ttk.Button(quick_btns, text="HELP", command=lambda: self._send_cmd_safe("help"),
+                    width=15).pack(side="left", padx=5)
+         
+         # === Manual Command ===
+         manual_frame = ttk.LabelFrame(tab, text="Manual Command", padding=10)
+         manual_frame.grid(row=2, column=0, sticky="ew", pady=(0, 10))
+         manual_frame.columnconfigure(0, weight=1)
+         
+         self.manual_cmd_var = tk.StringVar()
+         cmd_entry = ttk.Entry(manual_frame, textvariable=self.manual_cmd_var)
+         cmd_entry.grid(row=0, column=0, sticky="ew", padx=(0, 5))
+         cmd_entry.bind("<Return>", lambda e: self._send_manual_cmd())
+         
+@@ -678,56 +731,65 @@ class SX1280ControlApp(ttk.Frame):
+         port = self.port_map.get(label)
+         if not port or "no ports" in label.lower():
+             messagebox.showerror("No port", "No serial port selected.")
+             return
+         
+         try:
+             self.worker.connect(port)
+             self.status_var.set(f"🟢 Connected: {port}")
+             self._log(f"Connected to {port}", "info")
+             # Request current config
+             self.master.after(500, lambda: self._send_cmd_safe("get"))
+         except Exception as e:
+             messagebox.showerror("Connection failed", str(e))
+             self.status_var.set("🔴 Connection failed")
+ 
+     def _disconnect(self):
+         self.worker.disconnect()
+         self.status_var.set("⚫ Disconnected")
+         self._log("Disconnected", "info")
+ 
+     # === Command Methods ===
+     
+     def _send_cmd_safe(self, cmd: str):
+         try:
+             if not self.worker.is_connected():
+-                self._log(f"[NOT CONNECTED] {cmd}", "error")
++                if threading.current_thread() is threading.main_thread():
++                    self._log(f"[NOT CONNECTED] {cmd}", "error")
++                else:
++                    self.master.after(0, lambda: self._log(f"[NOT CONNECTED] {cmd}", "error"))
+                 return
+             self.worker.send_line(cmd)
+-            self._log(f"> {cmd}", "sent")
++            if threading.current_thread() is threading.main_thread():
++                self._log(f"> {cmd}", "sent")
++            else:
++                self.master.after(0, lambda: self._log(f"> {cmd}", "sent"))
+         except Exception as e:
+-            self._log(f"[SEND ERROR] {e}", "error")
++            if threading.current_thread() is threading.main_thread():
++                self._log(f"[SEND ERROR] {e}", "error")
++            else:
++                self.master.after(0, lambda: self._log(f"[SEND ERROR] {e}", "error"))
+ 
+     def _send_enable(self, which: str, enabled: bool):
+         v = "1" if enabled else "0"
+         self._send_cmd_safe(f"enable {which} {v}")
+ 
+     def _toggle_tx(self):
+         """Toggle TX on/off"""
+         current = self.tx_enabled_var.get()
+         new_state = not current
+         self.tx_enabled_var.set(new_state)
+         self._update_tx_button()
+         self._send_cmd_safe(f"tx {'1' if new_state else '0'}")
+ 
+     def _update_tx_button(self):
+         """Update TX button appearance based on state"""
+         if self.tx_enabled_var.get():
+             self.tx_button.config(text="TX ON", bg="#00cc00", fg="white", 
+                                    activebackground="#00ff00", activeforeground="white")
+         else:
+             self.tx_button.config(text="TX OFF", bg="#cccccc", fg="black",
+                                    activebackground="#dddddd", activeforeground="black")
+ 
+     def _on_ppm_slider(self, _val):
+         """Handle PPM slider change - IMMEDIATE response"""
+         ppm = self.ppm_var.get()
+@@ -816,55 +878,160 @@ class SX1280ControlApp(ttk.Frame):
+     def _clamp_freq(self, hz) -> float:
+         """Clamp frequency to valid range (now supports float)"""
+         hz = max(self.FREQ_MIN_HZ, min(self.FREQ_MAX_HZ, hz))
+         return hz
+ 
+     def _send_freq(self, hz):
+         """Send frequency command (supports sub-Hz precision)"""
+         self._send_cmd_safe(f"freq {hz:.1f}")
+ 
+     def _send_freq_from_entry(self):
+         try:
+             hz = float(self.freq_hz_var.get().replace(",", "."))
+             hz = self._clamp_freq(hz)
+             self.freq_hz_var.set(f"{hz:.0f}")
+             self.freq_mhz_var.set(hz / 1_000_000)
+             self._update_freq_display()
+             self._send_cmd_safe(f"freq {hz:.1f}")
+         except ValueError:
+             messagebox.showerror("Invalid frequency", "Frequency must be a number in Hz")
+ 
+     def _send_ppm(self):
+         """Send PPM from slider (now handled by _on_ppm_slider)"""
+         ppm = self.ppm_var.get()
+         self._send_cmd_safe(f"ppm {ppm:.4f}")
+ 
++    def _set_cw_preview(self, char: Optional[str] = None, symbol: Optional[str] = None, state: Optional[str] = None):
++        def apply_update():
++            if char is not None:
++                self.cw_preview_char_var.set(char)
++            if symbol is not None:
++                self.cw_preview_symbol_var.set(symbol)
++            if state is not None:
++                self.cw_preview_state_var.set(state)
++
++        if threading.current_thread() is threading.main_thread():
++            apply_update()
++        else:
++            self.master.after(0, apply_update)
++
+     def _start_cw(self):
++        self.cw_stop_evt.set()
++        self._set_cw_preview(char="Carrier", symbol="ON", state="Continuous CW")
+         self._send_cmd_safe("cw")
+ 
+     def _stop_cw(self):
++        self._abort_cw_text()
++
++    def _abort_cw_text(self):
++        self.cw_stop_evt.set()
++        self._set_cw_preview(symbol="-", state="Aborting...")
+         self._send_cmd_safe("stop")
++        self._set_cw_preview(state="Idle")
++
++    def _on_escape_stop(self, _event):
++        self._abort_cw_text()
++        return "break"
++
++    def _start_cw_text(self):
++        text = self.cw_text_var.get().strip().upper()
++        if not text:
++            messagebox.showerror("CW Text", "Please enter text for CW transmission.")
++            return
++
++        unsupported = sorted({ch for ch in text if ch != " " and ch not in MORSE_CODE_MAP})
++        if unsupported:
++            messagebox.showerror(
++                "CW Text",
++                f"Unsupported characters: {' '.join(unsupported)}"
++            )
++            return
++
++        if self.cw_thread and self.cw_thread.is_alive():
++            messagebox.showinfo("CW Text", "CW text transmission is already running.")
++            return
++
++        self.cw_stop_evt.clear()
++        wpm = max(5, min(40, int(self.cw_wpm_var.get())))
++        self._set_cw_preview(char="-", symbol="-", state=f"Running ({wpm} WPM)")
++        self.cw_thread = threading.Thread(target=self._cw_text_worker, args=(text, wpm), daemon=True)
++        self.cw_thread.start()
++        self._log(f"CW text started ({wpm} WPM): {text}", "info")
++
++    def _cw_text_worker(self, text: str, wpm: int):
++        unit_s = 1.2 / float(wpm)
++
++        def sleep_interruptible(duration_s: float):
++            end = time.time() + duration_s
++            while time.time() < end:
++                if self.cw_stop_evt.is_set():
++                    return False
++                time.sleep(min(0.02, end - time.time()))
++            return True
++
++        for i, ch in enumerate(text):
++            if self.cw_stop_evt.is_set():
++                break
++
++            if ch == " ":
++                self._set_cw_preview(char="(space)", symbol=" ", state="Word gap")
++                if not sleep_interruptible(unit_s * 7):
++                    break
++                continue
++
++            self._set_cw_preview(char=ch, symbol="-", state="Character")
++            code = MORSE_CODE_MAP[ch]
++            for j, symbol in enumerate(code):
++                if self.cw_stop_evt.is_set():
++                    break
++
++                self._set_cw_preview(symbol=symbol, state="Key down")
++                self._send_cmd_safe("cw")
++                tone_len = unit_s if symbol == "." else unit_s * 3
++                if not sleep_interruptible(tone_len):
++                    break
++
++                self._send_cmd_safe("stop")
++                self._set_cw_preview(state="Key up")
++
++                if j < len(code) - 1 and not sleep_interruptible(unit_s):
++                    break
++
++            if self.cw_stop_evt.is_set():
++                break
++
++            if i < len(text) - 1 and text[i + 1] != " ":
++                if not sleep_interruptible(unit_s * 3):
++                    break
++
++        self._send_cmd_safe("stop")
++        if self.cw_stop_evt.is_set():
++            self._set_cw_preview(symbol="-", state="Aborted")
++            self.master.after(0, lambda: self._log("CW text transmission aborted", "info"))
++        else:
++            self._set_cw_preview(char="-", symbol="-", state="Finished")
++            self.master.after(0, lambda: self._log("CW text transmission finished", "info"))
+ 
+     def _send_manual_cmd(self):
+         cmd = self.manual_cmd_var.get().strip()
+         if cmd:
+             self._send_cmd_safe(cmd)
+             self.manual_cmd_var.set("")
+ 
+     def _send_all(self):
+         """Send all current settings to the device"""
+         # RF
+         hz = self._clamp_freq(int(self.freq_hz_var.get()))
+         self._send_cmd_safe(f"freq {hz}")
+         
+         try:
+             ppm = float(self.ppm_var.get().replace(",", "."))
+             if -100 <= ppm <= 100:
+                 self._send_cmd_safe(f"ppm {ppm}")
+         except:
+             pass
+         
+         # TX Power
+         self._send_cmd_safe(f"txpwr {int(self.txpwr_var.get())}")
+         
+         # Enables
+         self._send_cmd_safe(f"enable bp {'1' if self.en_bp_var.get() else '0'}")
+
