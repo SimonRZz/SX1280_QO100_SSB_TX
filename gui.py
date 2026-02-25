@@ -18,6 +18,19 @@ import re
 from dataclasses import dataclass
 from typing import Optional, Callable
 
+
+MORSE_CODE_MAP = {
+    "A": ".-", "B": "-...", "C": "-.-.", "D": "-..", "E": ".",
+    "F": "..-.", "G": "--.", "H": "....", "I": "..", "J": ".---",
+    "K": "-.-", "L": ".-..", "M": "--", "N": "-.", "O": "---",
+    "P": ".--.", "Q": "--.-", "R": ".-.", "S": "...", "T": "-",
+    "U": "..-", "V": "...-", "W": ".--", "X": "-..-", "Y": "-.--",
+    "Z": "--..", "0": "-----", "1": ".----", "2": "..---", "3": "...--",
+    "4": "....-", "5": ".....", "6": "-....", "7": "--...", "8": "---..",
+    "9": "----.", "/": "-..-.", "?": "..--..", ".": ".-.-.-", ",": "--..--",
+    "=": "-...-", "+": ".-.-.", "-": "-....-", "(": "-.--.", ")": "-.--.-",
+}
+
 # ---- serial
 try:
     import serial
@@ -258,6 +271,8 @@ class SX1280ControlApp(ttk.Frame):
         self.config = TxConfig()
         self.rx_queue: queue.Queue = queue.Queue()
         self.worker = SerialWorker(self.rx_queue)
+        self.cw_stop_evt = threading.Event()
+        self.cw_thread: Optional[threading.Thread] = None
         
         # Debouncers (kept for other sliders, but freq/ppm are now immediate)
         self.debounced_send = Debouncer(master, 150, self._send_cmd_safe)
@@ -274,6 +289,7 @@ class SX1280ControlApp(ttk.Frame):
         master.bind_all("<Button-4>", self._on_global_scroll)  # Linux scroll up
         master.bind_all("<Button-5>", self._on_global_scroll)  # Linux scroll down
         master.bind_all("<MouseWheel>", self._on_global_scroll)  # Windows/macOS
+        master.bind_all("<Escape>", self._on_escape_stop)
         
         self._poll_rx()
         
@@ -322,6 +338,13 @@ class SX1280ControlApp(ttk.Frame):
         # Power shaping
         self.amp_gain_var = tk.DoubleVar(value=self.config.amp_gain)
         self.amp_min_a_var = tk.StringVar(value=f"{self.config.amp_min_a:.9f}")
+
+        # CW text mode
+        self.cw_text_var = tk.StringVar(value="CQ CQ DE SX1280")
+        self.cw_wpm_var = tk.IntVar(value=18)
+        self.cw_preview_char_var = tk.StringVar(value="-")
+        self.cw_preview_symbol_var = tk.StringVar(value="-")
+        self.cw_preview_state_var = tk.StringVar(value="Idle")
 
     def _build_ui(self):
         """Build the user interface"""
@@ -587,6 +610,36 @@ class SX1280ControlApp(ttk.Frame):
         
         self.stop_btn = ttk.Button(btn_frame, text="⏹ Stop", command=self._stop_cw, width=15)
         self.stop_btn.pack(side="left", padx=10)
+
+        ttk.Separator(cw_frame, orient="horizontal").pack(fill="x", pady=10)
+
+        ttk.Label(cw_frame, text="Send CW text (Morse code):").pack(anchor="w", pady=(0, 5))
+
+        cw_text_entry = ttk.Entry(cw_frame, textvariable=self.cw_text_var)
+        cw_text_entry.pack(fill="x", pady=(0, 8))
+        cw_text_entry.bind("<Return>", lambda _e: self._start_cw_text())
+
+        wpm_frame = ttk.Frame(cw_frame)
+        wpm_frame.pack(fill="x", pady=(0, 8))
+        ttk.Label(wpm_frame, text="WPM:").pack(side="left")
+        ttk.Scale(wpm_frame, from_=5, to=40, orient=tk.HORIZONTAL,
+                  variable=self.cw_wpm_var).pack(side="left", fill="x", expand=True, padx=8)
+        ttk.Label(wpm_frame, textvariable=self.cw_wpm_var, width=4).pack(side="left")
+
+        self.cw_text_btn = ttk.Button(cw_frame, text="📡 Send CW Text", command=self._start_cw_text)
+        self.cw_text_btn.pack(anchor="w")
+
+        self.cw_abort_btn = ttk.Button(cw_frame, text="⛔ Abort CW (Esc)", command=self._abort_cw_text)
+        self.cw_abort_btn.pack(anchor="w", pady=(6, 0))
+
+        preview_frame = ttk.LabelFrame(cw_frame, text="CW Live Preview", padding=8)
+        preview_frame.pack(fill="x", pady=(10, 0))
+        ttk.Label(preview_frame, text="Character:").grid(row=0, column=0, sticky="w")
+        ttk.Label(preview_frame, textvariable=self.cw_preview_char_var, width=20).grid(row=0, column=1, sticky="w", padx=(8, 0))
+        ttk.Label(preview_frame, text="Symbol:").grid(row=1, column=0, sticky="w")
+        ttk.Label(preview_frame, textvariable=self.cw_preview_symbol_var, width=20).grid(row=1, column=1, sticky="w", padx=(8, 0))
+        ttk.Label(preview_frame, text="State:").grid(row=2, column=0, sticky="w")
+        ttk.Label(preview_frame, textvariable=self.cw_preview_state_var, width=20).grid(row=2, column=1, sticky="w", padx=(8, 0))
         
         # === Quick Commands ===
         cmd_frame = ttk.LabelFrame(tab, text="Quick Commands", padding=20)
@@ -700,12 +753,21 @@ class SX1280ControlApp(ttk.Frame):
     def _send_cmd_safe(self, cmd: str):
         try:
             if not self.worker.is_connected():
-                self._log(f"[NOT CONNECTED] {cmd}", "error")
+                if threading.current_thread() is threading.main_thread():
+                    self._log(f"[NOT CONNECTED] {cmd}", "error")
+                else:
+                    self.master.after(0, lambda: self._log(f"[NOT CONNECTED] {cmd}", "error"))
                 return
             self.worker.send_line(cmd)
-            self._log(f"> {cmd}", "sent")
+            if threading.current_thread() is threading.main_thread():
+                self._log(f"> {cmd}", "sent")
+            else:
+                self.master.after(0, lambda: self._log(f"> {cmd}", "sent"))
         except Exception as e:
-            self._log(f"[SEND ERROR] {e}", "error")
+            if threading.current_thread() is threading.main_thread():
+                self._log(f"[SEND ERROR] {e}", "error")
+            else:
+                self.master.after(0, lambda: self._log(f"[SEND ERROR] {e}", "error"))
 
     def _send_enable(self, which: str, enabled: bool):
         v = "1" if enabled else "0"
@@ -838,11 +900,116 @@ class SX1280ControlApp(ttk.Frame):
         ppm = self.ppm_var.get()
         self._send_cmd_safe(f"ppm {ppm:.4f}")
 
+    def _set_cw_preview(self, char: Optional[str] = None, symbol: Optional[str] = None, state: Optional[str] = None):
+        def apply_update():
+            if char is not None:
+                self.cw_preview_char_var.set(char)
+            if symbol is not None:
+                self.cw_preview_symbol_var.set(symbol)
+            if state is not None:
+                self.cw_preview_state_var.set(state)
+
+        if threading.current_thread() is threading.main_thread():
+            apply_update()
+        else:
+            self.master.after(0, apply_update)
+
     def _start_cw(self):
+        self.cw_stop_evt.set()
+        self._set_cw_preview(char="Carrier", symbol="ON", state="Continuous CW")
         self._send_cmd_safe("cw")
 
     def _stop_cw(self):
+        self._abort_cw_text()
+
+    def _abort_cw_text(self):
+        self.cw_stop_evt.set()
+        self._set_cw_preview(symbol="-", state="Aborting...")
         self._send_cmd_safe("stop")
+        self._set_cw_preview(state="Idle")
+
+    def _on_escape_stop(self, _event):
+        self._abort_cw_text()
+        return "break"
+
+    def _start_cw_text(self):
+        text = self.cw_text_var.get().strip().upper()
+        if not text:
+            messagebox.showerror("CW Text", "Please enter text for CW transmission.")
+            return
+
+        unsupported = sorted({ch for ch in text if ch != " " and ch not in MORSE_CODE_MAP})
+        if unsupported:
+            messagebox.showerror(
+                "CW Text",
+                f"Unsupported characters: {' '.join(unsupported)}"
+            )
+            return
+
+        if self.cw_thread and self.cw_thread.is_alive():
+            messagebox.showinfo("CW Text", "CW text transmission is already running.")
+            return
+
+        self.cw_stop_evt.clear()
+        wpm = max(5, min(40, int(self.cw_wpm_var.get())))
+        self._set_cw_preview(char="-", symbol="-", state=f"Running ({wpm} WPM)")
+        self.cw_thread = threading.Thread(target=self._cw_text_worker, args=(text, wpm), daemon=True)
+        self.cw_thread.start()
+        self._log(f"CW text started ({wpm} WPM): {text}", "info")
+
+    def _cw_text_worker(self, text: str, wpm: int):
+        unit_s = 1.2 / float(wpm)
+
+        def sleep_interruptible(duration_s: float):
+            end = time.time() + duration_s
+            while time.time() < end:
+                if self.cw_stop_evt.is_set():
+                    return False
+                time.sleep(min(0.02, end - time.time()))
+            return True
+
+        for i, ch in enumerate(text):
+            if self.cw_stop_evt.is_set():
+                break
+
+            if ch == " ":
+                self._set_cw_preview(char="(space)", symbol=" ", state="Word gap")
+                if not sleep_interruptible(unit_s * 7):
+                    break
+                continue
+
+            self._set_cw_preview(char=ch, symbol="-", state="Character")
+            code = MORSE_CODE_MAP[ch]
+            for j, symbol in enumerate(code):
+                if self.cw_stop_evt.is_set():
+                    break
+
+                self._set_cw_preview(symbol=symbol, state="Key down")
+                self._send_cmd_safe("cw")
+                tone_len = unit_s if symbol == "." else unit_s * 3
+                if not sleep_interruptible(tone_len):
+                    break
+
+                self._send_cmd_safe("stop")
+                self._set_cw_preview(state="Key up")
+
+                if j < len(code) - 1 and not sleep_interruptible(unit_s):
+                    break
+
+            if self.cw_stop_evt.is_set():
+                break
+
+            if i < len(text) - 1 and text[i + 1] != " ":
+                if not sleep_interruptible(unit_s * 3):
+                    break
+
+        self._send_cmd_safe("stop")
+        if self.cw_stop_evt.is_set():
+            self._set_cw_preview(symbol="-", state="Aborted")
+            self.master.after(0, lambda: self._log("CW text transmission aborted", "info"))
+        else:
+            self._set_cw_preview(char="-", symbol="-", state="Finished")
+            self.master.after(0, lambda: self._log("CW text transmission finished", "info"))
 
     def _send_manual_cmd(self):
         cmd = self.manual_cmd_var.get().strip()
