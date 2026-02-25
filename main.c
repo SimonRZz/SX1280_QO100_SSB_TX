@@ -141,7 +141,7 @@ static const float PLL_STEP_HZ =
 #define F_OFF_LIMIT_HZ      3500.0f
 #define SILENCE_SECONDS     2u
 
-#define GATE_A_REF          0.01f   // Noise gate threshold - higher with compressor
+#define GATE_A_REF_DEFAULT  0.01f   // Default noise gate threshold ("VOX" level)
 #define GATE_SHAPE          1
 
 #define IQ_GAIN_CORR        1.00f
@@ -817,6 +817,7 @@ typedef struct {
 
     float amp_gain;
     float amp_min_a;
+    float vox_level_a;
 } audio_cfg_t;
 
 static volatile audio_cfg_t g_cfg = {
@@ -843,6 +844,7 @@ static volatile audio_cfg_t g_cfg = {
 
     .amp_gain  = AMP_GAIN,
     .amp_min_a = AMP_MIN_A,
+    .vox_level_a = GATE_A_REF_DEFAULT,
 };
 static volatile uint8_t g_cfg_dirty = 1;
 
@@ -881,6 +883,10 @@ static void cfg_sanitize(audio_cfg_t *c, float fs) {
 
     if (c->amp_gain < 0.01f) c->amp_gain = 0.01f;
     if (c->amp_min_a < 1e-9f) c->amp_min_a = 1e-9f;
+
+    // Runtime-adjustable gate/VOX threshold
+    if (c->vox_level_a < 0.0005f) c->vox_level_a = 0.0005f;
+    if (c->vox_level_a > 0.25f) c->vox_level_a = 0.25f;
 
     // Clamp bp_stages to valid range
     if (c->bp_stages < 1) c->bp_stages = 1;
@@ -995,7 +1001,7 @@ static void cfg_print(void) {
         "  eq_low_hz=%.1f eq_low_db=%.1f\r\n"
         "  eq_high_hz=%.1f eq_high_db=%.1f\r\n"
         "  comp_thr=%.1f ratio=%.2f att=%.2fms rel=%.2fms makeup=%.1f knee=%.1f outlim=%.3f\r\n"
-        "  amp_gain=%.3f amp_min_a=%.9f\r\n",
+        "  amp_gain=%.3f amp_min_a=%.9f vox=%.5f\r\n",
         g_target_freq_hz, g_ppm_correction, g_tx_enabled ? "ON" : "OFF", g_tx_power_max_dbm,
         corrected, (unsigned long)get_base_steps(), fine,
         c.enable_bandpass, c.enable_eq, c.enable_comp,
@@ -1003,7 +1009,7 @@ static void cfg_print(void) {
         c.eq_low_hz, c.eq_low_db,
         c.eq_high_hz, c.eq_high_db,
         c.comp_thr_db, c.comp_ratio, c.comp_attack_ms, c.comp_release_ms, c.comp_makeup_db, c.comp_knee_db, c.comp_out_limit,
-        c.amp_gain, c.amp_min_a
+        c.amp_gain, c.amp_min_a, c.vox_level_a
     );
 }
 
@@ -1036,6 +1042,7 @@ static void cmd_help(void) {
         "  set comp_outlim <0..1>\r\n"
         "  set amp_gain <float>\r\n"
         "  set amp_min_a <float>\r\n"
+        "  set vox <float>  - audio gate threshold (higher=harder trigger)\r\n"
         "\r\n"
         "Frequency is automatically split into PLL steps + fine DSP offset.\r\n"
     );
@@ -1165,6 +1172,7 @@ static void cdc_handle_line(char *line) {
         else if (streqi(argv[1], "comp_outlim")) c.comp_out_limit = f;
         else if (streqi(argv[1], "amp_gain"))    c.amp_gain = f;
         else if (streqi(argv[1], "amp_min_a"))   c.amp_min_a = f;
+        else if (streqi(argv[1], "vox"))         c.vox_level_a = f;
         else { cdc_write_str("ERR: unknown key\r\n"); return; }
 
         cfg_commit(&c);
@@ -1252,9 +1260,11 @@ static inline float hilbert_process(float x, float *i_delayed) {
     return y;
 }
 
-static inline float duty_from_A(float A) {
+static inline float duty_from_A(float A, float gate_a_ref) {
     if (A <= 0.0f) return 0.0f;
-    float r = A / GATE_A_REF;
+    float ref = gate_a_ref;
+    if (ref < 0.0005f) ref = 0.0005f;
+    float r = A / ref;
     if (r >= 1.0f) return 1.0f;
 #if GATE_SHAPE == 2
     return r * r;
@@ -1776,7 +1786,7 @@ int main(void) {
 
             int32_t cur_steps = base_steps + f_chosen;
 
-            float duty = duty_from_A(A);
+            float duty = duty_from_A(A, cfg_local.vox_level_a);
 
             int32_t p_chosen = PWR_MIN_DBM;
             uint8_t tx_on = 1;
