@@ -1096,6 +1096,71 @@ class SX1280ControlApp(ttk.Frame):
 
         return True
 
+    def _play_wav_with_aplay(self, wav_path: str, audio_device: str) -> bool:
+        devices = [audio_device]
+        if audio_device.startswith("hw:"):
+            devices.append(audio_device.replace("hw:", "plughw:", 1))
+        devices.append("default")
+
+        uniq_devices = []
+        for d in devices:
+            if d not in uniq_devices:
+                uniq_devices.append(d)
+
+        for dev in uniq_devices:
+            cmd = [
+                "aplay", "-q",
+                "--buffer-time=250000",
+                "--period-time=50000",
+                "-D", dev,
+                wav_path,
+            ]
+            self._run_on_ui_thread(lambda d=dev: self._log(f"FT8 playback via {d}", "info"))
+
+            try:
+                self.ft8_play_proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+            except Exception as e:
+                self._run_on_ui_thread(lambda d=dev, err=str(e): self._log(f"[FT8 ERROR] cannot start aplay on {d}: {err}", "error"))
+                continue
+
+            while self.ft8_play_proc and self.ft8_play_proc.poll() is None:
+                if self.cw_stop_evt.is_set():
+                    try:
+                        self.ft8_play_proc.terminate()
+                    except Exception:
+                        pass
+                    break
+                time.sleep(0.05)
+
+            proc = self.ft8_play_proc
+            self.ft8_play_proc = None
+            if proc is None:
+                continue
+
+            try:
+                stderr_txt = proc.stderr.read().strip() if proc.stderr else ""
+            except Exception:
+                stderr_txt = ""
+
+            rc = proc.returncode
+            if self.cw_stop_evt.is_set():
+                return False
+
+            if rc == 0:
+                return True
+
+            msg = f"[FT8 WARN] aplay failed on {dev} (rc={rc})"
+            if stderr_txt:
+                msg += f": {stderr_txt}"
+            self._run_on_ui_thread(lambda m=msg: self._log(m, "error"))
+
+        return False
+
     def _ft8_cq_worker(self, audio_device: str):
         delay_s = self._next_odd_ft8_slot_delay()
         start_at = time.time() + delay_s
@@ -1128,25 +1193,16 @@ class SX1280ControlApp(ttk.Frame):
                 return
 
             self.ft8_temp_wav = wav_path
-            try:
-                self.ft8_play_proc = subprocess.Popen(["aplay", "-q", "-D", audio_device, wav_path])
-            except Exception as e:
-                self._run_on_ui_thread(lambda err=str(e): messagebox.showerror("FT8 CQ", f"Audio playback failed: {err}"))
-                self._set_cw_preview(symbol="-", state="Playback failed")
-                return
-
             self._set_cw_preview(char="FT8 CQ", symbol="TX", state=f"Playing FT8 (#{cycle})")
 
-            while self.ft8_play_proc and self.ft8_play_proc.poll() is None:
-                if self.cw_stop_evt.is_set():
-                    try:
-                        self.ft8_play_proc.terminate()
-                    except Exception:
-                        pass
-                    break
-                time.sleep(0.05)
-
-            self.ft8_play_proc = None
+            ok = self._play_wav_with_aplay(wav_path, audio_device)
+            if not ok and not self.cw_stop_evt.is_set():
+                self._set_cw_preview(symbol="-", state="Playback failed")
+                self._run_on_ui_thread(lambda: messagebox.showerror(
+                    "FT8 CQ",
+                    "Audio playback failed (aplay). Bitte Device auf plughw:CARD=TX,DEV=0 stellen."
+                ))
+                return
             if self.ft8_temp_wav and os.path.exists(self.ft8_temp_wav):
                 try:
                     os.unlink(self.ft8_temp_wav)
