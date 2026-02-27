@@ -628,7 +628,7 @@ class SX1280ControlApp(ttk.Frame):
         ttk.Label(cw_frame, text="FT8 CQ (odd/uneven 15s slots):").pack(anchor="w", pady=(0, 5))
         self.ft8_btn = ttk.Button(
             cw_frame,
-            text="FT8 CQ Timing (uneven)",
+            text="Send FT8 CQ (uneven loop)",
             command=self._start_ft8_cq_uneven,
         )
         self.ft8_btn.pack(anchor="w", pady=(0, 10))
@@ -996,79 +996,99 @@ class SX1280ControlApp(ttk.Frame):
         self.ft8_thread = threading.Thread(target=self._ft8_cq_worker, daemon=True)
         self.ft8_thread.start()
 
+    def _wait_with_countdown(self, wait_s: float, label_prefix: str) -> bool:
+        end_wait = time.time() + wait_s
+        last_shown = None
+
+        while True:
+            if self.cw_stop_evt.is_set():
+                return False
+
+            remaining = end_wait - time.time()
+            if remaining <= 0:
+                break
+
+            remaining_i = int(math.ceil(remaining))
+            if remaining_i != last_shown:
+                last_shown = remaining_i
+                self._set_cw_preview(char="FT8 CQ", symbol="-", state=f"{label_prefix} {remaining_i}s")
+
+            time.sleep(min(0.1, max(0.01, remaining)))
+
+        return True
+
     def _ft8_cq_worker(self):
         delay_s = self._next_odd_ft8_slot_delay()
         start_at = time.time() + delay_s
-        self._set_cw_preview(char="FT8 CQ", symbol="-", state=f"Waiting {delay_s:.1f}s for odd slot")
         self._run_on_ui_thread(lambda: self._log(
             f"FT8 CQ scheduled for uneven slot at {time.strftime('%H:%M:%S', time.localtime(start_at))}: {self.ft8_cq_text}",
             "info",
         ))
 
-        end_wait = time.time() + delay_s
-        while time.time() < end_wait:
-            if self.cw_stop_evt.is_set():
-                self._set_cw_preview(symbol="-", state="Aborted")
-                self._run_on_ui_thread(lambda: self._log("FT8 CQ aborted before start", "info"))
-                return
-            time.sleep(min(0.02, end_wait - time.time()))
-
-        if self.cw_stop_evt.is_set():
+        if not self._wait_with_countdown(delay_s, "Waiting odd slot:"):
             self._set_cw_preview(symbol="-", state="Aborted")
-            self._run_on_ui_thread(lambda: self._log("FT8 CQ aborted", "info"))
+            self._run_on_ui_thread(lambda: self._log("FT8 CQ aborted before start", "info"))
             return
 
-        self._set_cw_preview(char="FT8 CQ", symbol="TX", state="Generating FT8")
-        self._run_on_ui_thread(lambda: self._log(f"FT8 slot reached, generating waveform: {self.ft8_cq_text}", "info"))
+        cycle = 1
+        while not self.cw_stop_evt.is_set():
+            self._set_cw_preview(char="FT8 CQ", symbol="TX", state=f"Generating FT8 (#{cycle})")
+            self._run_on_ui_thread(lambda n=cycle: self._log(f"FT8 cycle #{n}: generating waveform", "info"))
 
-        wav_path = self._generate_ft8_waveform(self.ft8_cq_text)
-        if not wav_path:
-            self._set_cw_preview(symbol="-", state="FT8 generation failed")
-            return
+            wav_path = self._generate_ft8_waveform(self.ft8_cq_text)
+            if not wav_path:
+                self._set_cw_preview(symbol="-", state="FT8 generation failed")
+                return
 
-        if not shutil.which("aplay"):
-            self._run_on_ui_thread(lambda: messagebox.showerror(
-                "FT8 CQ",
-                "aplay wurde nicht gefunden. Bitte WAV manuell abspielen:\n" + wav_path
-            ))
-            self._set_cw_preview(symbol="-", state="No audio player")
-            return
+            if not shutil.which("aplay"):
+                self._run_on_ui_thread(lambda: messagebox.showerror(
+                    "FT8 CQ",
+                    "aplay wurde nicht gefunden. Bitte WAV manuell abspielen:\n" + wav_path
+                ))
+                self._set_cw_preview(symbol="-", state="No audio player")
+                return
 
-        self.ft8_temp_wav = wav_path
-        try:
-            self.ft8_play_proc = subprocess.Popen(["aplay", "-q", wav_path])
-        except Exception as e:
-            self._run_on_ui_thread(lambda err=str(e): messagebox.showerror("FT8 CQ", f"Audio playback failed: {err}"))
-            self._set_cw_preview(symbol="-", state="Playback failed")
-            return
+            self.ft8_temp_wav = wav_path
+            try:
+                self.ft8_play_proc = subprocess.Popen(["aplay", "-q", wav_path])
+            except Exception as e:
+                self._run_on_ui_thread(lambda err=str(e): messagebox.showerror("FT8 CQ", f"Audio playback failed: {err}"))
+                self._set_cw_preview(symbol="-", state="Playback failed")
+                return
 
-        self._set_cw_preview(char="FT8 CQ", symbol="TX", state="Playing FT8")
-        self._run_on_ui_thread(lambda: self._log("FT8 waveform playback started", "info"))
+            self._set_cw_preview(char="FT8 CQ", symbol="TX", state=f"Playing FT8 (#{cycle})")
 
-        while self.ft8_play_proc and self.ft8_play_proc.poll() is None:
-            if self.cw_stop_evt.is_set():
+            while self.ft8_play_proc and self.ft8_play_proc.poll() is None:
+                if self.cw_stop_evt.is_set():
+                    try:
+                        self.ft8_play_proc.terminate()
+                    except Exception:
+                        pass
+                    break
+                time.sleep(0.05)
+
+            self.ft8_play_proc = None
+            if self.ft8_temp_wav and os.path.exists(self.ft8_temp_wav):
                 try:
-                    self.ft8_play_proc.terminate()
+                    os.unlink(self.ft8_temp_wav)
                 except Exception:
                     pass
-                break
-            time.sleep(0.05)
+                self.ft8_temp_wav = None
 
-        self.ft8_play_proc = None
-        if self.ft8_temp_wav and os.path.exists(self.ft8_temp_wav):
-            try:
-                os.unlink(self.ft8_temp_wav)
-            except Exception:
-                pass
-            self.ft8_temp_wav = None
+            if self.cw_stop_evt.is_set():
+                self._set_cw_preview(symbol="-", state="FT8 aborted")
+                self._run_on_ui_thread(lambda: self._log("FT8 waveform aborted", "info"))
+                return
 
-        if self.cw_stop_evt.is_set():
-            self._set_cw_preview(symbol="-", state="FT8 aborted")
-            self._run_on_ui_thread(lambda: self._log("FT8 waveform aborted", "info"))
-        else:
-            self._set_cw_preview(symbol="-", state="FT8 done")
-            self._run_on_ui_thread(lambda: self._log("FT8 waveform playback finished", "info"))
+            self._run_on_ui_thread(lambda n=cycle: self._log(f"FT8 cycle #{n}: playback finished", "info"))
+            cycle += 1
 
+            if not self._wait_with_countdown(15.0, "Next FT8 in:"):
+                self._set_cw_preview(symbol="-", state="FT8 aborted")
+                self._run_on_ui_thread(lambda: self._log("FT8 loop aborted", "info"))
+                return
+
+        self._set_cw_preview(symbol="-", state="FT8 stopped")
 
     def _build_ft8_symbols(self, message: str):
         """Build a deterministic 79-symbol 8-FSK FT8-style frame for one fixed message."""
