@@ -182,6 +182,37 @@ def list_serial_ports():
     return ports
 
 
+
+
+def list_alsa_playback_devices():
+    """Return available ALSA playback device names for aplay -D."""
+    if not shutil.which("aplay"):
+        return [("default", "default")]
+
+    try:
+        out = subprocess.check_output(["aplay", "-L"], text=True, stderr=subprocess.DEVNULL)
+    except Exception:
+        return [("default", "default")]
+
+    devices = []
+    for line in out.splitlines():
+        if not line or line[0].isspace():
+            continue
+        dev = line.strip()
+        devices.append((dev, dev))
+
+    if not any(d[0] == "default" for d in devices):
+        devices.insert(0, ("default", "default"))
+
+    seen = set()
+    uniq = []
+    for dev, label in devices:
+        if dev in seen:
+            continue
+        seen.add(dev)
+        uniq.append((dev, label))
+    return uniq
+
 class Debouncer:
     """Debounce rapid function calls"""
     
@@ -285,6 +316,7 @@ class SX1280ControlApp(ttk.Frame):
         self.ft8_thread: Optional[threading.Thread] = None
         self.ft8_play_proc: Optional[subprocess.Popen] = None
         self.ft8_temp_wav: Optional[str] = None
+        self.ft8_device_map = {"default": "default"}
         
         # Debouncers (kept for other sliders, but freq/ppm are now immediate)
         self.debounced_send = Debouncer(master, 150, self._send_cmd_safe)
@@ -358,6 +390,7 @@ class SX1280ControlApp(ttk.Frame):
         self.cw_preview_symbol_var = tk.StringVar(value="-")
         self.cw_preview_state_var = tk.StringVar(value="Idle")
         self.ft8_cq_text = "cq de dl1oke jo62"
+        self.ft8_audio_device_var = tk.StringVar(value="default")
 
     def _build_ui(self):
         """Build the user interface"""
@@ -631,7 +664,28 @@ class SX1280ControlApp(ttk.Frame):
             text="Send FT8 CQ (uneven loop)",
             command=self._start_ft8_cq_uneven,
         )
-        self.ft8_btn.pack(anchor="w", pady=(0, 10))
+        self.ft8_btn.pack(anchor="w", pady=(0, 6))
+
+        ft8_dev_frame = ttk.Frame(cw_frame)
+        ft8_dev_frame.pack(fill="x", pady=(0, 10))
+        ttk.Label(ft8_dev_frame, text="FT8 Audio Device:").pack(side="left")
+
+        devs = list_alsa_playback_devices()
+        self.ft8_device_map = {label: dev for dev, label in devs}
+        dev_labels = list(self.ft8_device_map.keys())
+        if dev_labels:
+            if self.ft8_audio_device_var.get() not in dev_labels:
+                self.ft8_audio_device_var.set(dev_labels[0])
+
+        self.ft8_device_combo = ttk.Combobox(
+            ft8_dev_frame,
+            textvariable=self.ft8_audio_device_var,
+            values=dev_labels,
+            state="readonly",
+            width=32,
+        )
+        self.ft8_device_combo.pack(side="left", padx=6, fill="x", expand=True)
+        ttk.Button(ft8_dev_frame, text="🔄", width=3, command=self._refresh_ft8_audio_devices).pack(side="left")
 
         ttk.Separator(cw_frame, orient="horizontal").pack(fill="x", pady=10)
 
@@ -983,6 +1037,15 @@ class SX1280ControlApp(ttk.Frame):
         next_boundary = next_slot * slot_len
         return max(0.0, next_boundary - now_epoch)
 
+    def _refresh_ft8_audio_devices(self):
+        devs = list_alsa_playback_devices()
+        self.ft8_device_map = {label: dev for dev, label in devs}
+        labels = list(self.ft8_device_map.keys())
+        self.ft8_device_combo["values"] = labels
+        if labels and self.ft8_audio_device_var.get() not in labels:
+            self.ft8_audio_device_var.set(labels[0])
+        self._log(f"FT8 audio devices refreshed ({len(labels)})", "info")
+
     def _start_ft8_cq_uneven(self):
         if self.cw_thread and self.cw_thread.is_alive():
             messagebox.showinfo("FT8 CQ", "Eine CW-Übertragung läuft bereits.")
@@ -992,8 +1055,24 @@ class SX1280ControlApp(ttk.Frame):
             messagebox.showinfo("FT8 CQ", "FT8 CQ ist bereits eingeplant/läuft.")
             return
 
+        selected_label = self.ft8_audio_device_var.get()
+        audio_device = self.ft8_device_map.get(selected_label, "default")
+        tx_enabled = bool(self.tx_enabled_var.get())
+        txpwr = int(self.txpwr_var.get())
+
+        if not self.worker.is_connected():
+            self._log("[FT8 WARN] Device not connected via CDC; TX control/power feedback unavailable", "error")
+        if not tx_enabled:
+            self._log("[FT8 WARN] TX button is OFF. No RF output expected.", "error")
+        if txpwr < 10:
+            self._log(f"[FT8 WARN] txpwr is {txpwr} dBm; PA output likely below max", "info")
+        else:
+            self._log(f"[FT8 INFO] txpwr={txpwr} dBm (configured max on SX1280)", "info")
+
+        self._log(f"[FT8 INFO] audio playback device: {audio_device}", "info")
+
         self.cw_stop_evt.clear()
-        self.ft8_thread = threading.Thread(target=self._ft8_cq_worker, daemon=True)
+        self.ft8_thread = threading.Thread(target=self._ft8_cq_worker, args=(audio_device,), daemon=True)
         self.ft8_thread.start()
 
     def _wait_with_countdown(self, wait_s: float, label_prefix: str) -> bool:
@@ -1017,7 +1096,7 @@ class SX1280ControlApp(ttk.Frame):
 
         return True
 
-    def _ft8_cq_worker(self):
+    def _ft8_cq_worker(self, audio_device: str):
         delay_s = self._next_odd_ft8_slot_delay()
         start_at = time.time() + delay_s
         self._run_on_ui_thread(lambda: self._log(
@@ -1050,7 +1129,7 @@ class SX1280ControlApp(ttk.Frame):
 
             self.ft8_temp_wav = wav_path
             try:
-                self.ft8_play_proc = subprocess.Popen(["aplay", "-q", wav_path])
+                self.ft8_play_proc = subprocess.Popen(["aplay", "-q", "-D", audio_device, wav_path])
             except Exception as e:
                 self._run_on_ui_thread(lambda err=str(e): messagebox.showerror("FT8 CQ", f"Audio playback failed: {err}"))
                 self._set_cw_preview(symbol="-", state="Playback failed")
