@@ -119,46 +119,6 @@ Run the GUI:
 python3 gui.py
 ```
 
-
-### External Keying (USB Paddle / HID / Keyboard)
-
-The GUI supports **external CW keying** with `key 1`/`key 0` real-time events and keyer modes:
-
-- Straight
-- Iambic A
-- Iambic B (with squeeze memory extra element behavior)
-
-Input device selection on Linux uses `/dev/input/eventX` via **python-evdev**.
-
-Zusätzlich werden **FTDI/USB-Serial Adapter** als Keying-Quelle unterstützt (z. B. `/dev/ttyUSB0`).
-In der GUI kann dafür der FTDI-Port ausgewählt und die Belegung der Modem-Leitungen (`CTS`, `DSR`, `RI`, `CD`) für Straight/DIT/DAH konfiguriert werden.
-Die Belegung ist zusätzlich über das Menü **External Keying → FTDI Belegung…** erreichbar.
-
-Install dependencies:
-```bash
-sudo apt install python3-evdev
-# and for serial GUI control
-pip install pyserial
-```
-
-Optional local sidetone monitor (PC audio):
-```bash
-pip install simpleaudio
-```
-
-Permissions for `/dev/input/event*` (without root):
-- Add user to `input` group, or
-- create a udev rule granting read access for your paddle device.
-
-FTDI adapter access (without root):
-- add user to `dialout` group (Debian/Ubuntu),
-- then relogin.
-
-When External Keying is enabled in GUI:
-- GUI sends `sidetone <hz>` and `wpm <n>`
-- keyer sends only `key 1` / `key 0` (no continuous `cw` test command)
-- On disable/exit GUI always sends `key 0` and `stop` to avoid stuck TX
-
 ### Carrier Mode
 If USB is not connected within 10 seconds of startup, the device automatically starts CW transmission on 2400.300 MHz at full power.
 
@@ -174,12 +134,8 @@ After connecting USB, a serial port is available with the following commands:
 | `get` | Show current configuration |
 | `diag` | SX1280 and buffer diagnostics |
 | `tx 0/1` | Enable/disable TX (SSB modulation) |
-| `cw` | Start CW test (legacy test mode) |
-| `key 0/1` | External key up/down for real-time keying |
-| `sidetone <Hz>` | Set CW sidetone hint (300..1200) |
-| `wpm <n>` | Set CW speed hint (5..60) |
-| `mode cw/ssb` | Mode hint for GUI workflows |
-| `stop` | Hard stop (CW + TX off) |
+| `cw` | Start CW test |
+| `stop` | Stop CW transmission |
 
 ### Frequency Configuration
 

@@ -130,9 +130,6 @@ static volatile float g_ppm_correction = 0.0f;
 static volatile uint8_t g_cw_test_mode = 0;  // 1 = CW test active (blocks normal Core1 operation)
 static volatile int8_t g_tx_power_max_dbm = PWR_MAX_DBM;  // Runtime TX power limit
 static volatile uint8_t g_tx_enabled = 1;  // TX enable flag (for GUI TX button)
-static volatile uint8_t g_cw_key_down = 0;  // External keying state (key 1/0)
-static volatile uint16_t g_cw_sidetone_hz = 700; // CW sidetone hint for GUI/host
-static volatile uint16_t g_cw_wpm = 20; // Optional WPM hint for GUI/host
 
 // --- Hilbert ---
 #define HILBERT_TAPS        247
@@ -646,7 +643,6 @@ static void sx_test_cw(void) {
 // Stop CW transmission
 static void sx_stop_cw(void) {
 #if CFG_TUD_CDC
-    g_cw_key_down = 0;
     gpio_put(PIN_TX_EN, 0);
 #if USE_TCXO_MODULE
     sx_set_standby_xosc();
@@ -1019,11 +1015,7 @@ static void cmd_help(void) {
         "  diag          - show SX1280 status\r\n"
         "  tx 0|1        - enable/disable TX (SSB modulation)\r\n"
         "  cw            - start CW test transmission\r\n"
-        "  key 0|1       - external key up/down\r\n"
-        "  sidetone <Hz> - set CW sidetone hint (300..1200)\r\n"
-        "  wpm <n>       - set CW WPM hint (5..60)\r\n"
-        "  mode cw|ssb   - force mode hint for host GUI\r\n"
-        "  stop          - hard stop (CW + TX off)\r\n"
+        "  stop          - stop CW transmission\r\n"
         "  freq <Hz>     - set frequency with sub-Hz precision (e.g. freq 2400100050.5)\r\n"
         "  ppm <value>   - set PPM correction (e.g. ppm -0.5)\r\n"
         "  txpwr <-18..13> - set max TX power in dBm\r\n"
@@ -1070,57 +1062,6 @@ static void cdc_handle_line(char *line) {
     if (streqi(argv[0], "diag")) { sx_print_diag(); return; }
     if (streqi(argv[0], "cw"))   { sx_test_cw(); return; }
     if (streqi(argv[0], "stop")) { sx_stop_cw(); return; }
-
-    if (streqi(argv[0], "key") && argc >= 2) {
-        uint8_t v;
-        if (!parse_bool(argv[1], &v)) {
-            cdc_write_str("ERR: key 0|1|on|off\r\n");
-            return;
-        }
-        g_cw_key_down = v ? 1u : 0u;
-        cdc_printf("OK key=%u\r\n", (unsigned)g_cw_key_down);
-        return;
-    }
-
-    if (streqi(argv[0], "sidetone") && argc >= 2) {
-        float hz;
-        if (!parse_f(argv[1], &hz)) {
-            cdc_write_str("ERR: bad sidetone value\r\n");
-            return;
-        }
-        if (hz < 300.0f) hz = 300.0f;
-        if (hz > 1200.0f) hz = 1200.0f;
-        g_cw_sidetone_hz = (uint16_t)hz;
-        cdc_printf("OK sidetone=%u\r\n", (unsigned)g_cw_sidetone_hz);
-        return;
-    }
-
-    if (streqi(argv[0], "wpm") && argc >= 2) {
-        float wpm;
-        if (!parse_f(argv[1], &wpm)) {
-            cdc_write_str("ERR: bad wpm value\r\n");
-            return;
-        }
-        if (wpm < 5.0f) wpm = 5.0f;
-        if (wpm > 60.0f) wpm = 60.0f;
-        g_cw_wpm = (uint16_t)wpm;
-        cdc_printf("OK wpm=%u\r\n", (unsigned)g_cw_wpm);
-        return;
-    }
-
-    if (streqi(argv[0], "mode") && argc >= 2) {
-        if (streqi(argv[1], "cw")) {
-            cdc_write_str("OK mode=cw\r\n");
-            return;
-        }
-        if (streqi(argv[1], "ssb")) {
-            g_cw_key_down = 0;
-            cdc_write_str("OK mode=ssb\r\n");
-            return;
-        }
-        cdc_write_str("ERR: mode cw|ssb\r\n");
-        return;
-    }
 
     // TX enable/disable: tx 0|1
     if (streqi(argv[0], "tx") && argc >= 2) {
@@ -1354,7 +1295,7 @@ static void core1_radio_apply_loop(void) {
     while (true) {
         // If CW test mode is active, skip SPI operations
         if (g_cw_test_mode) {
-            tight_loop_contents();
+            sleep_ms(10);
             continue;
         }
 
@@ -1383,6 +1324,7 @@ static void core1_radio_apply_loop(void) {
         if (!tx_en_activated) {
             gpio_put(PIN_TX_EN, 1);
             tx_en_activated = true;
+            sleep_ms(1);  // Short delay for PA to stabilize
         }
 
         sample_cmd_t *blk = g_blocks[b];
@@ -1872,15 +1814,8 @@ int main(void) {
                 if (p_acc >= 1.0f && p_high != p_low) { p_chosen = p_high; p_acc -= 1.0f; }
             }
 
-            // External CW keying override: stable carrier at center frequency
-            if (g_cw_key_down) {
-                cur_steps = base_steps;
-                p_chosen = (int32_t)g_tx_power_max_dbm;
-                tx_on = 1;
-            }
-
-            // Check global TX enable flag (from GUI TX button), unless external keying is active
-            if (!g_tx_enabled && !g_cw_key_down) {
+            // Check global TX enable flag (from GUI TX button)
+            if (!g_tx_enabled) {
                 tx_on = 0;
             }
 
