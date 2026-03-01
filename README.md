@@ -132,6 +132,7 @@ Input device selection on Linux uses `/dev/input/eventX` via **python-evdev**.
 
 Zusätzlich werden **FTDI/USB-Serial Adapter** als Keying-Quelle unterstützt (z. B. `/dev/ttyUSB0`).
 In der GUI kann dafür der FTDI-Port ausgewählt und die Belegung der Modem-Leitungen (`CTS`, `DSR`, `RI`, `CD`) für Straight/DIT/DAH konfiguriert werden.
+Die Belegung ist zusätzlich über das Menü **External Keying → FTDI Belegung…** erreichbar.
 
 Install dependencies:
 ```bash

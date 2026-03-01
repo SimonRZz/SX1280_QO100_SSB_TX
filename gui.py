@@ -531,6 +531,9 @@ class App(ttk.Frame):
         self.root.bind("<KeyRelease>", self._on_key_release)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
+        self._build_menu()
+        self._update_ftdi_summary()
+
     def _build_ui(self):
         top = ttk.Frame(self)
         top.pack(fill="x", padx=8, pady=8)
@@ -576,34 +579,15 @@ class App(ttk.Frame):
         if not self.sidetone.available():
             ttk.Label(key, text="(Install simpleaudio for local sidetone)").grid(row=5, column=1, sticky="w", pady=(8, 0))
 
-        ftdi_frame = ttk.LabelFrame(key, text="FTDI/USB-Serial Belegung (Modem-Lines)", padding=8)
-        ftdi_frame.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(10, 0))
-        ttk.Label(ftdi_frame, text="Straight Key line:").grid(row=0, column=0, sticky="w")
-        straight_combo = ttk.Combobox(ftdi_frame, textvariable=self.ftdi_straight_line_var,
-                                      values=MODEM_LINE_OPTIONS, state="readonly", width=10)
-        straight_combo.grid(row=0, column=1, sticky="w", padx=(8, 20))
-        straight_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_keyer_params_changed())
-
-        ttk.Label(ftdi_frame, text="DIT line:").grid(row=0, column=2, sticky="w")
-        dit_combo = ttk.Combobox(ftdi_frame, textvariable=self.ftdi_dit_line_var,
-                                 values=MODEM_LINE_OPTIONS, state="readonly", width=10)
-        dit_combo.grid(row=0, column=3, sticky="w", padx=(8, 20))
-        dit_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_keyer_params_changed())
-
-        ttk.Label(ftdi_frame, text="DAH line:").grid(row=0, column=4, sticky="w")
-        dah_combo = ttk.Combobox(ftdi_frame, textvariable=self.ftdi_dah_line_var,
-                                 values=MODEM_LINE_OPTIONS, state="readonly", width=10)
-        dah_combo.grid(row=0, column=5, sticky="w", padx=(8, 20))
-        dah_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_keyer_params_changed())
-
-        ttk.Checkbutton(ftdi_frame, text="Active Low (empfohlen)", variable=self.ftdi_active_low_var,
-                        command=self._on_keyer_params_changed).grid(row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
-        ttk.Label(ftdi_frame, text="Hinweis: FTDI-Eingänge sind typischerweise CTS/DSR/RI/CD.").grid(
-            row=1, column=3, columnspan=3, sticky="w", pady=(6, 0)
-        )
-
         key.columnconfigure(1, weight=1)
-        ftdi_frame.columnconfigure(6, weight=1)
+
+        self.ftdi_summary_var = tk.StringVar()
+        ttk.Label(key, textvariable=self.ftdi_summary_var, foreground="#444").grid(
+            row=6, column=0, columnspan=3, sticky="w", pady=(8, 0)
+        )
+        ttk.Button(key, text="FTDI Belegung…", command=self._open_ftdi_mapping_dialog).grid(
+            row=7, column=0, sticky="w", pady=(8, 0)
+        )
 
         cmd = ttk.LabelFrame(self, text="Manual Commands", padding=10)
         cmd.pack(fill="x", padx=8, pady=8)
@@ -616,6 +600,63 @@ class App(ttk.Frame):
         logf.pack(fill="both", expand=True, padx=8, pady=8)
         self.log_text = tk.Text(logf, height=20)
         self.log_text.pack(fill="both", expand=True)
+
+    def _build_menu(self):
+        menubar = tk.Menu(self.root)
+
+        keying_menu = tk.Menu(menubar, tearoff=0)
+        keying_menu.add_command(label="FTDI Belegung…", command=self._open_ftdi_mapping_dialog)
+        keying_menu.add_separator()
+        keying_menu.add_checkbutton(
+            label="FTDI Active Low",
+            variable=self.ftdi_active_low_var,
+            command=self._on_keyer_params_changed,
+        )
+        menubar.add_cascade(label="External Keying", menu=keying_menu)
+
+        self.root.config(menu=menubar)
+
+    def _open_ftdi_mapping_dialog(self):
+        dlg = tk.Toplevel(self.root)
+        dlg.title("FTDI Belegung")
+        dlg.transient(self.root)
+        dlg.grab_set()
+        dlg.resizable(False, False)
+
+        frm = ttk.Frame(dlg, padding=12)
+        frm.grid(row=0, column=0, sticky="nsew")
+
+        ttk.Label(frm, text="Straight Key line:").grid(row=0, column=0, sticky="w", pady=(0, 8))
+        c1 = ttk.Combobox(frm, textvariable=self.ftdi_straight_line_var, values=MODEM_LINE_OPTIONS, state="readonly", width=10)
+        c1.grid(row=0, column=1, sticky="w", pady=(0, 8))
+
+        ttk.Label(frm, text="DIT line:").grid(row=1, column=0, sticky="w", pady=(0, 8))
+        c2 = ttk.Combobox(frm, textvariable=self.ftdi_dit_line_var, values=MODEM_LINE_OPTIONS, state="readonly", width=10)
+        c2.grid(row=1, column=1, sticky="w", pady=(0, 8))
+
+        ttk.Label(frm, text="DAH line:").grid(row=2, column=0, sticky="w", pady=(0, 8))
+        c3 = ttk.Combobox(frm, textvariable=self.ftdi_dah_line_var, values=MODEM_LINE_OPTIONS, state="readonly", width=10)
+        c3.grid(row=2, column=1, sticky="w", pady=(0, 8))
+
+        ttk.Checkbutton(frm, text="Active Low", variable=self.ftdi_active_low_var).grid(row=3, column=0, columnspan=2, sticky="w", pady=(4, 8))
+
+        def apply_and_close():
+            self._on_keyer_params_changed()
+            dlg.destroy()
+
+        btns = ttk.Frame(frm)
+        btns.grid(row=4, column=0, columnspan=2, sticky="e")
+        ttk.Button(btns, text="Abbrechen", command=dlg.destroy).pack(side="right", padx=(8, 0))
+        ttk.Button(btns, text="Übernehmen", command=apply_and_close).pack(side="right")
+
+        dlg.bind("<Return>", lambda _e: apply_and_close())
+        dlg.bind("<Escape>", lambda _e: dlg.destroy())
+
+    def _update_ftdi_summary(self):
+        polarity = "active-low" if self.ftdi_active_low_var.get() else "active-high"
+        self.ftdi_summary_var.set(
+            f"FTDI: Straight={self.ftdi_straight_line_var.get()} | DIT={self.ftdi_dit_line_var.get()} | DAH={self.ftdi_dah_line_var.get()} | {polarity}"
+        )
 
     def _refresh_ports(self):
         ports = list_serial_ports()
@@ -694,6 +735,7 @@ class App(ttk.Frame):
             self.ftdi_dah_line_var.get(),
             self.ftdi_active_low_var.get(),
         )
+        self._update_ftdi_summary()
 
         self._send_cmd_safe(f"sidetone {tone}")
         self._send_cmd_safe(f"wpm {wpm}")
