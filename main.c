@@ -130,6 +130,10 @@ static volatile float g_ppm_correction = 0.0f;
 static volatile uint8_t g_cw_test_mode = 0;  // 1 = CW test active (blocks normal Core1 operation)
 static volatile int8_t g_tx_power_max_dbm = PWR_MAX_DBM;  // Runtime TX power limit
 static volatile uint8_t g_tx_enabled = 1;  // TX enable flag (for GUI TX button)
+static volatile uint8_t g_cw_key_down = 0;  // External CW keying state
+static volatile uint16_t g_cw_sidetone_hz = 700; // External CW sidetone frequency
+static volatile uint8_t g_cw_wpm = 18; // External CW speed
+static volatile uint8_t g_mode_cw = 0; // 0=ssb, 1=cw
 
 // --- Hilbert ---
 #define HILBERT_TAPS        247
@@ -1014,6 +1018,10 @@ static void cmd_help(void) {
         "  get\r\n"
         "  diag          - show SX1280 status\r\n"
         "  tx 0|1        - enable/disable TX (SSB modulation)\r\n"
+        "  key 0|1       - external CW key down/up\r\n"
+        "  sidetone <Hz> - set CW sidetone (300..1200)\r\n"
+        "  wpm <n>       - set CW speed (5..60)\r\n"
+        "  mode cw|ssb   - set external keying mode\r\n"
         "  cw            - start CW test transmission\r\n"
         "  stop          - stop CW transmission\r\n"
         "  freq <Hz>     - set frequency with sub-Hz precision (e.g. freq 2400100050.5)\r\n"
@@ -1062,6 +1070,59 @@ static void cdc_handle_line(char *line) {
     if (streqi(argv[0], "diag")) { sx_print_diag(); return; }
     if (streqi(argv[0], "cw"))   { sx_test_cw(); return; }
     if (streqi(argv[0], "stop")) { sx_stop_cw(); return; }
+
+    if (streqi(argv[0], "key") && argc >= 2) {
+        uint8_t v;
+        if (!parse_bool(argv[1], &v)) {
+            cdc_write_str("ERR: key 0|1|on|off\r\n");
+            return;
+        }
+        g_cw_key_down = v;
+        cdc_printf("OK key=%u\r\n", (unsigned)g_cw_key_down);
+        return;
+    }
+
+    if (streqi(argv[0], "sidetone") && argc >= 2) {
+        float hz;
+        if (!parse_f(argv[1], &hz)) {
+            cdc_write_str("ERR: bad sidetone value\r\n");
+            return;
+        }
+        if (hz < 300.0f) hz = 300.0f;
+        if (hz > 1200.0f) hz = 1200.0f;
+        g_cw_sidetone_hz = (uint16_t)hz;
+        cdc_printf("OK sidetone=%u\r\n", (unsigned)g_cw_sidetone_hz);
+        return;
+    }
+
+    if (streqi(argv[0], "wpm") && argc >= 2) {
+        float wpm;
+        if (!parse_f(argv[1], &wpm)) {
+            cdc_write_str("ERR: bad wpm value\r\n");
+            return;
+        }
+        if (wpm < 5.0f) wpm = 5.0f;
+        if (wpm > 60.0f) wpm = 60.0f;
+        g_cw_wpm = (uint8_t)wpm;
+        cdc_printf("OK wpm=%u\r\n", (unsigned)g_cw_wpm);
+        return;
+    }
+
+    if (streqi(argv[0], "mode") && argc >= 2) {
+        if (streqi(argv[1], "cw")) {
+            g_mode_cw = 1;
+            cdc_write_str("OK mode=cw\r\n");
+            return;
+        }
+        if (streqi(argv[1], "ssb")) {
+            g_mode_cw = 0;
+            g_cw_key_down = 0;
+            cdc_write_str("OK mode=ssb\r\n");
+            return;
+        }
+        cdc_write_str("ERR: mode cw|ssb\r\n");
+        return;
+    }
 
     // TX enable/disable: tx 0|1
     if (streqi(argv[0], "tx") && argc >= 2) {
