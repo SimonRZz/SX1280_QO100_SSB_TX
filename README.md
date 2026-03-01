@@ -130,6 +130,9 @@ The GUI supports **external CW keying** with `key 1`/`key 0` real-time events an
 
 Input device selection on Linux uses `/dev/input/eventX` via **python-evdev**.
 
+Zusätzlich werden **FTDI/USB-Serial Adapter** als Keying-Quelle unterstützt (z. B. `/dev/ttyUSB0`).
+In der GUI kann dafür der FTDI-Port ausgewählt und die Belegung der Modem-Leitungen (`CTS`, `DSR`, `RI`, `CD`) für Straight/DIT/DAH konfiguriert werden.
+
 Install dependencies:
 ```bash
 sudo apt install python3-evdev
@@ -145,6 +148,10 @@ pip install simpleaudio
 Permissions for `/dev/input/event*` (without root):
 - Add user to `input` group, or
 - create a udev rule granting read access for your paddle device.
+
+FTDI adapter access (without root):
+- add user to `dialout` group (Debian/Ubuntu),
+- then relogin.
 
 When External Keying is enabled in GUI:
 - GUI sends `sidetone <hz>` and `wpm <n>`

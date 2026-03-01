@@ -9,7 +9,7 @@ import threading
 import time
 import tkinter as tk
 from tkinter import ttk, messagebox
-from typing import Callable, Optional
+from typing import Callable
 
 try:
     import serial
@@ -32,6 +32,8 @@ try:
 except ImportError:
     sa = None
     HAS_SIMPLEAUDIO = False
+
+MODEM_LINE_OPTIONS = ("CTS", "DSR", "RI", "CD")
 
 
 class SerialWorker:
@@ -156,6 +158,11 @@ class ExternalKeyer:
         self.wpm = 18
         self.device_path = "Keyboard (Space)"
 
+        self.ftdi_straight_line = "CTS"
+        self.ftdi_dit_line = "CTS"
+        self.ftdi_dah_line = "DSR"
+        self.ftdi_active_low = True
+
         self._lock = threading.Lock()
         self._stop_evt = threading.Event()
         self._thread = threading.Thread(target=self._run_keyer_loop, daemon=True)
@@ -195,6 +202,15 @@ class ExternalKeyer:
         with self._lock:
             self.device_path = device_path
         if self.enabled:
+            self._restart_device_listener()
+
+    def set_ftdi_mapping(self, straight_line: str, dit_line: str, dah_line: str, active_low: bool):
+        with self._lock:
+            self.ftdi_straight_line = straight_line
+            self.ftdi_dit_line = dit_line
+            self.ftdi_dah_line = dah_line
+            self.ftdi_active_low = bool(active_low)
+        if self.enabled and self.device_path.startswith("FTDI:"):
             self._restart_device_listener()
 
     def enable(self):
@@ -241,16 +257,23 @@ class ExternalKeyer:
     def _restart_device_listener(self):
         self._stop_device_listener()
         path = self.device_path
-        if path == "Keyboard (Space)" or not HAS_EVDEV:
+        if path == "Keyboard (Space)":
             return
         self.dev_stop_evt.clear()
-        self.dev_thread = threading.Thread(target=self._evdev_loop, args=(path,), daemon=True)
+        if path.startswith("FTDI:"):
+            ftdi_port = path.split(":", 1)[1]
+            self.dev_thread = threading.Thread(target=self._ftdi_loop, args=(ftdi_port,), daemon=True)
+        else:
+            if not HAS_EVDEV:
+                self.log("[External keying] python-evdev not installed", "error")
+                return
+            self.dev_thread = threading.Thread(target=self._evdev_loop, args=(path,), daemon=True)
         self.dev_thread.start()
 
     def _stop_device_listener(self):
         self.dev_stop_evt.set()
         if self.dev_thread and self.dev_thread.is_alive():
-            self.dev_thread.join(timeout=0.3)
+            self.dev_thread.join(timeout=0.5)
         self.dev_thread = None
 
     def _evdev_loop(self, dev_path: str):
@@ -259,9 +282,7 @@ class ExternalKeyer:
             for event in dev.read_loop():
                 if self.dev_stop_evt.is_set() or not self.enabled:
                     break
-                if event.type != evdev.ecodes.EV_KEY:
-                    continue
-                if event.value == 2:
+                if event.type != evdev.ecodes.EV_KEY or event.value == 2:
                     continue
                 key_event = evdev.categorize(event)
                 code = key_event.keycode
@@ -270,7 +291,72 @@ class ExternalKeyer:
                 pressed = bool(event.value)
                 self._handle_evdev_key(code, pressed)
         except Exception as exc:
-            self.log(f"[External keying] Device error: {exc}", "error")
+            self.log(f"[External keying] evdev error: {exc}", "error")
+
+    def _read_modem_line(self, ser_obj, line_name: str) -> bool:
+        if line_name == "CTS":
+            return bool(ser_obj.cts)
+        if line_name == "DSR":
+            return bool(ser_obj.dsr)
+        if line_name == "RI":
+            return bool(ser_obj.ri)
+        if line_name == "CD":
+            return bool(ser_obj.cd)
+        return False
+
+    def _ftdi_loop(self, port: str):
+        if not HAS_SERIAL:
+            self.log("[External keying] pyserial missing for FTDI input", "error")
+            return
+        ser_obj = None
+        try:
+            ser_obj = serial.Serial(port=port, baudrate=9600, timeout=0, write_timeout=0)
+            ser_obj.rts = False
+            ser_obj.dtr = False
+            self.log(f"[External keying] FTDI modem monitor open: {port}", "info")
+
+            last_straight = None
+            last_dit = None
+            last_dah = None
+
+            while not self.dev_stop_evt.is_set() and self.enabled:
+                with self._lock:
+                    straight_line = self.ftdi_straight_line
+                    dit_line = self.ftdi_dit_line
+                    dah_line = self.ftdi_dah_line
+                    active_low = self.ftdi_active_low
+                    mode = self.mode
+
+                straight = self._read_modem_line(ser_obj, straight_line)
+                dit = self._read_modem_line(ser_obj, dit_line)
+                dah = self._read_modem_line(ser_obj, dah_line)
+
+                if active_low:
+                    straight = not straight
+                    dit = not dit
+                    dah = not dah
+
+                if mode == self.STRAIGHT:
+                    if straight != last_straight:
+                        self._set_key(straight)
+                        last_straight = straight
+                else:
+                    if dit != last_dit:
+                        self._update_paddle("dit", dit)
+                        last_dit = dit
+                    if dah != last_dah:
+                        self._update_paddle("dah", dah)
+                        last_dah = dah
+
+                time.sleep(0.002)
+        except Exception as exc:
+            self.log(f"[External keying] FTDI error ({port}): {exc}", "error")
+        finally:
+            if ser_obj:
+                try:
+                    ser_obj.close()
+                except Exception:
+                    pass
 
     def _handle_evdev_key(self, code: str, pressed: bool):
         dit_keys = {"KEY_LEFT", "KEY_Z", "BTN_TRIGGER_HAPPY1", "BTN_TOP"}
@@ -318,9 +404,7 @@ class ExternalKeyer:
             self.iambic_b_extra = False
             return "dah" if self.last_element == "dit" else "dit"
         if both:
-            if self.last_element == "dit":
-                return "dah"
-            return "dit"
+            return "dah" if self.last_element == "dit" else "dit"
         if self.dit_pressed or self.dit_latch:
             return "dit"
         if self.dah_pressed or self.dah_latch:
@@ -386,21 +470,27 @@ def list_serial_ports():
         label = f"{p.device} ({p.description})"
         if "SX1280" in p.description:
             label = f"★ {label}"
-        out.append((p.device, label))
+        out.append((p.device, label, p.description.lower()))
     return out
 
 
 def list_input_devices():
     items = [("Keyboard (Space)", "Keyboard (Space)")]
-    if not HAS_EVDEV:
-        return items
-    for path in sorted([f"/dev/input/{x}" for x in os.listdir('/dev/input') if x.startswith('event')]):
-        try:
-            dev = evdev.InputDevice(path)
-            items.append((path, f"{dev.name} [{path}]"))
-            dev.close()
-        except Exception:
-            items.append((path, f"Unknown [{path}]") )
+
+    if HAS_EVDEV and os.path.isdir("/dev/input"):
+        for path in sorted(f"/dev/input/{x}" for x in os.listdir('/dev/input') if x.startswith('event')):
+            try:
+                dev = evdev.InputDevice(path)
+                items.append((path, f"{dev.name} [{path}]"))
+                dev.close()
+            except Exception:
+                items.append((path, f"Unknown [{path}]"))
+
+    if HAS_SERIAL:
+        for dev, label, desc in list_serial_ports():
+            if "ftdi" in desc or "usb serial" in desc or "ch340" in desc or "cp210" in desc:
+                items.append((f"FTDI:{dev}", f"FTDI modem lines [{dev}]"))
+
     return items
 
 
@@ -409,7 +499,7 @@ class App(ttk.Frame):
         super().__init__(root)
         self.root = root
         self.root.title("SX1280 QO-100 Control + External CW Keying")
-        self.root.geometry("980x720")
+        self.root.geometry("980x780")
 
         self.rx_queue = queue.Queue()
         self.worker = SerialWorker(self.rx_queue)
@@ -425,6 +515,11 @@ class App(ttk.Frame):
         self.local_sidetone_var = tk.BooleanVar(value=False)
         self.device_label_var = tk.StringVar(value="Keyboard (Space)")
 
+        self.ftdi_straight_line_var = tk.StringVar(value="CTS")
+        self.ftdi_dit_line_var = tk.StringVar(value="CTS")
+        self.ftdi_dah_line_var = tk.StringVar(value="DSR")
+        self.ftdi_active_low_var = tk.BooleanVar(value=True)
+
         self._build_ui()
         self._refresh_ports()
         self._refresh_input_devices()
@@ -439,8 +534,8 @@ class App(ttk.Frame):
     def _build_ui(self):
         top = ttk.Frame(self)
         top.pack(fill="x", padx=8, pady=8)
-        ttk.Label(top, text="Serial Port:").pack(side="left")
-        self.port_combo = ttk.Combobox(top, textvariable=self.port_var, state="readonly", width=45)
+        ttk.Label(top, text="SX1280 Serial Port:").pack(side="left")
+        self.port_combo = ttk.Combobox(top, textvariable=self.port_var, state="readonly", width=42)
         self.port_combo.pack(side="left", padx=6)
         ttk.Button(top, text="Refresh", command=self._refresh_ports).pack(side="left")
         ttk.Button(top, text="Connect", command=self._connect).pack(side="left", padx=4)
@@ -452,9 +547,11 @@ class App(ttk.Frame):
 
         ttk.Checkbutton(key, text="External Keying On", variable=self.keying_enabled_var,
                         command=self._toggle_external_keying).grid(row=0, column=0, sticky="w")
+
         ttk.Label(key, text="Input Device:").grid(row=1, column=0, sticky="w", pady=(8, 0))
         self.device_combo = ttk.Combobox(key, textvariable=self.device_label_var, state="readonly", width=58)
         self.device_combo.grid(row=1, column=1, sticky="ew", pady=(8, 0))
+        self.device_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_keyer_params_changed())
         ttk.Button(key, text="Refresh", command=self._refresh_input_devices).grid(row=1, column=2, padx=4, pady=(8, 0))
 
         ttk.Label(key, text="Keyer Mode:").grid(row=2, column=0, sticky="w", pady=(8, 0))
@@ -479,7 +576,34 @@ class App(ttk.Frame):
         if not self.sidetone.available():
             ttk.Label(key, text="(Install simpleaudio for local sidetone)").grid(row=5, column=1, sticky="w", pady=(8, 0))
 
+        ftdi_frame = ttk.LabelFrame(key, text="FTDI/USB-Serial Belegung (Modem-Lines)", padding=8)
+        ftdi_frame.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(10, 0))
+        ttk.Label(ftdi_frame, text="Straight Key line:").grid(row=0, column=0, sticky="w")
+        straight_combo = ttk.Combobox(ftdi_frame, textvariable=self.ftdi_straight_line_var,
+                                      values=MODEM_LINE_OPTIONS, state="readonly", width=10)
+        straight_combo.grid(row=0, column=1, sticky="w", padx=(8, 20))
+        straight_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_keyer_params_changed())
+
+        ttk.Label(ftdi_frame, text="DIT line:").grid(row=0, column=2, sticky="w")
+        dit_combo = ttk.Combobox(ftdi_frame, textvariable=self.ftdi_dit_line_var,
+                                 values=MODEM_LINE_OPTIONS, state="readonly", width=10)
+        dit_combo.grid(row=0, column=3, sticky="w", padx=(8, 20))
+        dit_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_keyer_params_changed())
+
+        ttk.Label(ftdi_frame, text="DAH line:").grid(row=0, column=4, sticky="w")
+        dah_combo = ttk.Combobox(ftdi_frame, textvariable=self.ftdi_dah_line_var,
+                                 values=MODEM_LINE_OPTIONS, state="readonly", width=10)
+        dah_combo.grid(row=0, column=5, sticky="w", padx=(8, 20))
+        dah_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_keyer_params_changed())
+
+        ttk.Checkbutton(ftdi_frame, text="Active Low (empfohlen)", variable=self.ftdi_active_low_var,
+                        command=self._on_keyer_params_changed).grid(row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        ttk.Label(ftdi_frame, text="Hinweis: FTDI-Eingänge sind typischerweise CTS/DSR/RI/CD.").grid(
+            row=1, column=3, columnspan=3, sticky="w", pady=(6, 0)
+        )
+
         key.columnconfigure(1, weight=1)
+        ftdi_frame.columnconfigure(6, weight=1)
 
         cmd = ttk.LabelFrame(self, text="Manual Commands", padding=10)
         cmd.pack(fill="x", padx=8, pady=8)
@@ -495,7 +619,7 @@ class App(ttk.Frame):
 
     def _refresh_ports(self):
         ports = list_serial_ports()
-        self.port_map = {label: dev for dev, label in ports}
+        self.port_map = {label: dev for dev, label, _desc in ports}
         labels = list(self.port_map.keys()) or ["(no ports found)"]
         self.port_combo["values"] = labels
         self.port_var.set(labels[0])
@@ -506,11 +630,9 @@ class App(ttk.Frame):
         labels = list(self.device_map.keys())
         self.device_combo["values"] = labels
         if labels:
-            self.device_label_var.set(labels[0])
-        if HAS_EVDEV:
-            self._log("Input devices refreshed (/dev/input/eventX)", "info")
-        else:
-            self._log("python-evdev missing: keyboard fallback only", "error")
+            current = self.device_label_var.get()
+            self.device_label_var.set(current if current in labels else labels[0])
+        self._log("Input devices refreshed (Keyboard / evdev / FTDI)", "info")
 
     def _connect(self):
         label = self.port_var.get()
@@ -566,6 +688,12 @@ class App(ttk.Frame):
         self.keyer.set_wpm(wpm)
         device_path = self.device_map.get(self.device_label_var.get(), "Keyboard (Space)")
         self.keyer.set_device(device_path)
+        self.keyer.set_ftdi_mapping(
+            self.ftdi_straight_line_var.get(),
+            self.ftdi_dit_line_var.get(),
+            self.ftdi_dah_line_var.get(),
+            self.ftdi_active_low_var.get(),
+        )
 
         self._send_cmd_safe(f"sidetone {tone}")
         self._send_cmd_safe(f"wpm {wpm}")
