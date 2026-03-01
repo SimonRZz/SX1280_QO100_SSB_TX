@@ -159,6 +159,21 @@ When External Keying is enabled in GUI:
 - keyer sends only `key 1` / `key 0` (no continuous `cw` test command)
 - On disable/exit GUI always sends `key 0` and `stop` to avoid stuck TX
 
+
+### CW per Command Line
+
+For terminal-based CW workflows (without GUI), use `cw_cli.py`:
+
+```bash
+# Continuous CW carrier until Ctrl+C
+python3 cw_cli.py --port /dev/ttyACM0 carrier
+
+# Send text as Morse via key 1/0
+python3 cw_cli.py --port /dev/ttyACM0 text "CQ CQ DE SP8ESA" --wpm 18 --sidetone 700
+```
+
+The script uses existing CDC commands (`cw`, `key`, `wpm`, `sidetone`, `stop`) so all original firmware behavior remains unchanged.
+
 ### Carrier Mode
 If USB is not connected within 10 seconds of startup, the device automatically starts CW transmission on 2400.300 MHz at full power.
 
