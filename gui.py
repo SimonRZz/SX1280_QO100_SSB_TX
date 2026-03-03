@@ -603,6 +603,9 @@ class SX1280ControlApp(ttk.Frame):
         # FIX B: shared key state written only by _cw_loop (background thread),
         # read only by _cw_gui_update (GUI thread) – eliminates serial port race.
         self._cw_key_state = (False, False)
+        # FIX C: decoded chars passed via queue so _cw_loop never calls tkinter
+        # directly from a background thread (would deadlock against keyer._lock).
+        self._cw_char_queue: queue.Queue = queue.Queue()
 
         self.keyer.cb_key_on  = self.audio.on
         self.keyer.cb_key_off = self.audio.off
@@ -1067,12 +1070,14 @@ class SX1280ControlApp(ttk.Frame):
     def _cw_loop(self):
         # FIX B: this is the ONLY place that calls key_reader.read() – eliminates
         # the race condition with _cw_gui_update() that caused GUI freezes.
+        # FIX C: on error, signal via queue (None sentinel) instead of calling
+        # master.after() from a background thread, which can deadlock.
         while self._cw_running:
             try:
                 dit, dah = self.key_reader.read()
                 self._cw_key_state = (dit, dah)
             except Exception:
-                self.master.after(0, self._cw_stop)
+                self._cw_char_queue.put(None)  # None = error/stop signal
                 break
             self.keyer.tick(dit, dah)
             time.sleep(0.002)
@@ -1085,15 +1090,28 @@ class SX1280ControlApp(ttk.Frame):
             self.cw_key_lbl.config(
                 text="TASTE: GEDRUECKT" if down else "TASTE: OFFEN",
                 foreground="green" if down else "gray")
+        # FIX C: drain decoded-char queue – background thread never calls tkinter.
+        # None in the queue means the CW thread stopped due to an error.
+        try:
+            while True:
+                ch = self._cw_char_queue.get_nowait()
+                if ch is None:
+                    self._cw_stop()  # error signal from _cw_loop
+                else:
+                    self._cw_append_dec(ch)
+        except queue.Empty:
+            pass
         sym = self.keyer.get_sym_buf()
         self.cw_sym_lbl.config(text=sym)
         self.master.after(50, self._cw_gui_update)
 
     def _cw_on_char(self, ch):
-        self.master.after(0, self._cw_append_dec, ch)
+        # FIX C: called from background thread – put to queue, never touch tkinter
+        self._cw_char_queue.put(ch)
 
     def _cw_on_word_space(self):
-        self.master.after(0, self._cw_append_dec, ' ')
+        # FIX C: called from background thread – put to queue, never touch tkinter
+        self._cw_char_queue.put(' ')
 
     def _cw_append_dec(self, ch):
         self.cw_dec_text.config(state='normal')
