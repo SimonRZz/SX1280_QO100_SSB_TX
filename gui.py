@@ -337,12 +337,15 @@ class Keyer:
         self.dit_ms = 1200.0 / self.wpm
         self.dah_ms = self.dit_ms * 3.0
         self.iel_ms = self.dit_ms
-        self.ich_ms = self.dit_ms * 3.0
-        self.iwd_ms = self.dit_ms * 7.0
+        # ICH = 2 dits (so total char gap = IEL+ICH = 1+2 = 3 dits, standard)
+        self.ich_ms = self.dit_ms * 2.0
+        # IWD = 4 dits (so total word gap = 3+4 = 7 dits, standard)
+        self.iwd_ms = self.dit_ms * 4.0
 
     def set_wpm(self, w):
-        self.wpm = max(5, min(60, int(w)))
-        self._update_timing()
+        with self._lock:
+            self.wpm = max(5, min(60, int(w)))
+            self._update_timing()
 
     def set_mode(self, m):
         self.mode = m
@@ -368,9 +371,14 @@ class Keyer:
     def _straight(self, key, now):
         if key:
             if self._state == 'IDLE':
+                # Decode any pending symbol before starting a new element,
+                # so rapid keying (gap < ich_ms) doesn't swallow the character.
+                if self._sym_buf:
+                    ch = MORSE_TABLE.get(self._sym_buf, '?')
+                    self._sym_buf = ''
+                    if self.cb_char: self.cb_char(ch)
                 self._state = 'DOWN'
                 self._t0 = now
-                self._sym_buf = ''
                 if self.cb_key_on: self.cb_key_on()
             return True
         else:
@@ -469,7 +477,7 @@ class Keyer:
             return False
 
         elif self._state == 'IWD':
-            if el >= self.iwd_ms - self.ich_ms:
+            if el >= self.iwd_ms:
                 if self.cb_word_sp: self.cb_word_sp()
                 self._state = 'IDLE'; self._t0 = now
             # FIX A: only check _pend_* (edge-based), not raw dit/dah level
@@ -646,8 +654,8 @@ class SX1280ControlApp(ttk.Frame):
         self.cw_baud_var        = tk.StringVar(value='9600')
         self.cw_mode_var        = tk.StringVar(value='Iambic B')
         self.cw_dit_var         = tk.StringVar(value='CTS')
-        self.cw_dah_var         = tk.StringVar(value='DSR')
-        self.cw_active_low_var  = tk.BooleanVar(value=True)
+        self.cw_dah_var         = tk.StringVar(value='CD')
+        self.cw_active_low_var  = tk.BooleanVar(value=False)
         self.cw_wpm_var         = tk.DoubleVar(value=20)
         self.cw_tone_var        = tk.DoubleVar(value=700)
         self.cw_vol_var         = tk.DoubleVar(value=70)
@@ -908,13 +916,20 @@ class SX1280ControlApp(ttk.Frame):
             r = ttk.Frame(cpf)
             r.pack(fill='x', pady=2)
             ttk.Label(r, text=label, width=16, anchor='w').pack(side='left')
-            lbl = ttk.Label(r, text=fmt(from_), width=10, anchor='e')
+            # Use current variable value for initial label (not the range minimum)
+            lbl = ttk.Label(r, text=fmt(var.get()), width=10, anchor='e')
             lbl.pack(side='right')
-            def _cb(v):
+            def _update_label(v):
                 lbl.config(text=fmt(float(v)))
-                cb(float(v))
-            ttk.Scale(cpf, from_=from_, to=to, orient='horizontal',
-                      variable=var, command=_cb).pack(fill='x')
+            def _on_release(_event):
+                v = float(var.get())
+                lbl.config(text=fmt(v))
+                cb(v)
+            sc = ttk.Scale(cpf, from_=from_, to=to, orient='horizontal',
+                           variable=var, command=_update_label)
+            sc.pack(fill='x')
+            # Apply keyer/audio change only on release to prevent GUI freeze
+            sc.bind('<ButtonRelease-1>', _on_release)
 
         cw_slider("Geschw. (WPM)", self.cw_wpm_var,   5,   60,
                   lambda v: f"{int(v)} WPM", lambda v: self.keyer.set_wpm(v))
