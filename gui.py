@@ -428,13 +428,23 @@ class Keyer:
 
         elif self._state == 'IEL':
             if el >= self.iel_ms:
-                # IEL still checks current key state directly for squeeze-keying auto-repeat
-                if self._pend_dah or dah:
-                    self._send_dah(now); self._pend_dah = False
-                elif self._pend_dit or dit:
-                    self._send_dit(now); self._pend_dit = False
+                # Squeeze: alternate based on last element via _was_dit
+                if self._was_dit:
+                    # Last was dit → prefer dah next
+                    if self._pend_dah or dah:
+                        self._send_dah(now); self._pend_dah = False
+                    elif self._pend_dit or dit:
+                        self._send_dit(now); self._pend_dit = False
+                    else:
+                        self._state = 'ICH'; self._t0 = now
                 else:
-                    self._state = 'ICH'; self._t0 = now
+                    # Last was dah → prefer dit next
+                    if self._pend_dit or dit:
+                        self._send_dit(now); self._pend_dit = False
+                    elif self._pend_dah or dah:
+                        self._send_dah(now); self._pend_dah = False
+                    else:
+                        self._state = 'ICH'; self._t0 = now
             return False
 
         elif self._state == 'ICH':
