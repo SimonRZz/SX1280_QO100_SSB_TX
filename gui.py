@@ -13,6 +13,8 @@ import queue
 import ctypes
 import ctypes.util
 import sys
+import json
+import pathlib
 from dataclasses import dataclass
 from typing import Optional
 
@@ -54,6 +56,7 @@ def _suppress_alsa_errors():
 
 _suppress_alsa_errors()
 
+_CW_SETTINGS_PATH = pathlib.Path.home() / '.sx1280_cw_settings.json'
 
 MORSE_TABLE = {
     '.-':'A',    '-...':'B',  '-.-.':'C',  '-..':'D',
@@ -317,6 +320,7 @@ class Keyer:
     def __init__(self):
         self.mode       = self.IAMBIC_A
         self.wpm        = 20
+        self.weight     = 50        # 40–60 %, default 50
         self._update_timing()
         self._state     = 'IDLE'
         self._t0        = 0.0
@@ -335,8 +339,12 @@ class Keyer:
 
     def _update_timing(self):
         self.dit_ms = 1200.0 / self.wpm
-        self.dah_ms = self.dit_ms * 3.0
-        self.iel_ms = self.dit_ms
+        # Weighted mark times: mark_time = base_element * (weight / 50)
+        # Weight scales MARK only; space times always equal standard dit_ms.
+        w = self.weight / 50.0
+        self.dit_mark_ms = self.dit_ms * w          # DIT on-time
+        self.dah_mark_ms = self.dit_ms * 3.0 * w    # DAH on-time
+        self.iel_ms = self.dit_ms                    # inter-element space (1 dit)
         # ICH = 2 dits (so total char gap = IEL+ICH = 1+2 = 3 dits, standard)
         self.ich_ms = self.dit_ms * 2.0
         # IWD = 4 dits (so total word gap = 3+4 = 7 dits, standard)
@@ -345,6 +353,11 @@ class Keyer:
     def set_wpm(self, w):
         with self._lock:
             self.wpm = max(5, min(60, int(w)))
+            self._update_timing()
+
+    def set_weight(self, w):
+        with self._lock:
+            self.weight = max(40.0, min(60.0, float(w)))
             self._update_timing()
 
     def set_mode(self, m):
@@ -413,7 +426,7 @@ class Keyer:
             return False
 
         elif self._state == 'DIT':
-            if el >= self.dit_ms:
+            if el >= self.dit_mark_ms:
                 self._sym_buf += '.'
                 self._was_dit = True
                 if self.cb_key_off: self.cb_key_off()
@@ -424,7 +437,7 @@ class Keyer:
             return True
 
         elif self._state == 'DAH':
-            if el >= self.dah_ms:
+            if el >= self.dah_mark_ms:
                 self._sym_buf += '-'
                 self._was_dit = False
                 if self.cb_key_off: self.cb_key_off()
@@ -613,6 +626,7 @@ class SX1280ControlApp(ttk.Frame):
         self.keyer.cb_word_sp = self._cw_on_word_space
 
         self._create_variables()
+        self.keyer.set_weight(self.cw_weight_var.get())
         self._build_ui()
         self._update_freq_display()
 
@@ -662,6 +676,7 @@ class SX1280ControlApp(ttk.Frame):
         self.cw_wpm_var         = tk.DoubleVar(value=20)
         self.cw_tone_var        = tk.DoubleVar(value=700)
         self.cw_vol_var         = tk.DoubleVar(value=70)
+        self.cw_weight_var      = tk.DoubleVar(value=self._load_cw_weight())
         self.cw_conn_status_var = tk.StringVar(value='● GETRENNT')
 
     def _build_ui(self):
@@ -940,6 +955,9 @@ class SX1280ControlApp(ttk.Frame):
                   lambda v: f"{int(v)} Hz",  lambda v: self.audio.set_freq(v))
         cw_slider("Lautstaerke",   self.cw_vol_var,    0,  100,
                   lambda v: f"{int(v)} %",   lambda v: self.audio.set_vol(v / 100))
+        cw_slider("Tastverh. (%)", self.cw_weight_var, 40, 60,
+                  lambda v: f"{int(v)} %",
+                  lambda v: (self.keyer.set_weight(v), self._save_cw_weight(v)))
 
         if not HAS_AUDIO:
             ttk.Label(cpf, text="pyaudio fehlt\npip install pyaudio numpy",
@@ -1014,6 +1032,23 @@ class SX1280ControlApp(ttk.Frame):
             except: pass
         if state == 'normal':
             self._cw_mode_changed()
+
+    def _load_cw_weight(self):
+        try:
+            data = json.loads(_CW_SETTINGS_PATH.read_text())
+            return max(40.0, min(60.0, float(data.get('cw_weight', 50))))
+        except Exception:
+            return 50.0
+
+    def _save_cw_weight(self, value):
+        try:
+            data = {}
+            if _CW_SETTINGS_PATH.exists():
+                data = json.loads(_CW_SETTINGS_PATH.read_text())
+            data['cw_weight'] = float(value)
+            _CW_SETTINGS_PATH.write_text(json.dumps(data))
+        except Exception:
+            pass
 
     def _cw_toggle(self):
         if self._cw_running: self._cw_stop()
