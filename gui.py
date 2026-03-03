@@ -1262,13 +1262,11 @@ class SX1280ControlApp(ttk.Frame):
     def _cw_text_send(self):
         """Start transmitting the text-field content as CW.
 
+        Sidetone always plays. RF carrier is gated by _cw_tx_active inside
+        _cb_key_on, so TX On/Off is already respected without blocking here.
         Only the text added since the previous send is transmitted; if the
         field was edited non-appendably the whole content is (re)sent.
-        No transmission starts when TX is disabled.
         """
-        if not self._cw_tx_active:
-            return
-
         full = self.cw_text_var.get().upper()
         last = self._cw_last_sent
         # Determine the new suffix to send.
