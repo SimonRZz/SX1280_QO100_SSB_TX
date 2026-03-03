@@ -644,7 +644,7 @@ class SX1280ControlApp(ttk.Frame):
         self.amp_min_a_var   = tk.StringVar(value=f"{self.config.amp_min_a:.9f}")
         self.cw_port_var        = tk.StringVar()
         self.cw_baud_var        = tk.StringVar(value='9600')
-        self.cw_mode_var        = tk.StringVar(value='Iambic A')
+        self.cw_mode_var        = tk.StringVar(value='Iambic B')
         self.cw_dit_var         = tk.StringVar(value='CTS')
         self.cw_dah_var         = tk.StringVar(value='DSR')
         self.cw_active_low_var  = tk.BooleanVar(value=True)
