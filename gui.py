@@ -646,6 +646,7 @@ class SX1280ControlApp(ttk.Frame):
         # Text-transmit state
         self._cw_text_thread: Optional[threading.Thread] = None
         self._cw_text_stop   = threading.Event()
+        self._cw_last_sent   = ""   # full field text when last TX started
 
         # cb_key_on / cb_key_off: Sidetone + optional SX1280-Träger.
         # worker.send_line() ist thread-sicher (eigener Lock, kein Tkinter).
@@ -718,7 +719,7 @@ class SX1280ControlApp(ttk.Frame):
         self.cw_tone_var        = tk.DoubleVar(value=700)
         self.cw_vol_var         = tk.DoubleVar(value=70)
         self.cw_weight_var      = tk.DoubleVar(value=self._load_cw_weight())
-        self.cw_conn_status_var = tk.StringVar(value='● GETRENNT')
+        self.cw_conn_status_var = tk.StringVar(value='● DISCONNECTED')
         self.cw_text_var        = tk.StringVar()
 
     def _build_ui(self):
@@ -925,11 +926,13 @@ class SX1280ControlApp(ttk.Frame):
     def _build_cw_tab(self):
         tab = ttk.Frame(self.notebook, padding=10)
         self.notebook.add(tab, text="⚡ CW Keyer")
-        tab.columnconfigure(0, weight=1)
-        tab.columnconfigure(1, weight=1)
-        tab.rowconfigure(3, weight=1)   # status + decoded text row expands
-        tab.rowconfigure(4, weight=0)   # text-TX frame: fixed height
+        # uniform='cw' keeps both columns equal width; status col never stretches.
+        tab.columnconfigure(0, weight=1, uniform='cw')
+        tab.columnconfigure(1, weight=1, uniform='cw')
+        tab.rowconfigure(3, weight=0)   # status + text-send row: fixed height
+        tab.rowconfigure(4, weight=1)   # decoded text row: expands with window
 
+        # ── FTDI Adapter ────────────────────────────────────────────────────────
         pf = ttk.LabelFrame(tab, text="FTDI Adapter", padding=10)
         pf.grid(row=0, column=0, sticky="ew", padx=(0, 5), pady=(0, 8))
         pf.columnconfigure(1, weight=1)
@@ -941,19 +944,20 @@ class SX1280ControlApp(ttk.Frame):
             self.cw_port_var.set(all_ports[0])
         self.cw_port_combo.grid(row=0, column=1, padx=4)
         ttk.Button(pf, text="↻", width=3, command=self._cw_refresh_ports).grid(row=0, column=2)
-        ttk.Label(pf, text="Baudrate:").grid(row=1, column=0, sticky="w", pady=3)
+        ttk.Label(pf, text="Baud rate:").grid(row=1, column=0, sticky="w", pady=3)
         self.cw_baud_combo = ttk.Combobox(pf, textvariable=self.cw_baud_var, width=18,
                                            values=['1200','2400','4800','9600','19200','38400','115200'])
         self.cw_baud_combo.grid(row=1, column=1, padx=4)
 
-        mf = ttk.LabelFrame(tab, text="Modus & Pins", padding=10)
+        # ── Mode & Pins ─────────────────────────────────────────────────────────
+        mf = ttk.LabelFrame(tab, text="Mode & Pins", padding=10)
         mf.grid(row=1, column=0, sticky="ew", padx=(0, 5), pady=(0, 8))
-        ttk.Label(mf, text="Modus:").grid(row=0, column=0, sticky="w")
+        ttk.Label(mf, text="Mode:").grid(row=0, column=0, sticky="w")
         self.cw_mode_combo = ttk.Combobox(mf, textvariable=self.cw_mode_var, width=14,
                                            values=['Straight', 'Iambic A', 'Iambic B'])
         self.cw_mode_combo.grid(row=0, column=1, columnspan=2, padx=4, pady=2)
         self.cw_mode_combo.bind('<<ComboboxSelected>>', self._cw_mode_changed)
-        ttk.Label(mf, text="Dit / Taste:").grid(row=1, column=0, sticky="w")
+        ttk.Label(mf, text="Dit / Key:").grid(row=1, column=0, sticky="w")
         self.cw_dit_combo = ttk.Combobox(mf, textvariable=self.cw_dit_var,
                                           width=7, values=READABLE_PINS)
         self.cw_dit_combo.grid(row=1, column=1, padx=4, pady=2)
@@ -962,14 +966,15 @@ class SX1280ControlApp(ttk.Frame):
         self._cw_dah_cb = ttk.Combobox(mf, textvariable=self.cw_dah_var,
                                         width=7, values=READABLE_PINS)
         self._cw_dah_cb.grid(row=2, column=1, padx=4, pady=2)
-        self.cw_active_low_cb = ttk.Checkbutton(mf, text="Active Low (Taste→GND)",
+        self.cw_active_low_cb = ttk.Checkbutton(mf, text="Active Low (Key→GND)",
                                                   variable=self.cw_active_low_var)
         self.cw_active_low_cb.grid(row=3, column=0, columnspan=3, sticky="w", pady=2)
 
-        self.cw_conn_btn = ttk.Button(tab, text="▶  VERBINDEN", command=self._cw_toggle)
+        self.cw_conn_btn = ttk.Button(tab, text="▶  Connect", command=self._cw_toggle)
         self.cw_conn_btn.grid(row=2, column=0, sticky="ew", padx=(0, 5), pady=(0, 8))
 
-        cpf = ttk.LabelFrame(tab, text="CW Parameter", padding=10)
+        # ── CW Parameters ────────────────────────────────────────────────────────
+        cpf = ttk.LabelFrame(tab, text="CW Parameters", padding=10)
         cpf.grid(row=0, column=1, rowspan=3, sticky="nsew", pady=(0, 8))
         cpf.columnconfigure(0, weight=1)
 
@@ -977,7 +982,6 @@ class SX1280ControlApp(ttk.Frame):
             r = ttk.Frame(cpf)
             r.pack(fill='x', pady=2)
             ttk.Label(r, text=label, width=16, anchor='w').pack(side='left')
-            # Use current variable value for initial label (not the range minimum)
             lbl = ttk.Label(r, text=fmt(var.get()), width=10, anchor='e')
             lbl.pack(side='right')
             def _update_label(v):
@@ -989,40 +993,64 @@ class SX1280ControlApp(ttk.Frame):
             sc = ttk.Scale(cpf, from_=from_, to=to, orient='horizontal',
                            variable=var, command=_update_label)
             sc.pack(fill='x')
-            # Apply keyer/audio change only on release to prevent GUI freeze
             sc.bind('<ButtonRelease-1>', _on_release)
 
-        cw_slider("Geschw. (WPM)", self.cw_wpm_var,   5,   60,
+        cw_slider("Speed (WPM)",   self.cw_wpm_var,    5,   60,
                   lambda v: f"{int(v)} WPM", lambda v: self.keyer.set_wpm(v))
-        cw_slider("Sidetone (Hz)", self.cw_tone_var, 400, 1000,
+        cw_slider("Sidetone (Hz)", self.cw_tone_var,  400, 1000,
                   lambda v: f"{int(v)} Hz",  lambda v: self.audio.set_freq(v))
-        cw_slider("Lautstaerke",   self.cw_vol_var,    0,  100,
+        cw_slider("Volume",        self.cw_vol_var,     0,  100,
                   lambda v: f"{int(v)} %",   lambda v: self.audio.set_vol(v / 100))
-        cw_slider("Tastverh. (%)", self.cw_weight_var, 30, 60,
+        cw_slider("Weighting (%)", self.cw_weight_var, 30,   60,
                   lambda v: f"{int(v)} %",
                   lambda v: (self.keyer.set_weight(v), self._save_cw_weight(v)))
 
         if not HAS_AUDIO:
-            ttk.Label(cpf, text="pyaudio fehlt\npip install pyaudio numpy",
+            ttk.Label(cpf, text="pyaudio missing\npip install pyaudio numpy",
                       foreground="red").pack(pady=5)
 
+        # ── Status ───────────────────────────────────────────────────────────────
         sf = ttk.LabelFrame(tab, text="Status", padding=8)
         sf.grid(row=3, column=0, sticky="nsew", padx=(0, 5), pady=(0, 8))
+        # grid_propagate(False) prevents children from stretching the status column.
+        sf.grid_propagate(False)
         self.cw_conn_lbl = ttk.Label(sf, textvariable=self.cw_conn_status_var,
                                       font=("TkDefaultFont", 11, "bold"), foreground="red")
         self.cw_conn_lbl.pack()
-        self.cw_key_lbl = ttk.Label(sf, text="TASTE: OFFEN",
+        self.cw_key_lbl = ttk.Label(sf, text="KEY: OPEN",
                                      font=("Consolas", 10), foreground="gray")
         self.cw_key_lbl.pack(pady=2)
         self.cw_sym_lbl = ttk.Label(sf, text="",
                                      font=("Consolas", 20, "bold"), foreground="#cc8800")
         self.cw_sym_lbl.pack(pady=4)
-        self.cw_tx_btn = ttk.Button(sf, text="⬛  TX AUS",
+        self.cw_tx_btn = ttk.Button(sf, text="⬛  TX OFF",
                                     command=self._cw_toggle_tx)
         self.cw_tx_btn.pack(fill='x', pady=(4, 0))
 
-        df = ttk.LabelFrame(tab, text="Dekodierter Text", padding=8)
-        df.grid(row=3, column=1, sticky="nsew", pady=(0, 8))
+        # ── CW Text Send (row 3, col 1 – swapped with decoded text) ─────────────
+        tf = ttk.LabelFrame(tab, text="CW Text Send", padding=8)
+        tf.grid(row=3, column=1, sticky="nsew", pady=(0, 8))
+        tf.columnconfigure(0, weight=1)
+
+        self.cw_text_entry = ttk.Entry(tf, textvariable=self.cw_text_var,
+                                       font=("Consolas", 11))
+        self.cw_text_entry.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 6))
+        self.cw_text_entry.bind("<Return>", lambda _e: self._cw_text_send())
+
+        self.cw_text_send_btn = ttk.Button(tf, text="Send",
+                                           command=self._cw_text_send, width=8)
+        self.cw_text_send_btn.grid(row=1, column=0, sticky="w", padx=(0, 4))
+
+        self.cw_text_stop_btn = ttk.Button(tf, text="■ Stop",
+                                           command=self._cw_text_abort, width=8)
+        self.cw_text_stop_btn.grid(row=1, column=1, padx=(0, 4))
+
+        ttk.Button(tf, text="Clear", command=self._cw_text_clear,
+                   width=7).grid(row=1, column=2)
+
+        # ── Decoded Text (row 4, both columns – swapped with text-send) ──────────
+        df = ttk.LabelFrame(tab, text="Decoded Text", padding=8)
+        df.grid(row=4, column=0, columnspan=2, sticky="nsew", pady=(0, 8))
         df.rowconfigure(0, weight=1)
         df.columnconfigure(0, weight=1)
         self.cw_dec_text = tk.Text(df, font=("Consolas", 14, "bold"),
@@ -1032,28 +1060,11 @@ class SX1280ControlApp(ttk.Frame):
         self.cw_dec_text.config(yscrollcommand=sb.set)
         self.cw_dec_text.grid(row=0, column=0, sticky="nsew")
         sb.grid(row=0, column=1, sticky="ns")
-        ttk.Button(df, text="Leeren",
+        ttk.Button(df, text="Clear",
                    command=self._cw_clear_dec).grid(row=1, column=0, sticky="w", pady=3)
-        # ── Text Transmit ──────────────────────────────────────────────────────
-        tf = ttk.LabelFrame(tab, text="CW Text senden", padding=8)
-        tf.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(0, 6))
-        tf.columnconfigure(0, weight=1)
 
-        self.cw_text_entry = ttk.Entry(tf, textvariable=self.cw_text_var,
-                                       font=("Consolas", 11))
-        self.cw_text_entry.grid(row=0, column=0, sticky="ew", padx=(0, 6))
-        self.cw_text_entry.bind("<Return>", lambda _e: self._cw_text_send())
-
-        self.cw_text_send_btn = ttk.Button(tf, text="Senden",
-                                           command=self._cw_text_send, width=9)
-        self.cw_text_send_btn.grid(row=0, column=1, padx=(0, 4))
-
-        self.cw_text_stop_btn = ttk.Button(tf, text="■ Stop",
-                                           command=self._cw_text_abort, width=8)
-        self.cw_text_stop_btn.grid(row=0, column=2)
-
-        # ── Hint ───────────────────────────────────────────────────────────────
-        ttk.Label(tab, text="ESC = Abbruch  |  Pin → Taste → GND  |  Active Low",
+        # ── Hint ─────────────────────────────────────────────────────────────────
+        ttk.Label(tab, text="ESC = Abort  |  Pin → Key → GND  |  Active Low",
                   foreground="gray").grid(row=5, column=0, columnspan=2, pady=2)
 
     def _build_console_tab(self):
@@ -1100,18 +1111,18 @@ class SX1280ControlApp(ttk.Frame):
 
     def _cw_toggle_tx(self):
         if not self.worker.is_connected():
-            messagebox.showwarning("Nicht verbunden",
-                                   "Bitte zuerst mit dem SX1280 verbinden\n"
-                                   "(Verbindungsleiste oben)!")
+            messagebox.showwarning("Not connected",
+                                   "Please connect to the SX1280 first\n"
+                                   "(connection bar at the top)!")
             return
         self._cw_tx_active = not self._cw_tx_active
         if self._cw_tx_active:
-            self.cw_tx_btn.config(text="🔴  TX EIN")
+            self.cw_tx_btn.config(text="🔴  TX ON")
         else:
             # Träger sofort abschalten, falls Taste gerade gedrückt ist
             try: self.worker.send_line("stop")
             except Exception: pass
-            self.cw_tx_btn.config(text="⬛  TX AUS")
+            self.cw_tx_btn.config(text="⬛  TX OFF")
 
     def _load_cw_weight(self):
         try:
@@ -1136,11 +1147,11 @@ class SX1280ControlApp(ttk.Frame):
 
     def _cw_start(self):
         if not HAS_SERIAL:
-            messagebox.showerror("Fehler", "pip install pyserial")
+            messagebox.showerror("Error", "pip install pyserial")
             return
         port = self.cw_port_var.get()
         if not port:
-            messagebox.showerror("Fehler", "Keinen FTDI-Port ausgewaehlt!")
+            messagebox.showerror("Error", "No FTDI port selected!")
             return
         mode_map = {'Straight': Keyer.STRAIGHT,
                     'Iambic A': Keyer.IAMBIC_A,
@@ -1157,14 +1168,14 @@ class SX1280ControlApp(ttk.Frame):
             active_low=self.cw_active_low_var.get())
         ok, err = self.key_reader.connect()
         if not ok:
-            messagebox.showerror("FTDI Fehler", f"Verbindung fehlgeschlagen:\n{err}")
+            messagebox.showerror("FTDI Error", f"Connection failed:\n{err}")
             self.key_reader = None
             return
         self._cw_running = True
         self._cw_thread  = threading.Thread(target=self._cw_loop, daemon=True)
         self._cw_thread.start()
-        self.cw_conn_btn.config(text="TRENNEN")
-        self.cw_conn_status_var.set("● VERBUNDEN")
+        self.cw_conn_btn.config(text="Disconnect")
+        self.cw_conn_status_var.set("● CONNECTED")
         self.cw_conn_lbl.config(foreground="green")
         self._cw_set_widgets_state('disabled')
 
@@ -1175,17 +1186,17 @@ class SX1280ControlApp(ttk.Frame):
             try: self.worker.send_line("stop")
             except Exception: pass
         self._cw_tx_active = False
-        self.cw_tx_btn.config(text="⬛  TX AUS")
+        self.cw_tx_btn.config(text="⬛  TX OFF")
         self.keyer.reset()
         if self.key_reader:
             self.key_reader.disconnect()
             self.key_reader = None
-        # FIX B: reset shared key state so GUI shows "OFFEN" immediately
+        # FIX B: reset shared key state so GUI shows "OPEN" immediately
         self._cw_key_state = (False, False)
-        self.cw_conn_btn.config(text="▶  VERBINDEN")
-        self.cw_conn_status_var.set("● GETRENNT")
+        self.cw_conn_btn.config(text="▶  Connect")
+        self.cw_conn_status_var.set("● DISCONNECTED")
         self.cw_conn_lbl.config(foreground="red")
-        self.cw_key_lbl.config(text="TASTE: OFFEN", foreground="gray")
+        self.cw_key_lbl.config(text="KEY: OPEN", foreground="gray")
         self._cw_set_widgets_state('normal')
 
     def _cw_loop(self):
@@ -1209,7 +1220,7 @@ class SX1280ControlApp(ttk.Frame):
             dit, dah = self._cw_key_state
             down = dit or dah
             self.cw_key_lbl.config(
-                text="TASTE: GEDRUECKT" if down else "TASTE: OFFEN",
+                text="KEY: PRESSED" if down else "KEY: OPEN",
                 foreground="green" if down else "gray")
         # FIX C: drain decoded-char queue – background thread never calls tkinter.
         # None in the queue means the CW thread stopped due to an error.
@@ -1249,15 +1260,28 @@ class SX1280ControlApp(ttk.Frame):
     # ── Text Transmit ──────────────────────────────────────────────────────────
 
     def _cw_text_send(self):
-        """Start transmitting the text-field content as CW."""
-        text = self.cw_text_var.get().strip().upper()
-        if not text:
+        """Start transmitting the text-field content as CW.
+
+        Only the text added since the previous send is transmitted; if the
+        field was edited non-appendably the whole content is (re)sent.
+        No transmission starts when TX is disabled.
+        """
+        if not self._cw_tx_active:
             return
+
+        full = self.cw_text_var.get().upper()
+        last = self._cw_last_sent
+        # Determine the new suffix to send.
+        to_send = full[len(last):] if (last and full.startswith(last)) else full
+        if not to_send.strip():
+            return
+
+        self._cw_last_sent = full          # remember for next delta
         # Abort any running text TX and start fresh.
         self._cw_text_abort()
         self._cw_text_stop.clear()
         self._cw_text_thread = threading.Thread(
-            target=self._cw_text_loop, args=(text,), daemon=True)
+            target=self._cw_text_loop, args=(to_send,), daemon=True)
         self._cw_text_thread.start()
 
     def _cw_text_abort(self):
@@ -1267,6 +1291,11 @@ class SX1280ControlApp(ttk.Frame):
         if self._cw_tx_active and self.worker.is_connected():
             try: self.worker.send_line("stop")
             except Exception: pass
+
+    def _cw_text_clear(self):
+        """Clear the CW text input field and reset the sent-delta tracker."""
+        self.cw_text_var.set("")
+        self._cw_last_sent = ""
 
     def _cw_text_loop(self, text):
         """Background thread: convert text to CW elements and drive callbacks."""
@@ -1290,6 +1319,8 @@ class SX1280ControlApp(ttk.Frame):
                 # 3 dits were already slept as inter-char gap after the last
                 # character, so only the remaining 4 dits (iwd_ms) are needed.
                 _sleep_ms(self.keyer.iwd_ms)
+                if not stop.is_set():
+                    self._cw_char_queue.put(' ')   # mirror space to decoded text
                 continue
             code = MORSE_ENCODE.get(ch)
             if not code:
@@ -1311,6 +1342,7 @@ class SX1280ControlApp(ttk.Frame):
                 break
             # Inter-character gap: 3 dits total (iel + ich).
             _sleep_ms(self.keyer.iel_ms + self.keyer.ich_ms)
+            self._cw_char_queue.put(ch)            # mirror char to decoded text
 
         # Guarantee sidetone off when done or aborted.
         if cb_off:
