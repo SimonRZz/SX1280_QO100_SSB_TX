@@ -224,18 +224,37 @@ class AudioEngine:
 
     def _stream_loop(self, stream):
         chunk = 512
+        sr    = self.sample_rate
+        # Per-sample exponential envelope: 5 ms attack, 5 ms release.
+        # alpha = 1 - exp(-1 / (T_ms * 0.001 * sr))
+        alpha_att = 1.0 - np.exp(-1.0 / (5.0 * 0.001 * sr))
+        alpha_rel = 1.0 - np.exp(-1.0 / (5.0 * 0.001 * sr))
         current_vol = 0.0
-        phase = 0
+        phase = 0.0          # phase angle in radians – maintained across chunks
         try:
             while self._running:
                 with self._lock:
                     target = self.volume if self._playing else 0.0
                     freq   = self.tone_freq
-                # FIX C: coefficient 0.5 (was 0.12) – tail ≈46 ms instead of ≈200 ms
-                current_vol += (target - current_vol) * 0.5
-                t = (np.arange(chunk) + phase) / self.sample_rate
-                s = (np.sin(2 * np.pi * freq * t) * current_vol * 32767).astype(np.int16)
-                phase = (phase + chunk) % self.sample_rate
+                # Choose per-sample decay factor based on direction.
+                alpha = alpha_att if target >= current_vol else alpha_rel
+                r     = 1.0 - alpha
+                # Compute envelope analytically for all samples in this chunk:
+                #   env[n] = target + (current_vol - target) * r**n
+                diff = current_vol - target
+                if abs(diff) < 1e-7:
+                    env = np.full(chunk, target, dtype=np.float32)
+                    current_vol = target
+                else:
+                    rn  = r ** np.arange(chunk, dtype=np.float64)
+                    env = (target + diff * rn).astype(np.float32)
+                    current_vol = float(target + diff * (r ** chunk))
+                # Pure sine with continuous phase – no phase jump between chunks.
+                angles = phase + 2.0 * np.pi * freq * np.arange(chunk) / sr
+                sine   = np.sin(angles).astype(np.float32)
+                phase  = float((phase + 2.0 * np.pi * freq * chunk / sr) % (2.0 * np.pi))
+                # Scale, clip (safety guard – should never exceed ±1 with env in [0,1]).
+                s = np.clip(sine * env * 32767.0, -32767.0, 32767.0).astype(np.int16)
                 try:
                     stream.write(s.tobytes(), exception_on_underflow=False)
                 except Exception:
@@ -320,7 +339,7 @@ class Keyer:
     def __init__(self):
         self.mode       = self.IAMBIC_A
         self.wpm        = 20
-        self.weight     = 50        # 40–60 %, default 50
+        self.weight     = 50        # 30–60 %, default 50
         self._update_timing()
         self._state     = 'IDLE'
         self._t0        = 0.0
@@ -357,7 +376,7 @@ class Keyer:
 
     def set_weight(self, w):
         with self._lock:
-            self.weight = max(40.0, min(60.0, float(w)))
+            self.weight = max(30.0, min(60.0, float(w)))
             self._update_timing()
 
     def set_mode(self, m):
@@ -970,7 +989,7 @@ class SX1280ControlApp(ttk.Frame):
                   lambda v: f"{int(v)} Hz",  lambda v: self.audio.set_freq(v))
         cw_slider("Lautstaerke",   self.cw_vol_var,    0,  100,
                   lambda v: f"{int(v)} %",   lambda v: self.audio.set_vol(v / 100))
-        cw_slider("Tastverh. (%)", self.cw_weight_var, 40, 60,
+        cw_slider("Tastverh. (%)", self.cw_weight_var, 30, 60,
                   lambda v: f"{int(v)} %",
                   lambda v: (self.keyer.set_weight(v), self._save_cw_weight(v)))
 
@@ -1069,7 +1088,7 @@ class SX1280ControlApp(ttk.Frame):
     def _load_cw_weight(self):
         try:
             data = json.loads(_CW_SETTINGS_PATH.read_text())
-            return max(40.0, min(60.0, float(data.get('cw_weight', 50))))
+            return max(30.0, min(60.0, float(data.get('cw_weight', 50))))
         except Exception:
             return 50.0
 
