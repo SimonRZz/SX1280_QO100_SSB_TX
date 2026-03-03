@@ -77,6 +77,9 @@ MORSE_TABLE = {
 
 READABLE_PINS = ['CTS', 'DSR', 'RI', 'CD']
 
+# Reverse lookup: character → morse code (dots and dashes)
+MORSE_ENCODE = {v: k for k, v in MORSE_TABLE.items()}
+
 
 @dataclass
 class TxConfig:
@@ -640,6 +643,10 @@ class SX1280ControlApp(ttk.Frame):
         # directly from a background thread (would deadlock against keyer._lock).
         self._cw_char_queue: queue.Queue = queue.Queue()
 
+        # Text-transmit state
+        self._cw_text_thread: Optional[threading.Thread] = None
+        self._cw_text_stop   = threading.Event()
+
         # cb_key_on / cb_key_off: Sidetone + optional SX1280-Träger.
         # worker.send_line() ist thread-sicher (eigener Lock, kein Tkinter).
         def _cb_key_on():
@@ -712,6 +719,7 @@ class SX1280ControlApp(ttk.Frame):
         self.cw_vol_var         = tk.DoubleVar(value=70)
         self.cw_weight_var      = tk.DoubleVar(value=self._load_cw_weight())
         self.cw_conn_status_var = tk.StringVar(value='● GETRENNT')
+        self.cw_text_var        = tk.StringVar()
 
     def _build_ui(self):
         self.master.title("SX1280 QO-100 SSB TX Control")
@@ -919,7 +927,8 @@ class SX1280ControlApp(ttk.Frame):
         self.notebook.add(tab, text="⚡ CW Keyer")
         tab.columnconfigure(0, weight=1)
         tab.columnconfigure(1, weight=1)
-        tab.rowconfigure(3, weight=1)
+        tab.rowconfigure(3, weight=1)   # status + decoded text row expands
+        tab.rowconfigure(4, weight=0)   # text-TX frame: fixed height
 
         pf = ttk.LabelFrame(tab, text="FTDI Adapter", padding=10)
         pf.grid(row=0, column=0, sticky="ew", padx=(0, 5), pady=(0, 8))
@@ -1018,15 +1027,34 @@ class SX1280ControlApp(ttk.Frame):
         df.columnconfigure(0, weight=1)
         self.cw_dec_text = tk.Text(df, font=("Consolas", 14, "bold"),
                                     bg="#f0f8e8", fg="#006600",
-                                    wrap="word", height=6, state="disabled")
+                                    wrap="word", height=3, state="disabled")
         sb = ttk.Scrollbar(df, command=self.cw_dec_text.yview)
         self.cw_dec_text.config(yscrollcommand=sb.set)
         self.cw_dec_text.grid(row=0, column=0, sticky="nsew")
         sb.grid(row=0, column=1, sticky="ns")
         ttk.Button(df, text="Leeren",
                    command=self._cw_clear_dec).grid(row=1, column=0, sticky="w", pady=3)
+        # ── Text Transmit ──────────────────────────────────────────────────────
+        tf = ttk.LabelFrame(tab, text="CW Text senden", padding=8)
+        tf.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(0, 6))
+        tf.columnconfigure(0, weight=1)
+
+        self.cw_text_entry = ttk.Entry(tf, textvariable=self.cw_text_var,
+                                       font=("Consolas", 11))
+        self.cw_text_entry.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        self.cw_text_entry.bind("<Return>", lambda _e: self._cw_text_send())
+
+        self.cw_text_send_btn = ttk.Button(tf, text="Senden",
+                                           command=self._cw_text_send, width=9)
+        self.cw_text_send_btn.grid(row=0, column=1, padx=(0, 4))
+
+        self.cw_text_stop_btn = ttk.Button(tf, text="■ Stop",
+                                           command=self._cw_text_abort, width=8)
+        self.cw_text_stop_btn.grid(row=0, column=2)
+
+        # ── Hint ───────────────────────────────────────────────────────────────
         ttk.Label(tab, text="ESC = Abbruch  |  Pin → Taste → GND  |  Active Low",
-                  foreground="gray").grid(row=4, column=0, columnspan=2, pady=2)
+                  foreground="gray").grid(row=5, column=0, columnspan=2, pady=2)
 
     def _build_console_tab(self):
         tab = ttk.Frame(self.notebook, padding=10)
@@ -1218,7 +1246,78 @@ class SX1280ControlApp(ttk.Frame):
         self.cw_dec_text.config(state='disabled')
         self.cw_sym_lbl.config(text='')
 
+    # ── Text Transmit ──────────────────────────────────────────────────────────
+
+    def _cw_text_send(self):
+        """Start transmitting the text-field content as CW."""
+        text = self.cw_text_var.get().strip().upper()
+        if not text:
+            return
+        # Abort any running text TX and start fresh.
+        self._cw_text_abort()
+        self._cw_text_stop.clear()
+        self._cw_text_thread = threading.Thread(
+            target=self._cw_text_loop, args=(text,), daemon=True)
+        self._cw_text_thread.start()
+
+    def _cw_text_abort(self):
+        """Immediately stop text transmit and silence the sidetone."""
+        self._cw_text_stop.set()
+        self.audio.off()
+        if self._cw_tx_active and self.worker.is_connected():
+            try: self.worker.send_line("stop")
+            except Exception: pass
+
+    def _cw_text_loop(self, text):
+        """Background thread: convert text to CW elements and drive callbacks."""
+        stop   = self._cw_text_stop
+        cb_on  = self.keyer.cb_key_on
+        cb_off = self.keyer.cb_key_off
+
+        def _sleep_ms(ms):
+            """Sleep for ms milliseconds, waking every 2 ms to check stop."""
+            end = time.monotonic() + ms / 1000.0
+            while time.monotonic() < end:
+                if stop.is_set():
+                    return
+                time.sleep(0.002)
+
+        for ch in text:
+            if stop.is_set():
+                break
+            if ch == ' ':
+                # Word gap: 7 dits total between words.
+                # 3 dits were already slept as inter-char gap after the last
+                # character, so only the remaining 4 dits (iwd_ms) are needed.
+                _sleep_ms(self.keyer.iwd_ms)
+                continue
+            code = MORSE_ENCODE.get(ch)
+            if not code:
+                continue
+            for j, sym in enumerate(code):
+                if stop.is_set():
+                    break
+                if cb_on:
+                    cb_on()
+                dur = (self.keyer.dit_mark_ms if sym == '.'
+                       else self.keyer.dah_mark_ms)
+                _sleep_ms(dur)
+                if cb_off:
+                    cb_off()
+                # Inter-element gap between elements of the same character.
+                if j < len(code) - 1:
+                    _sleep_ms(self.keyer.iel_ms)
+            if stop.is_set():
+                break
+            # Inter-character gap: 3 dits total (iel + ich).
+            _sleep_ms(self.keyer.iel_ms + self.keyer.ich_ms)
+
+        # Guarantee sidetone off when done or aborted.
+        if cb_off:
+            cb_off()
+
     def _cw_on_esc(self, _=None):
+        self._cw_text_abort()
         if self._cw_running:
             self._cw_stop()
 
