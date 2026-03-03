@@ -611,8 +611,9 @@ class SX1280ControlApp(ttk.Frame):
         self.audio       = AudioEngine()
         self.keyer       = Keyer()
         self.key_reader  = None
-        self._cw_running = False
-        self._cw_thread  = None
+        self._cw_running   = False
+        self._cw_thread    = None
+        self._cw_tx_active = False   # True = SX1280 wird mitgekeyt
         # FIX B: shared key state written only by _cw_loop (background thread),
         # read only by _cw_gui_update (GUI thread) – eliminates serial port race.
         self._cw_key_state = (False, False)
@@ -620,8 +621,22 @@ class SX1280ControlApp(ttk.Frame):
         # directly from a background thread (would deadlock against keyer._lock).
         self._cw_char_queue: queue.Queue = queue.Queue()
 
-        self.keyer.cb_key_on  = self.audio.on
-        self.keyer.cb_key_off = self.audio.off
+        # cb_key_on / cb_key_off: Sidetone + optional SX1280-Träger.
+        # worker.send_line() ist thread-sicher (eigener Lock, kein Tkinter).
+        def _cb_key_on():
+            self.audio.on()
+            if self._cw_tx_active and self.worker.is_connected():
+                try: self.worker.send_line("cw")
+                except Exception: pass
+
+        def _cb_key_off():
+            self.audio.off()
+            if self._cw_tx_active and self.worker.is_connected():
+                try: self.worker.send_line("stop")
+                except Exception: pass
+
+        self.keyer.cb_key_on  = _cb_key_on
+        self.keyer.cb_key_off = _cb_key_off
         self.keyer.cb_char    = self._cw_on_char
         self.keyer.cb_word_sp = self._cw_on_word_space
 
@@ -974,6 +989,9 @@ class SX1280ControlApp(ttk.Frame):
         self.cw_sym_lbl = ttk.Label(sf, text="",
                                      font=("Consolas", 20, "bold"), foreground="#cc8800")
         self.cw_sym_lbl.pack(pady=4)
+        self.cw_tx_btn = ttk.Button(sf, text="⬛  TX AUS",
+                                    command=self._cw_toggle_tx)
+        self.cw_tx_btn.pack(fill='x', pady=(4, 0))
 
         df = ttk.LabelFrame(tab, text="Dekodierter Text", padding=8)
         df.grid(row=3, column=1, sticky="nsew", pady=(0, 8))
@@ -1033,6 +1051,21 @@ class SX1280ControlApp(ttk.Frame):
         if state == 'normal':
             self._cw_mode_changed()
 
+    def _cw_toggle_tx(self):
+        if not self.worker.is_connected():
+            messagebox.showwarning("Nicht verbunden",
+                                   "Bitte zuerst mit dem SX1280 verbinden\n"
+                                   "(Verbindungsleiste oben)!")
+            return
+        self._cw_tx_active = not self._cw_tx_active
+        if self._cw_tx_active:
+            self.cw_tx_btn.config(text="🔴  TX EIN")
+        else:
+            # Träger sofort abschalten, falls Taste gerade gedrückt ist
+            try: self.worker.send_line("stop")
+            except Exception: pass
+            self.cw_tx_btn.config(text="⬛  TX AUS")
+
     def _load_cw_weight(self):
         try:
             data = json.loads(_CW_SETTINGS_PATH.read_text())
@@ -1090,6 +1123,12 @@ class SX1280ControlApp(ttk.Frame):
 
     def _cw_stop(self):
         self._cw_running = False
+        # TX sofort deaktivieren und Träger abschalten, bevor keyer.reset() läuft
+        if self._cw_tx_active and self.worker.is_connected():
+            try: self.worker.send_line("stop")
+            except Exception: pass
+        self._cw_tx_active = False
+        self.cw_tx_btn.config(text="⬛  TX AUS")
         self.keyer.reset()
         if self.key_reader:
             self.key_reader.disconnect()
