@@ -228,9 +228,12 @@ class AudioEngine:
     def _stream_loop(self, stream):
         chunk = 512
         sr    = self.sample_rate
-        # Per-sample exponential envelope: 5 ms attack, 5 ms release.
+        # Per-sample exponential envelope: 2 ms attack, 5 ms release.
+        # 2 ms attack: reaches full amplitude quickly enough for high-speed CW
+        # (at 60 WPM a dit is 20 ms; 2 ms τ → 95 % in 6 ms, no audible click).
+        # 5 ms release: longer tail suppresses key-up transients.
         # alpha = 1 - exp(-1 / (T_ms * 0.001 * sr))
-        alpha_att = 1.0 - np.exp(-1.0 / (5.0 * 0.001 * sr))
+        alpha_att = 1.0 - np.exp(-1.0 / (2.0 * 0.001 * sr))
         alpha_rel = 1.0 - np.exp(-1.0 / (5.0 * 0.001 * sr))
         current_vol = 0.0
         phase = 0.0          # phase angle in radians – maintained across chunks
@@ -424,7 +427,8 @@ class Keyer:
                 if self.cb_key_off: self.cb_key_off()
                 self._sym_buf += '.' if dur < self.dit_ms * 2.0 else '-'
             elif self._state == 'IDLE' and self._sym_buf:
-                if now - self._t0 >= self.ich_ms:
+                # 3-dit inter-char gap (IEL + ICH), consistent with iambic mode.
+                if now - self._t0 >= self.iel_ms + self.ich_ms:
                     ch = MORSE_TABLE.get(self._sym_buf, '?')
                     self._sym_buf = ''
                     if self.cb_char: self.cb_char(ch)
@@ -1180,6 +1184,7 @@ class SX1280ControlApp(ttk.Frame):
         self._cw_set_widgets_state('disabled')
 
     def _cw_stop(self):
+        self._cw_text_abort()   # Text-TX stoppen bevor Keyer-Reset
         self._cw_running = False
         # TX sofort deaktivieren und Träger abschalten, bevor keyer.reset() läuft
         if self._cw_tx_active and self.worker.is_connected():
@@ -1275,16 +1280,18 @@ class SX1280ControlApp(ttk.Frame):
             return
 
         self._cw_last_sent = full          # remember for next delta
-        # Abort any running text TX and start fresh.
+        # Abort running text TX, then give the new thread its own stop Event
+        # so we never race between set() and clear() on a shared Event.
         self._cw_text_abort()
-        self._cw_text_stop.clear()
+        stop = threading.Event()
+        self._cw_text_stop = stop
         self._cw_text_thread = threading.Thread(
-            target=self._cw_text_loop, args=(to_send,), daemon=True)
+            target=self._cw_text_loop, args=(to_send, stop), daemon=True)
         self._cw_text_thread.start()
 
     def _cw_text_abort(self):
         """Immediately stop text transmit and silence the sidetone."""
-        self._cw_text_stop.set()
+        self._cw_text_stop.set()   # old thread's Event – never cleared
         self.audio.off()
         if self._cw_tx_active and self.worker.is_connected():
             try: self.worker.send_line("stop")
@@ -1295,28 +1302,43 @@ class SX1280ControlApp(ttk.Frame):
         self.cw_text_var.set("")
         self._cw_last_sent = ""
 
-    def _cw_text_loop(self, text):
-        """Background thread: convert text to CW elements and drive callbacks."""
-        stop   = self._cw_text_stop
+    def _cw_text_loop(self, text, stop):
+        """Background thread: convert text to CW elements and drive callbacks.
+
+        Uses absolute-deadline timing (_sleep_until) to prevent per-element
+        drift from Python call overhead.  Timing attributes are snapshotted
+        under the keyer lock once per character so WPM changes never split a
+        single character across two speed settings.
+        """
         cb_on  = self.keyer.cb_key_on
         cb_off = self.keyer.cb_key_off
 
-        def _sleep_ms(ms):
-            """Sleep for ms milliseconds, waking every 2 ms to check stop."""
-            end = time.monotonic() + ms / 1000.0
-            while time.monotonic() < end:
-                if stop.is_set():
+        def _sleep_until(deadline):
+            """Sleep until an absolute monotonic deadline, checking stop every 1 ms."""
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or stop.is_set():
                     return
-                time.sleep(0.002)
+                time.sleep(min(remaining, 0.001))
+
+        t = time.monotonic()   # absolute timeline origin
 
         for ch in text:
             if stop.is_set():
                 break
+            # Snapshot timing under lock – one consistent set per character.
+            with self.keyer._lock:
+                dit_mark = self.keyer.dit_mark_ms / 1000.0
+                dah_mark = self.keyer.dah_mark_ms / 1000.0
+                iel      = self.keyer.iel_ms      / 1000.0
+                ich      = self.keyer.ich_ms      / 1000.0
+                iwd      = self.keyer.iwd_ms      / 1000.0
             if ch == ' ':
                 # Word gap: 7 dits total between words.
-                # 3 dits were already slept as inter-char gap after the last
-                # character, so only the remaining 4 dits (iwd_ms) are needed.
-                _sleep_ms(self.keyer.iwd_ms)
+                # 3 dits were already scheduled as inter-char gap after the last
+                # character, so only the remaining 4 dits (iwd) are needed.
+                t += iwd
+                _sleep_until(t)
                 if not stop.is_set():
                     self._cw_char_queue.put(' ')   # mirror space to decoded text
                 continue
@@ -1326,21 +1348,21 @@ class SX1280ControlApp(ttk.Frame):
             for j, sym in enumerate(code):
                 if stop.is_set():
                     break
-                if cb_on:
-                    cb_on()
-                dur = (self.keyer.dit_mark_ms if sym == '.'
-                       else self.keyer.dah_mark_ms)
-                _sleep_ms(dur)
-                if cb_off:
-                    cb_off()
+                dur = dit_mark if sym == '.' else dah_mark
+                if cb_on: cb_on()
+                t += dur
+                _sleep_until(t)
+                if cb_off: cb_off()
                 # Inter-element gap between elements of the same character.
                 if j < len(code) - 1:
-                    _sleep_ms(self.keyer.iel_ms)
+                    t += iel
+                    _sleep_until(t)
             if stop.is_set():
                 break
             # Inter-character gap: 3 dits total (iel + ich).
-            _sleep_ms(self.keyer.iel_ms + self.keyer.ich_ms)
-            self._cw_char_queue.put(ch)            # mirror char to decoded text
+            t += iel + ich
+            _sleep_until(t)
+            self._cw_char_queue.put(ch)   # mirror char to decoded text
 
         # Guarantee sidetone off when done or aborted.
         if cb_off:
