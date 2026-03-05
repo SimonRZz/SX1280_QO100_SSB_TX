@@ -130,6 +130,7 @@ static volatile float g_ppm_correction = 0.0f;
 static volatile uint8_t g_cw_test_mode = 0;  // 1 = CW test active (blocks normal Core1 operation)
 static volatile int8_t g_tx_power_max_dbm = PWR_MAX_DBM;  // Runtime TX power limit
 static volatile uint8_t g_tx_enabled = 1;  // TX enable flag (for GUI TX button)
+static volatile uint8_t g_ptt_active = 0;  // Manual PTT control for normal SSB/audio TX
 
 // --- Hilbert ---
 #define HILBERT_TAPS        247
@@ -988,7 +989,7 @@ static void cfg_print(void) {
 
     cdc_printf(
         "CFG:\r\n"
-        "  freq=%.1f Hz (target)  ppm=%.3f  tx=%s  txpwr=%d dBm\r\n"
+        "  freq=%.1f Hz (target)  ppm=%.3f  tx=%s  ptt=%s  txpwr=%d dBm\r\n"
         "  corrected=%.1f Hz  base_steps=%lu  fine=%.1f Hz (auto)\r\n"
         "  enable bp=%u eq=%u comp=%u\r\n"
         "  bp_lo=%.1f bp_hi=%.1f bp_stages=%u (%u dB/oct)\r\n"
@@ -996,7 +997,7 @@ static void cfg_print(void) {
         "  eq_high_hz=%.1f eq_high_db=%.1f\r\n"
         "  comp_thr=%.1f ratio=%.2f att=%.2fms rel=%.2fms makeup=%.1f knee=%.1f outlim=%.3f\r\n"
         "  amp_gain=%.3f amp_min_a=%.9f\r\n",
-        g_target_freq_hz, g_ppm_correction, g_tx_enabled ? "ON" : "OFF", g_tx_power_max_dbm,
+        g_target_freq_hz, g_ppm_correction, g_tx_enabled ? "ON" : "OFF", g_ptt_active ? "ON" : "OFF", g_tx_power_max_dbm,
         corrected, (unsigned long)get_base_steps(), fine,
         c.enable_bandpass, c.enable_eq, c.enable_comp,
         c.bp_lo_hz, c.bp_hi_hz, c.bp_stages, c.bp_stages * 12,
@@ -1014,6 +1015,7 @@ static void cmd_help(void) {
         "  get\r\n"
         "  diag          - show SX1280 status\r\n"
         "  tx 0|1        - enable/disable TX (SSB modulation)\r\n"
+        "  ptt 0|1       - push-to-talk for normal SSB/audio TX\r\n"
         "  cw            - start CW test transmission\r\n"
         "  stop          - stop CW transmission\r\n"
         "  freq <Hz>     - set frequency with sub-Hz precision (e.g. freq 2400100050.5)\r\n"
@@ -1061,7 +1063,12 @@ static void cdc_handle_line(char *line) {
     if (streqi(argv[0], "get"))  { cfg_print(); return; }
     if (streqi(argv[0], "diag")) { sx_print_diag(); return; }
     if (streqi(argv[0], "cw"))   { sx_test_cw(); return; }
-    if (streqi(argv[0], "stop")) { sx_stop_cw(); return; }
+    if (streqi(argv[0], "stop")) {
+        g_ptt_active = 0;
+        sx_stop_cw();
+        cdc_write_str("PTT OFF\r\n");
+        return;
+    }
 
     // TX enable/disable: tx 0|1
     if (streqi(argv[0], "tx") && argc >= 2) {
@@ -1072,6 +1079,18 @@ static void cdc_handle_line(char *line) {
         }
         g_tx_enabled = v;
         cdc_printf("OK tx=%s\r\n", g_tx_enabled ? "ON" : "OFF");
+        return;
+    }
+
+    // Manual PTT enable/disable: ptt 0|1
+    if (streqi(argv[0], "ptt") && argc >= 2) {
+        uint8_t v;
+        if (!parse_bool(argv[1], &v)) {
+            cdc_write_str("ERR: ptt 0|1|on|off\r\n");
+            return;
+        }
+        g_ptt_active = v;
+        cdc_printf("OK ptt=%s\r\n", g_ptt_active ? "ON" : "OFF");
         return;
     }
 
@@ -1290,7 +1309,6 @@ static void core1_radio_apply_loop(void) {
     int32_t last_steps = 0x7FFFFFFF;
     int32_t last_p_dbm = 9999;
     bool last_tx_on = false;  // Start with TX off
-    bool tx_en_activated = false;  // Track if we've enabled the PA
 
     while (true) {
         // If CW test mode is active, skip SPI operations
@@ -1320,13 +1338,6 @@ static void core1_radio_apply_loop(void) {
             continue;
         }
 
-        // Enable TX_EN on first valid block (USB is now stable)
-        if (!tx_en_activated) {
-            gpio_put(PIN_TX_EN, 1);
-            tx_en_activated = true;
-            sleep_ms(1);  // Short delay for PA to stabilize
-        }
-
         sample_cmd_t *blk = g_blocks[b];
         uint64_t next_us = time_us_64();
 
@@ -1337,12 +1348,19 @@ static void core1_radio_apply_loop(void) {
                 sample_cmd_t c = blk[i];
 
                 if ((bool)c.tx_on != last_tx_on) {
-                    if (c.tx_on) sx_start_tx_continuous_wave();
+                    if (c.tx_on) {
+                        gpio_put(PIN_TX_EN, 1);
+                        sleep_ms(1);  // Short delay for PA to stabilize
+                        sx_start_tx_continuous_wave();
+                    }
 #if USE_TCXO_MODULE
                     else         sx_set_standby_xosc();
 #else
                     else         sx_set_standby_rc();
 #endif
+                    if (!c.tx_on) {
+                        gpio_put(PIN_TX_EN, 0);
+                    }
                     last_tx_on = (bool)c.tx_on;
                 }
 
@@ -1815,7 +1833,7 @@ int main(void) {
             }
 
             // Check global TX enable flag (from GUI TX button)
-            if (!g_tx_enabled) {
+            if (!g_tx_enabled || !g_ptt_active) {
                 tx_on = 0;
             }
 
