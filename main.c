@@ -593,12 +593,24 @@ static void sx_test_cw(void) {
     // Signal Core1 to stop SPI operations
     g_cw_test_mode = 1;
     __compiler_memory_barrier();
-    sleep_ms(50);  // Wait for Core1 to finish current block (max 32 ms) and see flag
-    
+    // Wait for Core1 to finish its current block (max 32 ms) and see the flag.
+    // Keep TinyUSB alive during the wait so the host can write without timing out.
+    {
+        absolute_time_t deadline = make_timeout_time_ms(60);
+        while (!time_reached(deadline)) {
+            tud_task();
+            sleep_ms(1);
+        }
+    }
+
     // Ensure TCXO is on
 #if USE_TCXO_MODULE
     gpio_put(PIN_TCXO_EN, 1);
-    sleep_ms(5);
+    // Brief TCXO stabilisation - keep USB alive
+    {
+        absolute_time_t deadline = make_timeout_time_ms(5);
+        while (!time_reached(deadline)) { tud_task(); sleep_ms(1); }
+    }
     cdc_printf("TCXO enabled\r\n");
 #endif
     
