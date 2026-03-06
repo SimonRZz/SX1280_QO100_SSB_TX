@@ -592,7 +592,8 @@ static void sx_test_cw(void) {
     
     // Signal Core1 to stop SPI operations
     g_cw_test_mode = 1;
-    sleep_ms(10);  // Wait for Core1 to see flag and stop
+    __compiler_memory_barrier();
+    sleep_ms(50);  // Wait for Core1 to finish current block (max 32 ms) and see flag
     
     // Ensure TCXO is on
 #if USE_TCXO_MODULE
