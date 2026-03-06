@@ -128,7 +128,8 @@ static const uint32_t SX_SPI_BAUD = 18000000;
 // Frequency stored as double for sub-Hz precision; automatically split into PLL steps + fine DSP offset
 static volatile double g_target_freq_hz = (double)BASE_FREQ_HZ;
 static volatile float g_ppm_correction = 0.0f;
-static volatile uint8_t g_cw_test_mode = 0;  // 1 = CW test active (blocks normal Core1 operation)
+static volatile uint8_t g_cw_test_mode      = 0;  // 1 = CW test active (blocks normal Core1 operation)
+static volatile uint8_t g_cw_test_requested = 0;  // set by CDC handler, consumed by main loop
 static volatile int8_t g_tx_power_max_dbm = PWR_MAX_DBM;  // Runtime TX power limit
 static volatile uint8_t g_tx_enabled  = 1;  // TX enable flag (for GUI TX button)
 static volatile uint8_t g_pa_enabled  = 0;  // External PA: 0=always off (default), 1=follows TX
@@ -593,25 +594,15 @@ static void sx_test_cw(void) {
     // Signal Core1 to stop SPI operations
     g_cw_test_mode = 1;
     __compiler_memory_barrier();
-    // Wait for Core1 to finish its current block (max 32 ms) and see the flag.
-    // Keep TinyUSB alive during the wait so the host can write without timing out.
-    {
-        absolute_time_t deadline = make_timeout_time_ms(60);
-        while (!time_reached(deadline)) {
-            tud_task();
-            sleep_ms(1);
-        }
-    }
+    // Wait 60 ms for Core1 to finish its current block (max 32 ms) and see the flag.
+    // Called from the main loop (never from inside cdc_task/tud_task), so
+    // tud_task() is not running here – the 60 ms stall is safe (<<500 ms timeout).
+    sleep_ms(60);
 
     // Ensure TCXO is on
 #if USE_TCXO_MODULE
     gpio_put(PIN_TCXO_EN, 1);
-    // Brief TCXO stabilisation - keep USB alive
-    {
-        absolute_time_t deadline = make_timeout_time_ms(5);
-        while (!time_reached(deadline)) { tud_task(); sleep_ms(1); }
-    }
-    cdc_printf("TCXO enabled\r\n");
+    sleep_ms(5);
 #endif
     
     // Set standby
@@ -1078,7 +1069,7 @@ static void cdc_handle_line(char *line) {
     if (streqi(argv[0], "help")) { cmd_help(); return; }
     if (streqi(argv[0], "get"))  { cfg_print(); return; }
     if (streqi(argv[0], "diag")) { sx_print_diag(); return; }
-    if (streqi(argv[0], "cw"))   { sx_test_cw(); return; }
+    if (streqi(argv[0], "cw"))   { g_cw_test_requested = 1; cdc_write_str("CW: starting...\r\n"); return; }
     if (streqi(argv[0], "stop")) { sx_stop_cw(); return; }
 
     // TX enable/disable: tx 0|1
@@ -1652,6 +1643,13 @@ int main(void) {
         }
 
 #if CFG_TUD_CDC
+        // Handle CW test request here (main loop), NOT inside cdc_task().
+        // This avoids re-entrant tud_task() calls that crash the USB stack.
+        if (g_cw_test_requested) {
+            g_cw_test_requested = 0;
+            sx_test_cw();
+        }
+
         if (!greeted && tud_cdc_connected()) {
             greeted = 1;
             cdc_write_str("\r\nSX1280_SDR control ready. Type 'help'.\r\n");
