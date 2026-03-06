@@ -692,6 +692,7 @@ class SX1280ControlApp(ttk.Frame):
         self.freq_hz_var  = tk.StringVar(value=str(self.config.freq_hz))
         self.ppm_var      = tk.DoubleVar(value=0.0)
         self.txpwr_var    = tk.IntVar(value=self.config.tx_power_dbm)
+        self.pa_enabled_var          = tk.BooleanVar(value=False)
         self.tx_enabled_var          = tk.BooleanVar(value=True)
         self.scroll_tune_enabled_var = tk.BooleanVar(value=False)
         self.en_bp_var    = tk.BooleanVar(value=self.config.enable_bp)
@@ -825,6 +826,15 @@ class SX1280ControlApp(ttk.Frame):
         LabeledScale(tpf, "", self.txpwr_var, -18, 13, 1,
                      lambda v: self._send_cmd_safe(f"txpwr {int(v)}"),
                      lambda v: f"{int(v)} dBm").pack(fill="x")
+        pabf = ttk.Frame(tpf)
+        pabf.pack(fill="x", pady=(4, 0))
+        self.pa_btn = tk.Button(pabf, text="PA OFF", width=10,
+                                font=("TkDefaultFont", 10, "bold"),
+                                command=self._toggle_pa, relief="raised", bd=2,
+                                bg="#cccccc", fg="black",
+                                activebackground="#dddddd", activeforeground="black")
+        self.pa_btn.pack(side="left")
+        ttk.Label(pabf, text="  Ext. PA  (GPIO 13)", foreground="gray").pack(side="left")
 
         ef = ttk.LabelFrame(tab, text="DSP Modules", padding=10)
         ef.grid(row=1, column=0, sticky="ew", pady=(0, 10))
@@ -1431,6 +1441,17 @@ class SX1280ControlApp(ttk.Frame):
         else:
             self.tx_button.config(text="TX OFF", bg="#cccccc", fg="black",
                                    activebackground="#dddddd", activeforeground="black")
+
+    def _toggle_pa(self):
+        new_state = not self.pa_enabled_var.get()
+        self.pa_enabled_var.set(new_state)
+        if new_state:
+            self.pa_btn.config(text="PA ON", bg="#ff6600", fg="white",
+                               activebackground="#ff8833", activeforeground="white")
+        else:
+            self.pa_btn.config(text="PA OFF", bg="#cccccc", fg="black",
+                               activebackground="#dddddd", activeforeground="black")
+        self._send_cmd_safe(f"pa {'1' if new_state else '0'}")
 
     def _on_ppm_slider(self, _val):
         ppm = self.ppm_var.get()

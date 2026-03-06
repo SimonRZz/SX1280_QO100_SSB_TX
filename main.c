@@ -92,6 +92,7 @@ static const uint32_t PIN_NSS   = 17;
 
 static const uint32_t PIN_RX_EN = 14;
 static const uint32_t PIN_TX_EN = 15;
+static const uint32_t PIN_PA_EN = 13;  // External PA enable (active HIGH, GPIO13)
 
 static const uint32_t PIN_RESET = 20;
 static const uint32_t PIN_BUSY  = 21;
@@ -129,7 +130,8 @@ static volatile double g_target_freq_hz = (double)BASE_FREQ_HZ;
 static volatile float g_ppm_correction = 0.0f;
 static volatile uint8_t g_cw_test_mode = 0;  // 1 = CW test active (blocks normal Core1 operation)
 static volatile int8_t g_tx_power_max_dbm = PWR_MAX_DBM;  // Runtime TX power limit
-static volatile uint8_t g_tx_enabled = 1;  // TX enable flag (for GUI TX button)
+static volatile uint8_t g_tx_enabled  = 1;  // TX enable flag (for GUI TX button)
+static volatile uint8_t g_pa_enabled  = 0;  // External PA: 0=always off (default), 1=follows TX
 
 // --- Hilbert ---
 #define HILBERT_TAPS        247
@@ -643,6 +645,7 @@ static void sx_test_cw(void) {
 // Stop CW transmission
 static void sx_stop_cw(void) {
 #if CFG_TUD_CDC
+    gpio_put(PIN_PA_EN, 0);  // PA off first (before RF goes quiet)
     gpio_put(PIN_TX_EN, 0);
 #if USE_TCXO_MODULE
     sx_set_standby_xosc();
@@ -650,7 +653,7 @@ static void sx_stop_cw(void) {
     sx_set_standby_rc();
 #endif
     cdc_printf("TX stopped, back to standby\r\n");
-    
+
     // Resume normal Core1 operation
     g_cw_test_mode = 0;
 #endif
@@ -988,7 +991,7 @@ static void cfg_print(void) {
 
     cdc_printf(
         "CFG:\r\n"
-        "  freq=%.1f Hz (target)  ppm=%.3f  tx=%s  txpwr=%d dBm\r\n"
+        "  freq=%.1f Hz (target)  ppm=%.3f  tx=%s  txpwr=%d dBm  pa=%s\r\n"
         "  corrected=%.1f Hz  base_steps=%lu  fine=%.1f Hz (auto)\r\n"
         "  enable bp=%u eq=%u comp=%u\r\n"
         "  bp_lo=%.1f bp_hi=%.1f bp_stages=%u (%u dB/oct)\r\n"
@@ -997,6 +1000,7 @@ static void cfg_print(void) {
         "  comp_thr=%.1f ratio=%.2f att=%.2fms rel=%.2fms makeup=%.1f knee=%.1f outlim=%.3f\r\n"
         "  amp_gain=%.3f amp_min_a=%.9f\r\n",
         g_target_freq_hz, g_ppm_correction, g_tx_enabled ? "ON" : "OFF", g_tx_power_max_dbm,
+        g_pa_enabled ? "ON" : "OFF",
         corrected, (unsigned long)get_base_steps(), fine,
         c.enable_bandpass, c.enable_eq, c.enable_comp,
         c.bp_lo_hz, c.bp_hi_hz, c.bp_stages, c.bp_stages * 12,
@@ -1019,6 +1023,7 @@ static void cmd_help(void) {
         "  freq <Hz>     - set frequency with sub-Hz precision (e.g. freq 2400100050.5)\r\n"
         "  ppm <value>   - set PPM correction (e.g. ppm -0.5)\r\n"
         "  txpwr <-18..13> - set max TX power in dBm\r\n"
+        "  pa 0|1         - enable/disable external PA (GPIO13, default OFF)\r\n"
         "  enable <bp|eq|comp> <0|1|on|off>\r\n"
         "  set bp_lo <Hz>\r\n"
         "  set bp_hi <Hz>\r\n"
@@ -1109,6 +1114,19 @@ static void cdc_handle_line(char *line) {
         cdc_printf("OK ppm=%.3f (corrected=%.1f Hz, steps=%lu, fine=%.1f Hz)\r\n", 
                    g_ppm_correction, corrected,
                    (unsigned long)get_base_steps(), fine);
+        return;
+    }
+
+    // External PA enable/disable: pa 0|1
+    if (streqi(argv[0], "pa") && argc >= 2) {
+        uint8_t v;
+        if (!parse_bool(argv[1], &v)) {
+            cdc_write_str("ERR: pa 0|1|on|off\r\n");
+            return;
+        }
+        g_pa_enabled = v;
+        if (!v) gpio_put(PIN_PA_EN, 0);  // Immediately silence PA when disabled
+        cdc_printf("OK pa=%s\r\n", g_pa_enabled ? "ON" : "OFF");
         return;
     }
 
@@ -1337,12 +1355,19 @@ static void core1_radio_apply_loop(void) {
                 sample_cmd_t c = blk[i];
 
                 if ((bool)c.tx_on != last_tx_on) {
-                    if (c.tx_on) sx_start_tx_continuous_wave();
+                    if (c.tx_on) {
+                        // Enable external PA before starting the carrier (if user enabled it).
+                        gpio_put(PIN_PA_EN, (uint8_t)g_pa_enabled);
+                        sx_start_tx_continuous_wave();
+                    } else {
+                        // Silence RF first, then kill PA so no glitch reaches the antenna.
+                        gpio_put(PIN_PA_EN, 0);
 #if USE_TCXO_MODULE
-                    else         sx_set_standby_xosc();
+                        sx_set_standby_xosc();
 #else
-                    else         sx_set_standby_rc();
+                        sx_set_standby_rc();
 #endif
+                    }
                     last_tx_on = (bool)c.tx_on;
                 }
 
@@ -1458,6 +1483,7 @@ int main(void) {
     gpio_init(PIN_NSS);   gpio_set_dir(PIN_NSS, GPIO_OUT);   gpio_put(PIN_NSS, 1);
     gpio_init(PIN_RX_EN); gpio_set_dir(PIN_RX_EN, GPIO_OUT); gpio_put(PIN_RX_EN, 0);
     gpio_init(PIN_TX_EN); gpio_set_dir(PIN_TX_EN, GPIO_OUT); gpio_put(PIN_TX_EN, 0);  // Start with TX disabled!
+    gpio_init(PIN_PA_EN); gpio_set_dir(PIN_PA_EN, GPIO_OUT); gpio_put(PIN_PA_EN, 0);  // PA always off at boot
     gpio_init(PIN_RESET); gpio_set_dir(PIN_RESET, GPIO_OUT); gpio_put(PIN_RESET, 1);
     gpio_init(PIN_BUSY);  gpio_set_dir(PIN_BUSY, GPIO_IN);
 
