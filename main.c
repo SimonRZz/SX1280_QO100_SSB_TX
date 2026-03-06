@@ -596,7 +596,7 @@ static void sx_print_diag(void) {
 static void sx_test_cw(void) {
 #if CFG_TUD_CDC
     cdc_printf("\r\n*** Starting CW test ***\r\n");
-    
+
     // Signal Core1 to stop SPI operations.
     // sx_test_cw() is always called from the main loop (never inside cdc_task/tud_task),
     // so calling tud_task() here is safe – no re-entrancy.
@@ -606,20 +606,27 @@ static void sx_test_cw(void) {
     // while keeping TinyUSB alive so host writes never time out.
     for (int _i = 0; _i < 60; _i++) { tud_task(); sleep_ms(1); }
 
-    // Ensure TCXO is on
 #if USE_TCXO_MODULE
     gpio_put(PIN_TCXO_EN, 1);
     for (int _i = 0; _i < 5; _i++) { tud_task(); sleep_ms(1); }
     cdc_printf("TCXO enabled\r\n");
 #endif
 
-    // Set standby
+    // Set standby and verify chip actually entered that mode
 #if USE_TCXO_MODULE
     sx_set_standby_xosc(); tud_task();
-    cdc_printf("Mode: STDBY_XOSC\r\n");
+    {
+        uint8_t st = sx_get_status();
+        cdc_printf("Mode: STDBY_XOSC (sent) → chip mode=%d cmd_stat=%d [0x%02X]\r\n",
+                   (st>>5)&7, (st>>1)&7, st);
+    }
 #else
     sx_set_standby_rc(); tud_task();
-    cdc_printf("Mode: STDBY_RC\r\n");
+    {
+        uint8_t st = sx_get_status();
+        cdc_printf("Mode: STDBY_RC (sent) → chip mode=%d [0x%02X]\r\n",
+                   (st>>5)&7, st);
+    }
 #endif
 
     // Packet type
@@ -640,16 +647,26 @@ static void sx_test_cw(void) {
     gpio_put(PIN_RX_EN, 0);
     cdc_printf("TX_EN=1, RX_EN=0\r\n");
 
-    // Start CW
+    // Start CW – check status immediately (before 5ms) and after
     sx_start_tx_continuous_wave(); tud_task();
+    {
+        uint8_t st_imm = sx_get_status();
+        cdc_printf("Status immediately after SetTxCW: 0x%02X (mode=%d cmd_stat=%d)\r\n",
+                   st_imm, (st_imm>>5)&7, (st_imm>>1)&7);
+    }
     for (int _i = 0; _i < 5; _i++) { tud_task(); sleep_ms(1); }
     uint8_t status = sx_get_status(); tud_task();
-    cdc_printf("Status after CW: 0x%02X (mode=%d)\r\n", status, (status >> 5) & 0x07);
-    
+    cdc_printf("Status after 5ms: 0x%02X (mode=%d)\r\n", status, (status >> 5) & 0x07);
+    cdc_printf("  mode 6=TX, 3=STDBY_XOSC, 2=STDBY_RC\r\n");
+    cdc_printf("  cmd_stat: 5=fail, 3=timeout, 6=TX_done, 2=data_avail\r\n");
+
     if (((status >> 5) & 0x07) == 6) {
         cdc_printf("*** TX ACTIVE - check spectrum analyzer! ***\r\n");
     } else {
         cdc_printf("*** WARNING: TX not active! ***\r\n");
+        cdc_printf("  If mode=2 and cmd_stat=5: XOSC/PLL failed (check XTA signal)\r\n");
+        cdc_printf("  If mode=2 and cmd_stat=3: command timeout\r\n");
+        cdc_printf("  BUSY pin: %d (should be 0 after failed cmd)\r\n", gpio_get(PIN_BUSY));
     }
 #endif
 }
