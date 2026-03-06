@@ -148,7 +148,6 @@ class SerialWorker:
             if not self.is_connected():
                 raise RuntimeError("Not connected")
             self.ser.write(data)
-            self.ser.flush()
 
     def _rx_loop(self):
         buf = bytearray()

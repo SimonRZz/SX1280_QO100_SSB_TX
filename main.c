@@ -130,6 +130,7 @@ static volatile double g_target_freq_hz = (double)BASE_FREQ_HZ;
 static volatile float g_ppm_correction = 0.0f;
 static volatile uint8_t g_cw_test_mode      = 0;  // 1 = CW test active (blocks normal Core1 operation)
 static volatile uint8_t g_cw_test_requested = 0;  // set by CDC handler, consumed by main loop
+static volatile uint8_t g_stop_cw_requested = 0;  // set by CDC handler, consumed by main loop
 static volatile int8_t g_tx_power_max_dbm = PWR_MAX_DBM;  // Runtime TX power limit
 static volatile uint8_t g_tx_enabled  = 1;  // TX enable flag (for GUI TX button)
 static volatile uint8_t g_pa_enabled  = 0;  // External PA: 0=always off (default), 1=follows TX
@@ -446,7 +447,12 @@ static inline void cs_select(void)   { gpio_put(PIN_NSS, 0); }
 static inline void cs_deselect(void) { gpio_put(PIN_NSS, 1); }
 
 static inline void sx_wait_busy(void) {
-    while (gpio_get(PIN_BUSY)) { tight_loop_contents(); }
+    // 200 ms safety timeout – prevents infinite spin if BUSY is stuck HIGH.
+    uint32_t t0 = time_us_32();
+    while (gpio_get(PIN_BUSY)) {
+        if ((uint32_t)(time_us_32() - t0) > 200000u) break;
+        tight_loop_contents();
+    }
 }
 
 // Forward declarations for CDC functions
@@ -649,14 +655,16 @@ static void sx_test_cw(void) {
 }
 
 // Stop CW transmission
+// Called from the main loop (never inside cdc_task/tud_task), so
+// tud_task() calls here are safe – no re-entrancy.
 static void sx_stop_cw(void) {
 #if CFG_TUD_CDC
     gpio_put(PIN_PA_EN, 0);  // PA off first (before RF goes quiet)
     gpio_put(PIN_TX_EN, 0);
 #if USE_TCXO_MODULE
-    sx_set_standby_xosc();
+    sx_set_standby_xosc(); tud_task();
 #else
-    sx_set_standby_rc();
+    sx_set_standby_rc(); tud_task();
 #endif
     cdc_printf("TX stopped, back to standby\r\n");
 
@@ -1072,7 +1080,7 @@ static void cdc_handle_line(char *line) {
     if (streqi(argv[0], "get"))  { cfg_print(); return; }
     if (streqi(argv[0], "diag")) { sx_print_diag(); return; }
     if (streqi(argv[0], "cw"))   { g_cw_test_requested = 1; cdc_write_str("CW: starting...\r\n"); return; }
-    if (streqi(argv[0], "stop")) { sx_stop_cw(); return; }
+    if (streqi(argv[0], "stop")) { g_stop_cw_requested  = 1; cdc_write_str("CW: stopping...\r\n"); return; }
 
     // TX enable/disable: tx 0|1
     if (streqi(argv[0], "tx") && argc >= 2) {
@@ -1641,15 +1649,30 @@ int main(void) {
 
         while (g_block_ready[b]) {
             usb_audio_pump();
+            // Check CW start/stop inside the inner loop too, so they work
+            // even while g_cw_test_mode=1 (Core1 paused, inner loop runs forever).
+#if CFG_TUD_CDC
+            if (g_cw_test_requested) {
+                g_cw_test_requested = 0;
+                sx_test_cw();
+            }
+            if (g_stop_cw_requested) {
+                g_stop_cw_requested = 0;
+                sx_stop_cw();
+            }
+#endif
             tight_loop_contents();
         }
 
 #if CFG_TUD_CDC
-        // Handle CW test request here (main loop), NOT inside cdc_task().
-        // This avoids re-entrant tud_task() calls that crash the USB stack.
+        // Also check outside the inner loop for the normal (non-CW-mode) path.
         if (g_cw_test_requested) {
             g_cw_test_requested = 0;
             sx_test_cw();
+        }
+        if (g_stop_cw_requested) {
+            g_stop_cw_requested = 0;
+            sx_stop_cw();
         }
 
         if (!greeted && tud_cdc_connected()) {
