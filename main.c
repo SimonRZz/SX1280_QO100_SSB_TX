@@ -79,9 +79,9 @@
 // ===============================================
 
 // ================== MODULE VARIANT ==================
-// Set to 1 if using LoRa1280F27-TCXO module
-// Set to 0 if using LoRa1280F27 or LoRa1281F27 (standard crystal)
-#define USE_TCXO_MODULE     1
+// Set to 1 if using LoRa1280F27-TCXO module (onboard TCXO)
+// Set to 0 if using external clock on XTA pin (crystal substitute)
+#define USE_TCXO_MODULE     0   // External 52 MHz clock on XTA – no TCXO
 // ====================================================
 
 // ---------------- Pin mapping ----------------
@@ -1485,7 +1485,7 @@ int main(void) {
     board_init_after_tusb();
 
     // ---- SX1280 GPIO/SPI init ----
-    // CRITICAL FOR TCXO MODULE: Enable TCXO FIRST, before any SPI/reset!
+    // External 52 MHz clock on XTA: no TCXO GPIO needed.
 #if USE_TCXO_MODULE
     gpio_init(PIN_TCXO_EN);
     gpio_set_dir(PIN_TCXO_EN, GPIO_OUT);
