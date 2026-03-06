@@ -591,51 +591,53 @@ static void sx_test_cw(void) {
 #if CFG_TUD_CDC
     cdc_printf("\r\n*** Starting CW test ***\r\n");
     
-    // Signal Core1 to stop SPI operations
+    // Signal Core1 to stop SPI operations.
+    // sx_test_cw() is always called from the main loop (never inside cdc_task/tud_task),
+    // so calling tud_task() here is safe – no re-entrancy.
     g_cw_test_mode = 1;
     __compiler_memory_barrier();
-    // Wait 60 ms for Core1 to finish its current block (max 32 ms) and see the flag.
-    // Called from the main loop (never from inside cdc_task/tud_task), so
-    // tud_task() is not running here – the 60 ms stall is safe (<<500 ms timeout).
-    sleep_ms(60);
+    // Wait 60 ms for Core1 to finish its current block (max 32 ms) and see the flag,
+    // while keeping TinyUSB alive so host writes never time out.
+    for (int _i = 0; _i < 60; _i++) { tud_task(); sleep_ms(1); }
 
     // Ensure TCXO is on
 #if USE_TCXO_MODULE
     gpio_put(PIN_TCXO_EN, 1);
-    sleep_ms(5);
+    for (int _i = 0; _i < 5; _i++) { tud_task(); sleep_ms(1); }
+    cdc_printf("TCXO enabled\r\n");
 #endif
-    
+
     // Set standby
 #if USE_TCXO_MODULE
-    sx_set_standby_xosc();
+    sx_set_standby_xosc(); tud_task();
     cdc_printf("Mode: STDBY_XOSC\r\n");
 #else
-    sx_set_standby_rc();
+    sx_set_standby_rc(); tud_task();
     cdc_printf("Mode: STDBY_RC\r\n");
 #endif
-    
+
     // Packet type
-    sx_set_packet_type_gfsk();
+    sx_set_packet_type_gfsk(); tud_task();
     cdc_printf("Packet: GFSK\r\n");
-    
+
     // Frequency - use current center freq
     uint32_t steps = get_base_steps();
-    sx_set_rf_frequency_steps(steps);
+    sx_set_rf_frequency_steps(steps); tud_task();
     cdc_printf("Freq: %.1f Hz (steps=%lu)\r\n", g_target_freq_hz, (unsigned long)steps);
-    
+
     // Max power
-    sx_set_tx_params_dbm(g_tx_power_max_dbm);
+    sx_set_tx_params_dbm(g_tx_power_max_dbm); tud_task();
     cdc_printf("Power: %d dBm\r\n", g_tx_power_max_dbm);
-    
+
     // Enable PA
     gpio_put(PIN_TX_EN, 1);
     gpio_put(PIN_RX_EN, 0);
     cdc_printf("TX_EN=1, RX_EN=0\r\n");
-    
+
     // Start CW
-    sx_start_tx_continuous_wave();
-    sleep_ms(5);  // Give chip time to start TX
-    uint8_t status = sx_get_status();
+    sx_start_tx_continuous_wave(); tud_task();
+    for (int _i = 0; _i < 5; _i++) { tud_task(); sleep_ms(1); }
+    uint8_t status = sx_get_status(); tud_task();
     cdc_printf("Status after CW: 0x%02X (mode=%d)\r\n", status, (status >> 5) & 0x07);
     
     if (((status >> 5) & 0x07) == 6) {
