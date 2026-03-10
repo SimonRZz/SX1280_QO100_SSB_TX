@@ -1321,11 +1321,17 @@ class SX1280ControlApp(ttk.Frame):
         self._cw_text_thread.start()
 
     def _cw_text_abort(self):
-        """Immediately stop text transmit and silence the sidetone."""
+        """Immediately stop text transmit and silence the sidetone.
+
+        Sends 'key 0' (PA off) but NOT 'stop': CW mode stays active so the
+        paddle keyer and the next text-send can continue without re-init.
+        'stop' is only sent by _cw_stop() / _cw_toggle_tx() when the user
+        explicitly exits CW mode.
+        """
         self._cw_text_stop.set()   # old thread's Event – never cleared
         self.audio.off()
         if self._cw_tx_active and self.worker.is_connected():
-            try: self.worker.send_line("stop")
+            try: self.worker.send_line("key 0")   # silence PA, keep CW mode
             except Exception: pass
 
     def _cw_text_clear(self):
