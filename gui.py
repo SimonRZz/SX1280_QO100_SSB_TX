@@ -693,7 +693,7 @@ class SX1280ControlApp(ttk.Frame):
         self.ppm_var      = tk.DoubleVar(value=0.0)
         self.txpwr_var    = tk.IntVar(value=self.config.tx_power_dbm)
         self.pa_enabled_var          = tk.BooleanVar(value=False)
-        self.tcxo_enabled_var        = tk.BooleanVar(value=False)  # mirrors USE_TCXO_MODULE=0 default
+        self.tcxo_enabled_var        = tk.BooleanVar(value=True)   # mirrors USE_TCXO_MODULE=1 default
         self.tx_enabled_var          = tk.BooleanVar(value=True)
         self.scroll_tune_enabled_var = tk.BooleanVar(value=False)
         self.en_bp_var    = tk.BooleanVar(value=self.config.enable_bp)
@@ -840,11 +840,11 @@ class SX1280ControlApp(ttk.Frame):
 
         tcxobf = ttk.Frame(tpf)
         tcxobf.pack(fill="x", pady=(4, 0))
-        self.tcxo_btn = tk.Button(tcxobf, text="TCXO OFF", width=10,
+        self.tcxo_btn = tk.Button(tcxobf, text="TCXO ON", width=10,
                                   font=("TkDefaultFont", 10, "bold"),
                                   command=self._toggle_tcxo, relief="raised", bd=2,
-                                  bg="#cccccc", fg="black",
-                                  activebackground="#dddddd", activeforeground="black")
+                                  bg="#0066cc", fg="white",
+                                  activebackground="#0055aa", activeforeground="white")
         self.tcxo_btn.pack(side="left")
         ttk.Label(tcxobf, text="  Onboard TCXO (GPIO 22)",
                   foreground="gray").pack(side="left")
@@ -1433,6 +1433,8 @@ class SX1280ControlApp(ttk.Frame):
             self.status_var.set(f"🟢 Connected: {port}")
             self._log(f"Connected to {port}", "info")
             self.master.after(500, lambda: self._send_cmd_safe("get"))
+            tcxo_val = '1' if self.tcxo_enabled_var.get() else '0'
+            self.master.after(700, lambda v=tcxo_val: self._send_cmd_safe(f"tcxo {v}"))
         except Exception as e:
             messagebox.showerror("Connection failed", str(e))
             self.status_var.set("🔴 Connection failed")
