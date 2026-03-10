@@ -693,6 +693,7 @@ class SX1280ControlApp(ttk.Frame):
         self.ppm_var      = tk.DoubleVar(value=0.0)
         self.txpwr_var    = tk.IntVar(value=self.config.tx_power_dbm)
         self.pa_enabled_var          = tk.BooleanVar(value=False)
+        self.tcxo_enabled_var        = tk.BooleanVar(value=False)  # mirrors USE_TCXO_MODULE=0 default
         self.tx_enabled_var          = tk.BooleanVar(value=True)
         self.scroll_tune_enabled_var = tk.BooleanVar(value=False)
         self.en_bp_var    = tk.BooleanVar(value=self.config.enable_bp)
@@ -836,6 +837,17 @@ class SX1280ControlApp(ttk.Frame):
                                 activebackground="#dddddd", activeforeground="black")
         self.pa_btn.pack(side="left")
         ttk.Label(pabf, text="  Ext. PA  (GPIO 13)", foreground="gray").pack(side="left")
+
+        tcxobf = ttk.Frame(tpf)
+        tcxobf.pack(fill="x", pady=(4, 0))
+        self.tcxo_btn = tk.Button(tcxobf, text="TCXO OFF", width=10,
+                                  font=("TkDefaultFont", 10, "bold"),
+                                  command=self._toggle_tcxo, relief="raised", bd=2,
+                                  bg="#cccccc", fg="black",
+                                  activebackground="#dddddd", activeforeground="black")
+        self.tcxo_btn.pack(side="left")
+        ttk.Label(tcxobf, text="  Onboard TCXO (GPIO 22)",
+                  foreground="gray").pack(side="left")
 
         ef = ttk.LabelFrame(tab, text="DSP Modules", padding=10)
         ef.grid(row=1, column=0, sticky="ew", pady=(0, 10))
@@ -1461,6 +1473,17 @@ class SX1280ControlApp(ttk.Frame):
             self.pa_btn.config(text="PA OFF", bg="#cccccc", fg="black",
                                activebackground="#dddddd", activeforeground="black")
         self._send_cmd_safe(f"pa {'1' if new_state else '0'}")
+
+    def _toggle_tcxo(self):
+        new_state = not self.tcxo_enabled_var.get()
+        self.tcxo_enabled_var.set(new_state)
+        if new_state:
+            self.tcxo_btn.config(text="TCXO ON", bg="#0066cc", fg="white",
+                                 activebackground="#0088ff", activeforeground="white")
+        else:
+            self.tcxo_btn.config(text="TCXO OFF", bg="#cccccc", fg="black",
+                                 activebackground="#dddddd", activeforeground="black")
+        self._send_cmd_safe(f"tcxo {'1' if new_state else '0'}")
 
     def _on_ppm_slider(self, _val):
         ppm = self.ppm_var.get()
