@@ -131,6 +131,10 @@ static volatile float g_ppm_correction = 0.0f;
 static volatile uint8_t g_cw_test_mode      = 0;  // 1 = CW test active (blocks normal Core1 operation)
 static volatile uint8_t g_cw_test_requested = 0;  // set by CDC handler, consumed by main loop
 static volatile uint8_t g_stop_cw_requested = 0;  // set by CDC handler, consumed by main loop
+static volatile uint32_t g_cw_hang_ms       = 1000; // Hang time: carrier stays on this long after key-up
+// These are Core0-only (main loop + CDC handler), no need for volatile:
+static uint8_t  g_cw_hang_pending  = 0;   // 1 = hang timer running
+static uint32_t g_cw_hang_dl_us    = 0;   // Hang-expiry timestamp (us)
 static volatile int8_t g_tx_power_max_dbm = PWR_MAX_DBM;  // Runtime TX power limit
 static volatile uint8_t g_tx_enabled  = 1;  // TX enable flag (for GUI TX button)
 static volatile uint8_t g_pa_enabled  = 0;  // External PA: 0=always off (default), 1=follows TX
@@ -642,11 +646,13 @@ static void sx_test_cw(void) {
     sx_set_tx_params_dbm(g_tx_power_max_dbm); tud_task();
     cdc_printf("Power: %d dBm\r\n", g_tx_power_max_dbm);
 
-    // Enable RF frontend (and external PA if user enabled it)
+    // Enable RF switch; PA stays off until first 'key 1' command.
+    // This allows the keyer to key the PA without any SPI overhead per element.
     gpio_put(PIN_TX_EN, 1);
     gpio_put(PIN_RX_EN, 0);
-    if (g_pa_enabled) gpio_put(PIN_PA_EN, 1);
-    cdc_printf("TX_EN=1, RX_EN=0, PA_EN=%d\r\n", g_pa_enabled);
+    gpio_put(PIN_PA_EN, 0);   // PA off; keyer drives it via 'key 1' / 'key 0'
+    g_cw_hang_pending = 0;    // Cancel any stale hang timer
+    cdc_printf("TX_EN=1, RX_EN=0, PA_EN=0 (PA follows key)\r\n");
 
     // Start CW – check status immediately (before 5ms) and after
     sx_start_tx_continuous_wave(); tud_task();
@@ -677,6 +683,7 @@ static void sx_test_cw(void) {
 // tud_task() calls here are safe – no re-entrancy.
 static void sx_stop_cw(void) {
 #if CFG_TUD_CDC
+    g_cw_hang_pending = 0;   // Cancel hang timer before touching GPIOs
     gpio_put(PIN_PA_EN, 0);  // PA off first (before RF goes quiet)
     gpio_put(PIN_TX_EN, 0);
 #if USE_TCXO_MODULE
@@ -1050,8 +1057,10 @@ static void cmd_help(void) {
         "  get\r\n"
         "  diag          - show SX1280 status\r\n"
         "  tx 0|1        - enable/disable TX (SSB modulation)\r\n"
-        "  cw            - start CW test transmission\r\n"
-        "  stop          - stop CW transmission\r\n"
+        "  cw            - start CW mode (SX1280 in CW, TX_EN=1, PA follows 'key')\r\n"
+        "  stop          - stop CW mode, return to SSB\r\n"
+        "  key 0|1       - key down/up (GPIO only, no SPI; use while in CW mode)\r\n"
+        "  hang <ms>     - set hang time 0..10000 ms (PA stays on this long after key-up)\r\n"
         "  freq <Hz>     - set frequency with sub-Hz precision (e.g. freq 2400100050.5)\r\n"
         "  ppm <value>   - set PPM correction (e.g. ppm -0.5)\r\n"
         "  txpwr <-18..13> - set max TX power in dBm\r\n"
@@ -1099,6 +1108,37 @@ static void cdc_handle_line(char *line) {
     if (streqi(argv[0], "diag")) { sx_print_diag(); return; }
     if (streqi(argv[0], "cw"))   { g_cw_test_requested = 1; cdc_write_str("CW: starting...\r\n"); return; }
     if (streqi(argv[0], "stop")) { g_stop_cw_requested  = 1; cdc_write_str("CW: stopping...\r\n"); return; }
+
+    // CW key command: key 0|1
+    // Fast GPIO-only keying — no SPI, safe to call from CDC handler.
+    // Sequencing: key 1 → PA_EN=1 immediately (TX_EN already HIGH from sx_test_cw).
+    //             key 0 → PA stays on; hang timer starts; PA_EN=0 when hang expires.
+    if (streqi(argv[0], "key") && argc >= 2) {
+        if (!g_cw_test_mode) { cdc_write_str("ERR: key requires CW mode (send 'cw' first)\r\n"); return; }
+        uint8_t v;
+        if (!parse_bool(argv[1], &v)) { cdc_write_str("ERR: key 0|1\r\n"); return; }
+        if (v) {
+            // Key down: cancel any pending hang, enable PA immediately
+            g_cw_hang_pending = 0;
+            if (g_pa_enabled) gpio_put(PIN_PA_EN, 1);
+        } else {
+            // Key up: start hang timer; PA_EN stays HIGH until hang expires
+            g_cw_hang_pending = 1;
+            g_cw_hang_dl_us   = time_us_32() + g_cw_hang_ms * 1000u;
+        }
+        return;
+    }
+
+    // CW hang time: hang <ms>  (0..10000)
+    if (streqi(argv[0], "hang") && argc >= 2) {
+        float h;
+        if (!parse_f(argv[1], &h) || h < 0.0f || h > 10000.0f) {
+            cdc_write_str("ERR: hang 0..10000 (ms)\r\n"); return;
+        }
+        g_cw_hang_ms = (uint32_t)h;
+        cdc_printf("OK hang=%lu ms\r\n", (unsigned long)g_cw_hang_ms);
+        return;
+    }
 
     // TX enable/disable: tx 0|1
     if (streqi(argv[0], "tx") && argc >= 2) {
@@ -1695,6 +1735,11 @@ int main(void) {
                 g_stop_cw_requested = 0;
                 sx_stop_cw();
             }
+            // Hang timer: PA_EN goes LOW after hang_ms of key-up silence
+            if (g_cw_hang_pending && ((int32_t)(time_us_32() - g_cw_hang_dl_us) >= 0)) {
+                g_cw_hang_pending = 0;
+                gpio_put(PIN_PA_EN, 0);  // Silence PA; SX1280 stays in CW mode
+            }
 #endif
             tight_loop_contents();
         }
@@ -1708,6 +1753,10 @@ int main(void) {
         if (g_stop_cw_requested) {
             g_stop_cw_requested = 0;
             sx_stop_cw();
+        }
+        if (g_cw_hang_pending && ((int32_t)(time_us_32() - g_cw_hang_dl_us) >= 0)) {
+            g_cw_hang_pending = 0;
+            gpio_put(PIN_PA_EN, 0);
         }
 
         if (!greeted && tud_cdc_connected()) {

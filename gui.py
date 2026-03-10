@@ -651,18 +651,19 @@ class SX1280ControlApp(ttk.Frame):
         self._cw_text_stop   = threading.Event()
         self._cw_last_sent   = ""   # full field text when last TX started
 
-        # cb_key_on / cb_key_off: Sidetone + optional SX1280-Träger.
-        # worker.send_line() ist thread-sicher (eigener Lock, kein Tkinter).
+        # cb_key_on / cb_key_off: Sidetone + GPIO-only CW keying on firmware side.
+        # 'key 1'/'key 0' only toggle PA_EN (no SPI, no re-init latency).
+        # CW mode must be active (TX button ON) before keying starts.
         def _cb_key_on():
             self.audio.on()
             if self._cw_tx_active and self.worker.is_connected():
-                try: self.worker.send_line("cw")
+                try: self.worker.send_line("key 1")
                 except Exception: pass
 
         def _cb_key_off():
             self.audio.off()
             if self._cw_tx_active and self.worker.is_connected():
-                try: self.worker.send_line("stop")
+                try: self.worker.send_line("key 0")
                 except Exception: pass
 
         self.keyer.cb_key_on  = _cb_key_on
@@ -723,6 +724,7 @@ class SX1280ControlApp(ttk.Frame):
         self.cw_tone_var        = tk.DoubleVar(value=700)
         self.cw_vol_var         = tk.DoubleVar(value=70)
         self.cw_weight_var      = tk.DoubleVar(value=self._load_cw_weight())
+        self.cw_hang_var        = tk.DoubleVar(value=1000)  # Hang time ms
         self.cw_conn_status_var = tk.StringVar(value='● DISCONNECTED')
         self.cw_text_var        = tk.StringVar()
 
@@ -1017,6 +1019,9 @@ class SX1280ControlApp(ttk.Frame):
         cw_slider("Weighting (%)", self.cw_weight_var, 30,   60,
                   lambda v: f"{int(v)} %",
                   lambda v: (self.keyer.set_weight(v), self._save_cw_weight(v)))
+        cw_slider("Hang time (ms)", self.cw_hang_var, 100, 5000,
+                  lambda v: f"{int(v)} ms",
+                  lambda v: self._send_cmd_safe(f"hang {int(v)}"))
 
         if not HAS_AUDIO:
             ttk.Label(cpf, text="pyaudio missing\npip install pyaudio numpy",
@@ -1130,9 +1135,14 @@ class SX1280ControlApp(ttk.Frame):
             return
         self._cw_tx_active = not self._cw_tx_active
         if self._cw_tx_active:
+            # Start CW mode once; subsequent key presses use 'key 1'/'key 0'
+            try:
+                self.worker.send_line("cw")
+                self.worker.send_line(f"hang {int(self.cw_hang_var.get())}")
+            except Exception: pass
             self.cw_tx_btn.config(text="🔴  TX ON")
         else:
-            # Träger sofort abschalten, falls Taste gerade gedrückt ist
+            # Full stop: cancel hang, return SX1280 to standby
             try: self.worker.send_line("stop")
             except Exception: pass
             self.cw_tx_btn.config(text="⬛  TX OFF")
