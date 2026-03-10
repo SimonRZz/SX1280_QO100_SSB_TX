@@ -737,7 +737,10 @@ static void sx_stop_cw(void) {
 #if CFG_TUD_CDC
     g_cw_hang_pending = 0;   // Cancel hang timer before touching GPIOs
     gpio_put(PIN_PA_EN, 0);  // PA off first (before RF goes quiet)
-    gpio_put(PIN_TX_EN, 0);
+    // TX_EN stays HIGH: Core1 already has tx_en_activated=true and won't
+    // re-assert it.  Pulling TX_EN low here would leave the RF switch in
+    // the wrong state for SSB/VOX operation after this function returns.
+    // SX1280 entering standby is sufficient to silence the carrier.
     sx_set_standby_auto(); tud_task();
     cdc_printf("TX stopped, back to standby (%s)\r\n",
                g_tcxo_enabled ? "STDBY_XOSC" : "STDBY_RC");
@@ -1180,9 +1183,12 @@ static void cdc_handle_line(char *line) {
         uint8_t v;
         if (!parse_bool(argv[1], &v)) { cdc_write_str("ERR: key 0|1\r\n"); return; }
         if (v) {
-            // Key down: cancel any pending hang, enable PA immediately
+            // Key down: cancel any pending hang, enable PA immediately.
+            // PA_EN is unconditionally driven HIGH here – the 'key' command
+            // is an explicit CW keying action so PA always needs to follow,
+            // regardless of the g_pa_enabled flag (which only gates SSB PA).
             g_cw_hang_pending = 0;
-            if (g_pa_enabled) gpio_put(PIN_PA_EN, 1);
+            gpio_put(PIN_PA_EN, 1);
         } else {
             // Key up: start hang timer; PA_EN stays HIGH until hang expires
             g_cw_hang_pending = 1;
