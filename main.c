@@ -84,7 +84,7 @@
 // required.  GPIO22 (PIN_TCXO_EN) is always initialised regardless of this.
 //   1 = boot with TCXO on  (LoRa1280F27-TCXO module, STDBY_XOSC)
 //   0 = boot with TCXO off (external 52 MHz clock on XTA, STDBY_RC)
-#define USE_TCXO_MODULE     0
+#define USE_TCXO_MODULE     1
 // ====================================================
 
 // ---------------- Pin mapping ----------------
@@ -625,7 +625,17 @@ static void sx_apply_tcxo(uint8_t enable) {
         gpio_put(PIN_TCXO_EN, 1);
         for (int _i = 0; _i < 5; _i++) { tud_task(); sleep_ms(1); } // TCXO stabilise ≥3ms
         sx_set_standby_xosc(); tud_task();
-        cdc_printf("OK TCXO on  → STDBY_XOSC (GPIO%lu=1)\r\n", (unsigned long)PIN_TCXO_EN);
+        {
+            uint8_t st = sx_get_status();
+            uint8_t mode = (st >> 5) & 0x07;
+            if (mode == 3) {
+                cdc_printf("OK TCXO on  → STDBY_XOSC (GPIO%lu=1)\r\n", (unsigned long)PIN_TCXO_EN);
+            } else {
+                cdc_printf("ERR TCXO on: SetStandby(XOSC) failed! chip mode=%d [0x%02X]\r\n"
+                           "  → TCXO signal not valid; check TCXOEN wiring (pin2→GPIO%lu)\r\n",
+                           mode, st, (unsigned long)PIN_TCXO_EN);
+            }
+        }
     } else {
         sx_set_standby_rc(); tud_task();
         gpio_put(PIN_TCXO_EN, 0);
@@ -662,9 +672,17 @@ static void sx_test_cw(void) {
     sx_set_standby_auto(); tud_task();
     {
         uint8_t st = sx_get_status();
-        cdc_printf("Mode: %s → chip mode=%d [0x%02X]\r\n",
-                   g_tcxo_enabled ? "STDBY_XOSC" : "STDBY_RC",
-                   (st>>5)&7, st);
+        uint8_t mode = (st >> 5) & 0x07;
+        const char *expected = g_tcxo_enabled ? "STDBY_XOSC" : "STDBY_RC";
+        uint8_t expected_mode = g_tcxo_enabled ? 3 : 2;
+        cdc_printf("Mode: %s → chip mode=%d [0x%02X] %s\r\n",
+                   expected, mode, st,
+                   (mode == expected_mode) ? "OK" : "*** MISMATCH - XOSC failed? ***");
+        if (g_tcxo_enabled && mode != 3) {
+            cdc_printf("  TCXO/XOSC not running! TX will fail.\r\n"
+                       "  Check: TCXOEN pin2→GPIO%lu, TCXO supply, 52MHz on XTA.\r\n",
+                       (unsigned long)PIN_TCXO_EN);
+        }
     }
 
     // Packet type
