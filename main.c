@@ -745,6 +745,18 @@ static void sx_stop_cw(void) {
     cdc_printf("TX stopped, back to standby (%s)\r\n",
                g_tcxo_enabled ? "STDBY_XOSC" : "STDBY_RC");
 
+    // Flush stale audio blocks that accumulated while Core1 was paused.
+    // Core1 is still sleeping (g_cw_test_mode=1), so no race condition here.
+    // Without this, Core1 would immediately process old blocks with tx_on=1
+    // (microphone noise), causing a brief wide-band SSB burst after CW stop.
+    __compiler_memory_barrier();
+    for (uint32_t i = 0; i < NUM_BLOCKS; i++) {
+        g_block_ready[i] = 0;
+    }
+    // Reset consumer pointer to match producer so no gap/wrap confusion.
+    g_cons_block = g_prod_block;
+    __compiler_memory_barrier();
+
     // Resume normal Core1 operation
     g_cw_test_mode = 0;
 #endif
