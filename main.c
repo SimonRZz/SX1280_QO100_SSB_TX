@@ -144,8 +144,6 @@ static uint32_t g_cw_hang_dl_us    = 0;   // Hang-expiry timestamp (us)
 static volatile int8_t g_tx_power_max_dbm = PWR_MAX_DBM;  // Runtime TX power limit
 static volatile uint8_t g_tx_enabled  = 1;  // TX enable flag (for GUI TX button)
 static volatile uint8_t g_pa_enabled  = 0;  // External PA: 0=always off (default), 1=follows TX
-static volatile uint32_t g_cw_speed_wpm  = 20;  // CW text send speed in WPM (5-60)
-static volatile uint8_t  g_cw_send_abort = 0;   // Set to 1 to abort cwsend in progress
 
 // --- Hilbert ---
 #define HILBERT_TAPS        247
@@ -1101,101 +1099,6 @@ static void cfg_print(void) {
     );
 }
 
-// ==========================================================
-// CW Keyer: Morse code table + text sender
-// ==========================================================
-
-static const char * const cw_morse_alpha[26] = {
-    ".-",   "-...", "-.-.", "-..",  ".",    "..-.", "--.",  "....",
-    "..",   ".---", "-.-",  ".-..", "--",   "-.",   "---",  ".--.",
-    "--.-", ".-.",  "...",  "-",    "..-",  "...-", ".--",  "-..-",
-    "-.--", "--.."
-};
-
-static const char * const cw_morse_digit[10] = {
-    "-----", ".----", "..---", "...--", "....-",
-    ".....", "-....", "--...", "---..", "----."
-};
-
-// Delay ms while keeping USB alive and checking for abort via CDC RX.
-// Uses its own static mini-buffer so it never re-enters cdc_task().
-static void cw_delay_ms(uint32_t ms) {
-    uint32_t deadline = time_us_32() + ms * 1000u;
-    static char  abuf[16];
-    static uint32_t apos = 0;
-
-    while ((int32_t)(time_us_32() - deadline) < 0) {
-        tud_task();
-
-        // Peek at incoming CDC bytes for an abort command ("stop" or "s")
-        while (tud_cdc_available() && !g_cw_send_abort) {
-            char ch = (char)tud_cdc_read_char();
-            if (ch == '\r' || ch == '\n') {
-                abuf[apos] = '\0';
-                if (apos > 0 && (streqi(abuf, "stop") || streqi(abuf, "s"))) {
-                    g_cw_send_abort  = 1;
-                    g_stop_cw_requested = 1;
-                }
-                apos = 0;
-            } else if (apos < sizeof(abuf) - 1u) {
-                abuf[apos++] = ch;
-            }
-        }
-
-        if (g_cw_send_abort) return;
-        sleep_us(500);
-    }
-}
-
-// Send one Morse element string (e.g. ".-") at the given dit_ms duration.
-static void cw_send_morse(const char *m, uint32_t dit_ms) {
-    for (; *m && !g_cw_send_abort; m++) {
-        // Key down
-        g_cw_hang_pending = 0;
-        if (g_pa_enabled) gpio_put(PIN_PA_EN, 1);
-        cw_delay_ms(*m == '.' ? dit_ms : dit_ms * 3u);
-
-        // Key up (inter-element gap = 1 dit)
-        if (g_pa_enabled) gpio_put(PIN_PA_EN, 0);
-        if (!g_cw_send_abort) cw_delay_ms(dit_ms);
-    }
-}
-
-// Send text as CW.  Requires g_cw_test_mode == 1 (send 'cw' first).
-// Send 'stop' or 's' over CDC to abort mid-send.
-static void cw_send_text(const char *text) {
-    if (!g_cw_test_mode) {
-        cdc_write_str("ERR: start CW mode first ('cw')\r\n");
-        return;
-    }
-    uint32_t dit_ms = 1200u / g_cw_speed_wpm;
-    g_cw_send_abort = 0;
-
-    for (; *text && !g_cw_send_abort; text++) {
-        char c = *text;
-        if (c == ' ' || c == '\t') {
-            // Word space = 7 dits; inter-char gap already accounts for 3, add 4 more
-            cw_delay_ms(dit_ms * 4u);
-            continue;
-        }
-        if (c >= 'a' && c <= 'z') c = (char)(c - 32);  // to upper
-        const char *m = NULL;
-        if      (c >= 'A' && c <= 'Z') m = cw_morse_alpha[(uint8_t)(c - 'A')];
-        else if (c >= '0' && c <= '9') m = cw_morse_digit[(uint8_t)(c - '0')];
-        if (m) {
-            cw_send_morse(m, dit_ms);
-            // Inter-character gap = 3 dits; already have 1 (end of last element), add 2
-            if (!g_cw_send_abort) cw_delay_ms(dit_ms * 2u);
-        }
-    }
-
-    if (g_cw_send_abort)
-        cdc_write_str("CW: send aborted\r\n");
-    else
-        cdc_write_str("CW: send done\r\n");
-    g_cw_send_abort = 0;
-}
-
 static void cmd_help(void) {
     cdc_write_str(
         "Commands:\r\n"
@@ -1204,12 +1107,9 @@ static void cmd_help(void) {
         "  diag          - show SX1280 status\r\n"
         "  tx 0|1        - enable/disable TX (SSB modulation)\r\n"
         "  cw            - start CW mode (SX1280 in CW, TX_EN=1, PA follows 'key')\r\n"
-        "  stop          - stop CW mode, return to SSB (also aborts cwsend)\r\n"
+        "  stop          - stop CW mode, return to SSB\r\n"
         "  key 0|1       - key down/up (GPIO only, no SPI; use while in CW mode)\r\n"
         "  hang <ms>     - set hang time 0..10000 ms (PA stays on this long after key-up)\r\n"
-        "  cwspeed <5..60> - set CW text send speed in WPM (default 20)\r\n"
-        "  cwsend <text>   - send text as CW (requires CW mode; type 'stop' to abort)\r\n"
-        "  (RTS on this serial port = PTT for WSJTX/digital modes)\r\n"
         "  tcxo 0|1      - enable/disable onboard TCXO (GPIO22) at runtime\r\n"
         "  freq <Hz>     - set frequency with sub-Hz precision (e.g. freq 2400100050.5)\r\n"
         "  ppm <value>   - set PPM correction (e.g. ppm -0.5)\r\n"
@@ -1257,7 +1157,7 @@ static void cdc_handle_line(char *line) {
     if (streqi(argv[0], "get"))  { cfg_print(); return; }
     if (streqi(argv[0], "diag")) { sx_print_diag(); return; }
     if (streqi(argv[0], "cw"))   { g_cw_test_requested = 1; cdc_write_str("CW: starting...\r\n"); return; }
-    if (streqi(argv[0], "stop")) { g_stop_cw_requested = 1; g_cw_send_abort = 1; cdc_write_str("CW: stopping...\r\n"); return; }
+    if (streqi(argv[0], "stop")) { g_stop_cw_requested  = 1; cdc_write_str("CW: stopping...\r\n"); return; }
 
     // tcxo 0|1 – enable/disable onboard TCXO (GPIO22) at runtime.
     // Must not be changed while in CW test mode (SX1280 in use).
@@ -1299,28 +1199,6 @@ static void cdc_handle_line(char *line) {
         }
         g_cw_hang_ms = (uint32_t)h;
         cdc_printf("OK hang=%lu ms\r\n", (unsigned long)g_cw_hang_ms);
-        return;
-    }
-
-    // CW text speed: cwspeed <wpm>
-    if (streqi(argv[0], "cwspeed") && argc >= 2) {
-        float wpm;
-        if (!parse_f(argv[1], &wpm) || wpm < 5.0f || wpm > 60.0f) {
-            cdc_write_str("ERR: cwspeed 5..60 (WPM)\r\n"); return;
-        }
-        g_cw_speed_wpm = (uint32_t)wpm;
-        cdc_printf("OK cwspeed=%lu WPM\r\n", (unsigned long)g_cw_speed_wpm);
-        return;
-    }
-
-    // CW text send: cwsend <text>  (spaces become word spaces; send 'stop' to abort)
-    if (streqi(argv[0], "cwsend") && argc >= 2) {
-        char text[116] = {0};
-        for (int i = 1; i < argc; i++) {
-            if (i > 1) strncat(text, " ", sizeof(text) - strlen(text) - 1u);
-            strncat(text, argv[i], sizeof(text) - strlen(text) - 1u);
-        }
-        cw_send_text(text);
         return;
     }
 
@@ -1485,30 +1363,6 @@ static void cdc_task(void) {
         } else {
             if (pos < sizeof(line) - 1) {
                 line[pos++] = ch;
-            }
-        }
-    }
-
-    // RTS PTT: WSJTX (and other digital-mode software) raises RTS to key TX.
-    // We snapshot RTS state on first connection so an initial high level does
-    // not accidentally trigger transmission; only transitions matter.
-    {
-        static uint8_t was_connected = 0;
-        static uint8_t last_rts      = 0xFF; // 0xFF = not yet initialised
-
-        uint8_t connected = tud_cdc_connected() ? 1u : 0u;
-        if (!connected) {
-            was_connected = 0;
-            last_rts      = 0xFF;
-        } else if (!was_connected) {
-            // First tick after connection: snapshot without applying PTT
-            was_connected = 1;
-            last_rts = (tud_cdc_get_line_state() >> 1u) & 1u;
-        } else if (!g_cw_test_mode) {
-            uint8_t rts = (tud_cdc_get_line_state() >> 1u) & 1u;
-            if (rts != last_rts) {
-                last_rts     = rts;
-                g_tx_enabled = rts;
             }
         }
     }
