@@ -1120,9 +1120,13 @@ static void cdc_handle_line(char *line) {
             return;
         }
         g_target_freq_hz = f;
+        if (g_cw_test_mode) {
+            sx_set_rf_frequency_steps(get_base_steps());
+            sx_start_tx_continuous_wave();
+        }
         double corrected = get_corrected_freq_hz();
         float fine = get_fine_tune_hz();
-        cdc_printf("OK freq=%.1f Hz (corrected=%.1f, steps=%lu, fine=%.1f Hz)\r\n", 
+        cdc_printf("OK freq=%.1f Hz (corrected=%.1f, steps=%lu, fine=%.1f Hz)\r\n",
                    g_target_freq_hz, corrected,
                    (unsigned long)get_base_steps(), fine);
         return;
@@ -1131,18 +1135,22 @@ static void cdc_handle_line(char *line) {
     // PPM correction command: ppm <value>
     if (streqi(argv[0], "ppm") && argc >= 2) {
         float ppm;
-        if (!parse_f(argv[1], &ppm)) { 
-            cdc_write_str("ERR: bad PPM value\r\n"); 
-            return; 
+        if (!parse_f(argv[1], &ppm)) {
+            cdc_write_str("ERR: bad PPM value\r\n");
+            return;
         }
         if (ppm < -100.0f || ppm > 100.0f) {
             cdc_write_str("ERR: ppm must be -100 to +100\r\n");
             return;
         }
         g_ppm_correction = ppm;
+        if (g_cw_test_mode) {
+            sx_set_rf_frequency_steps(get_base_steps());
+            sx_start_tx_continuous_wave();
+        }
         double corrected = get_corrected_freq_hz();
         float fine = get_fine_tune_hz();
-        cdc_printf("OK ppm=%.3f (corrected=%.1f Hz, steps=%lu, fine=%.1f Hz)\r\n", 
+        cdc_printf("OK ppm=%.3f (corrected=%.1f Hz, steps=%lu, fine=%.1f Hz)\r\n",
                    g_ppm_correction, corrected,
                    (unsigned long)get_base_steps(), fine);
         return;
@@ -1156,7 +1164,11 @@ static void cdc_handle_line(char *line) {
             return;
         }
         g_pa_enabled = v;
-        if (!v) gpio_put(PIN_PA_EN, 0);  // Immediately silence PA when disabled
+        if (!v) {
+            gpio_put(PIN_PA_EN, 0);                          // Immediately off
+        } else if (g_tx_enabled || g_cw_test_mode) {
+            gpio_put(PIN_PA_EN, 1);                          // Immediately on if TX active
+        }
         cdc_printf("OK pa=%s\r\n", g_pa_enabled ? "ON" : "OFF");
         return;
     }
@@ -1164,13 +1176,17 @@ static void cdc_handle_line(char *line) {
     // TX power command: txpwr <-18..13>
     if (streqi(argv[0], "txpwr") && argc >= 2) {
         float pwr;
-        if (!parse_f(argv[1], &pwr)) { 
-            cdc_write_str("ERR: bad txpwr value\r\n"); 
-            return; 
+        if (!parse_f(argv[1], &pwr)) {
+            cdc_write_str("ERR: bad txpwr value\r\n");
+            return;
         }
         if (pwr < (float)PWR_MIN_DBM) pwr = (float)PWR_MIN_DBM;
         if (pwr > (float)PWR_MAX_DBM) pwr = (float)PWR_MAX_DBM;
         g_tx_power_max_dbm = (int8_t)pwr;
+        if (g_cw_test_mode) {
+            sx_set_tx_params_dbm(g_tx_power_max_dbm);
+            sx_start_tx_continuous_wave();
+        }
         cdc_printf("OK txpwr=%d dBm\r\n", g_tx_power_max_dbm);
         return;
     }
