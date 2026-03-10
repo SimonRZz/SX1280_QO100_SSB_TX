@@ -642,10 +642,11 @@ static void sx_test_cw(void) {
     sx_set_tx_params_dbm(g_tx_power_max_dbm); tud_task();
     cdc_printf("Power: %d dBm\r\n", g_tx_power_max_dbm);
 
-    // Enable PA
+    // Enable RF frontend (and external PA if user enabled it)
     gpio_put(PIN_TX_EN, 1);
     gpio_put(PIN_RX_EN, 0);
-    cdc_printf("TX_EN=1, RX_EN=0\r\n");
+    if (g_pa_enabled) gpio_put(PIN_PA_EN, 1);
+    cdc_printf("TX_EN=1, RX_EN=0, PA_EN=%d\r\n", g_pa_enabled);
 
     // Start CW – check status immediately (before 5ms) and after
     sx_start_tx_continuous_wave(); tud_task();
@@ -1165,10 +1166,11 @@ static void cdc_handle_line(char *line) {
         }
         g_pa_enabled = v;
         if (!v) {
-            gpio_put(PIN_PA_EN, 0);                          // Immediately off
-        } else if (g_tx_enabled || g_cw_test_mode) {
-            gpio_put(PIN_PA_EN, 1);                          // Immediately on if TX active
+            gpio_put(PIN_PA_EN, 0);          // Immediately off
+        } else if (g_cw_test_mode) {
+            gpio_put(PIN_PA_EN, 1);          // Immediately on during CW (RF is continuously active)
         }
+        // In SSB mode Core1 will apply g_pa_enabled at the next tx_on transition
         cdc_printf("OK pa=%s\r\n", g_pa_enabled ? "ON" : "OFF");
         return;
     }
