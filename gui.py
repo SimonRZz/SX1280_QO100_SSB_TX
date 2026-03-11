@@ -715,6 +715,7 @@ class SX1280ControlApp(ttk.Frame):
         self.comp_outlim_var = tk.DoubleVar(value=self.config.comp_out_limit)
         self.amp_gain_var    = tk.DoubleVar(value=self.config.amp_gain)
         self.amp_min_a_var   = tk.StringVar(value=f"{self.config.amp_min_a:.9f}")
+        self.gate_ref_var    = tk.DoubleVar(value=0.04)   # matches GATE_A_REF firmware default
         self.cw_port_var        = tk.StringVar()
         self.cw_baud_var        = tk.StringVar(value='9600')
         self.cw_mode_var        = tk.StringVar(value='Iambic B')
@@ -912,6 +913,14 @@ class SX1280ControlApp(ttk.Frame):
         ttk.Button(amf, text="Set",
                    command=lambda: self._send_cmd_safe(f"set amp_min_a {self.amp_min_a_var.get()}")
                    ).pack(side="left")
+        import math as _math
+        def _gate_fmt(v):
+            if v <= 0.0: return "0.000  (off)"
+            db = -20.0 * _math.log10(v) if v > 0 else 0
+            return f"{v:.3f}  (-{db:.0f} dBfs)"
+        LabeledScale(pwf, "Noise gate",    self.gate_ref_var, 0.0, 0.20, 0.001,
+                     lambda v: self.debounced_send.call(f"set gate_ref {v:.4f}"),
+                     _gate_fmt).pack(fill="x")
 
     def _build_tx_tab(self):
         tab = ttk.Frame(self.notebook, padding=10)
@@ -1584,6 +1593,7 @@ class SX1280ControlApp(ttk.Frame):
         self._send_cmd_safe(f"set comp_outlim {self.comp_outlim_var.get():.3f}")
         self._send_cmd_safe(f"set amp_gain {self.amp_gain_var.get():.3f}")
         self._send_cmd_safe(f"set amp_min_a {self.amp_min_a_var.get()}")
+        self._send_cmd_safe(f"set gate_ref {self.gate_ref_var.get():.4f}")
         self._log("All settings sent", "info")
 
     def _log(self, msg, tag="recv"):
