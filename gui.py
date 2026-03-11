@@ -715,7 +715,7 @@ class SX1280ControlApp(ttk.Frame):
         self.comp_outlim_var = tk.DoubleVar(value=self.config.comp_out_limit)
         self.amp_gain_var    = tk.DoubleVar(value=self.config.amp_gain)
         self.amp_min_a_var   = tk.StringVar(value=f"{self.config.amp_min_a:.9f}")
-        self.gate_ref_var    = tk.DoubleVar(value=0.04)   # matches GATE_A_REF firmware default
+        self.gate_ref_var    = tk.DoubleVar(value=0.10)   # matches GATE_A_REF firmware default
         self.cw_port_var        = tk.StringVar()
         self.cw_baud_var        = tk.StringVar(value='9600')
         self.cw_mode_var        = tk.StringVar(value='Iambic B')

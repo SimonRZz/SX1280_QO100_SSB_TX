@@ -155,7 +155,7 @@ static const float PLL_STEP_HZ =
 #define F_OFF_LIMIT_HZ      3500.0f
 #define SILENCE_SECONDS     2u
 
-#define GATE_A_REF          0.04f   // Noise gate default (raised: EQ high-shelf can boost USB noise ~4x)
+#define GATE_A_REF          0.10f   // Noise gate default: hard gate, safely above EQ-boosted USB noise floor
 #define GATE_SHAPE          1
 
 #define IQ_GAIN_CORR        1.00f
@@ -1451,14 +1451,12 @@ static inline float hilbert_process(float x, float *i_delayed) {
 }
 
 static inline float duty_from_A(float A, float gate_ref) {
-    if (gate_ref <= 0.0f || A >= gate_ref) return 1.0f;
+    // Hard gate: below threshold → silence (duty=0 → tx_on never fires).
+    // This avoids rapid TX↔standby SPI switching that disturbs the PLL.
+    // Above threshold → full duty (tx_on=1); amplitude is handled via p_chosen.
     if (A <= 0.0f) return 0.0f;
-    float r = A / gate_ref;
-#if GATE_SHAPE == 2
-    return r * r;
-#else
-    return r;
-#endif
+    if (gate_ref > 0.0f && A < gate_ref) return 0.0f;
+    return 1.0f;
 }
 
 // ==========================================================
