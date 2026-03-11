@@ -143,7 +143,7 @@ static uint8_t  g_cw_hang_pending  = 0;   // 1 = hang timer running
 static uint32_t g_cw_hang_dl_us    = 0;   // Hang-expiry timestamp (us)
 static volatile int8_t g_tx_power_max_dbm = PWR_MAX_DBM;  // Runtime TX power limit
 static volatile uint8_t g_tx_enabled  = 1;  // TX enable flag (for GUI TX button)
-static volatile uint8_t g_pa_enabled  = 0;  // External PA: 0=always off (default), 1=follows TX
+static volatile uint8_t g_pa_enabled  = 1;  // RF output enable: 0=RF muted (TX_EN low), 1=normal TX
 
 // --- Hilbert ---
 #define HILBERT_TAPS        247
@@ -581,8 +581,8 @@ static void sx_print_diag(void) {
     cdc_printf("BUSY pin: %d\r\n", gpio_get(PIN_BUSY));
     cdc_printf("TX_EN pin: %d\r\n", gpio_get(PIN_TX_EN));
     cdc_printf("RX_EN pin: %d\r\n", gpio_get(PIN_RX_EN));
-    cdc_printf("PA_EN pin: %d  (g_pa_enabled=%d  hang_pending=%d)\r\n",
-               gpio_get(PIN_PA_EN), g_pa_enabled, g_cw_hang_pending);
+    cdc_printf("PA_EN pin: %d  TX_EN pin: %d  (g_pa_enabled=%d  hang_pending=%d)\r\n",
+               gpio_get(PIN_PA_EN), gpio_get(PIN_TX_EN), g_pa_enabled, g_cw_hang_pending);
     cdc_printf("TCXO_EN pin: %d (runtime g_tcxo_enabled=%d, build USE_TCXO_MODULE=%d)\r\n",
                gpio_get(PIN_TCXO_EN), g_tcxo_enabled, USE_TCXO_MODULE);
     cdc_printf("Base freq: %lu Hz\r\n", (unsigned long)BASE_FREQ_HZ);
@@ -700,13 +700,12 @@ static void sx_test_cw(void) {
     sx_set_tx_params_dbm(g_tx_power_max_dbm); tud_task();
     cdc_printf("Power: %d dBm\r\n", g_tx_power_max_dbm);
 
-    // Enable RF switch; PA stays off until first 'key 1' command.
-    // This allows the keyer to key the PA without any SPI overhead per element.
-    gpio_put(PIN_TX_EN, 1);
+    // Enable RF switch only when PA (RF output) is enabled by the user.
+    if (g_pa_enabled) gpio_put(PIN_TX_EN, 1);
     gpio_put(PIN_RX_EN, 0);
-    gpio_put(PIN_PA_EN, 0);   // PA off; keyer drives it via 'key 1' / 'key 0'
+    gpio_put(PIN_PA_EN, 0);   // External PA pin (unconnected); keyer drives via 'key 1' / 'key 0'
     g_cw_hang_pending = 0;    // Cancel any stale hang timer
-    cdc_printf("TX_EN=1, RX_EN=0, PA_EN=0 (PA follows key)\r\n");
+    cdc_printf("TX_EN=%d, RX_EN=0, PA_EN=0 (pa_enabled=%d)\r\n", g_pa_enabled ? 1 : 0, g_pa_enabled);
 
     // Start CW – check status immediately (before 5ms) and after
     sx_start_tx_continuous_wave(); tud_task();
@@ -1298,11 +1297,11 @@ static void cdc_handle_line(char *line) {
         }
         g_pa_enabled = v;
         if (!v) {
-            gpio_put(PIN_PA_EN, 0);          // Immediately off
-        } else if (g_cw_test_mode) {
-            gpio_put(PIN_PA_EN, 1);          // Immediately on during CW (RF is continuously active)
+            gpio_put(PIN_TX_EN, 0);   // Mute RF: disconnect RF switch from antenna path
+            gpio_put(PIN_PA_EN, 0);   // External PA pin (unconnected, kept consistent)
+        } else {
+            gpio_put(PIN_TX_EN, 1);   // Restore RF switch (safe in standby: SX1280 output is off)
         }
-        // In SSB mode Core1 will apply g_pa_enabled at the next tx_on transition
         cdc_printf("OK pa=%s\r\n", g_pa_enabled ? "ON" : "OFF");
         return;
     }
@@ -1518,11 +1517,11 @@ static void core1_radio_apply_loop(void) {
             continue;
         }
 
-        // Enable TX_EN on first valid block (USB is now stable)
+        // Enable TX_EN on first valid block (USB is now stable), unless RF is muted.
         if (!tx_en_activated) {
-            gpio_put(PIN_TX_EN, 1);
+            if (g_pa_enabled) gpio_put(PIN_TX_EN, 1);
             tx_en_activated = true;
-            sleep_ms(1);  // Short delay for PA to stabilize
+            sleep_ms(1);  // Short delay for RF switch to stabilize
         }
 
         sample_cmd_t *blk = g_blocks[b];
