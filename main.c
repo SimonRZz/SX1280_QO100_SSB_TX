@@ -581,6 +581,8 @@ static void sx_print_diag(void) {
     cdc_printf("BUSY pin: %d\r\n", gpio_get(PIN_BUSY));
     cdc_printf("TX_EN pin: %d\r\n", gpio_get(PIN_TX_EN));
     cdc_printf("RX_EN pin: %d\r\n", gpio_get(PIN_RX_EN));
+    cdc_printf("PA_EN pin: %d  (g_pa_enabled=%d  hang_pending=%d)\r\n",
+               gpio_get(PIN_PA_EN), g_pa_enabled, g_cw_hang_pending);
     cdc_printf("TCXO_EN pin: %d (runtime g_tcxo_enabled=%d, build USE_TCXO_MODULE=%d)\r\n",
                gpio_get(PIN_TCXO_EN), g_tcxo_enabled, USE_TCXO_MODULE);
     cdc_printf("Base freq: %lu Hz\r\n", (unsigned long)BASE_FREQ_HZ);
