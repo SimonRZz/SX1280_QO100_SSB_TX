@@ -1708,47 +1708,6 @@ int main(void) {
     while (true) { tud_task(); tight_loop_contents(); }
 #endif
 
-    // *** USB TIMEOUT: If no USB connection within 10 seconds, start beacon CW on 2400.3 MHz ***
-    {
-        const uint32_t USB_TIMEOUT_MS = 10000;
-        const uint32_t BEACON_FREQ_HZ = 2400300000u;
-        
-        printf("[BOOT] Waiting for USB connection (timeout %lu ms)...\n", (unsigned long)USB_TIMEOUT_MS);
-        
-        absolute_time_t deadline = make_timeout_time_ms(USB_TIMEOUT_MS);
-        
-        while (!tud_ready()) {
-            tud_task();
-            
-            if (absolute_time_diff_us(get_absolute_time(), deadline) <= 0) {
-                // Timeout! Start beacon mode
-                printf("[BOOT] USB timeout - starting beacon CW on %.3f MHz\n", 
-                       (float)BEACON_FREQ_HZ / 1000000.0f);
-                
-                g_target_freq_hz = (double)BEACON_FREQ_HZ;
-                g_ppm_correction = 0.0f;
-                
-                sx_set_rf_frequency_steps(get_base_steps());
-                sx_set_tx_params_dbm((int32_t)g_tx_power_max_dbm);
-                gpio_put(PIN_TX_EN, 1);
-                sx_start_tx_continuous_wave();
-                
-                // Stay in beacon mode forever (or until power cycle)
-                while (true) {
-                    tud_task();
-                    sleep_ms(100);
-                    
-                    // If USB connects later, could optionally exit beacon mode
-                    // For now, stay in CW beacon
-                }
-            }
-            
-            sleep_ms(10);
-        }
-        
-        printf("[BOOT] USB connected, starting normal SSB mode\n");
-    }
-
     hilbert_init();;
 
     const float Fs = (float)WAV_SAMPLE_RATE;

@@ -692,7 +692,6 @@ class SX1280ControlApp(ttk.Frame):
         self.freq_hz_var  = tk.StringVar(value=str(self.config.freq_hz))
         self.ppm_var      = tk.DoubleVar(value=0.0)
         self.txpwr_var    = tk.IntVar(value=self.config.tx_power_dbm)
-        self.pa_enabled_var          = tk.BooleanVar(value=True)   # mirrors g_pa_enabled=1 default
         self.tcxo_enabled_var        = tk.BooleanVar(value=True)   # mirrors USE_TCXO_MODULE=1 default
         self.tx_enabled_var          = tk.BooleanVar(value=True)
         self.scroll_tune_enabled_var = tk.BooleanVar(value=False)
@@ -829,16 +828,6 @@ class SX1280ControlApp(ttk.Frame):
         LabeledScale(tpf, "", self.txpwr_var, -18, 13, 1,
                      lambda v: self._send_cmd_safe(f"txpwr {int(v)}"),
                      lambda v: f"{int(v)} dBm").pack(fill="x")
-        pabf = ttk.Frame(tpf)
-        pabf.pack(fill="x", pady=(4, 0))
-        self.pa_btn = tk.Button(pabf, text="PA ON", width=10,
-                                font=("TkDefaultFont", 10, "bold"),
-                                command=self._toggle_pa, relief="raised", bd=2,
-                                bg="#ff6600", fg="white",
-                                activebackground="#ff8833", activeforeground="white")
-        self.pa_btn.pack(side="left")
-        ttk.Label(pabf, text="  RF Out  (TX_EN / GPIO 15)", foreground="gray").pack(side="left")
-
         tcxobf = ttk.Frame(tpf)
         tcxobf.pack(fill="x", pady=(4, 0))
         self.tcxo_btn = tk.Button(tcxobf, text="TCXO ON", width=10,
@@ -1480,17 +1469,6 @@ class SX1280ControlApp(ttk.Frame):
             self.tx_button.config(text="TX OFF", bg="#cccccc", fg="black",
                                    activebackground="#dddddd", activeforeground="black")
 
-    def _toggle_pa(self):
-        new_state = not self.pa_enabled_var.get()
-        self.pa_enabled_var.set(new_state)
-        if new_state:
-            self.pa_btn.config(text="PA ON", bg="#ff6600", fg="white",
-                               activebackground="#ff8833", activeforeground="white")
-        else:
-            self.pa_btn.config(text="PA OFF", bg="#cccccc", fg="black",
-                               activebackground="#dddddd", activeforeground="black")
-        self._send_cmd_safe(f"pa {'1' if new_state else '0'}")
-
     def _toggle_tcxo(self):
         new_state = not self.tcxo_enabled_var.get()
         self.tcxo_enabled_var.set(new_state)
@@ -1594,7 +1572,6 @@ class SX1280ControlApp(ttk.Frame):
         self._send_cmd_safe(f"set amp_gain {self.amp_gain_var.get():.3f}")
         self._send_cmd_safe(f"set amp_min_a {self.amp_min_a_var.get()}")
         self._send_cmd_safe(f"set gate_ref {self.gate_ref_var.get():.4f}")
-        self._send_cmd_safe(f"pa {'1' if self.pa_enabled_var.get() else '0'}")
         self._log("All settings sent", "info")
 
     def _log(self, msg, tag="recv"):
