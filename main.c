@@ -654,14 +654,13 @@ static void sx_test_cw(void) {
     sx_set_tx_params_dbm(g_tx_power_max_dbm); tud_task();
     cdc_printf("Power: %d dBm\r\n", g_tx_power_max_dbm);
 
-    // Enable RF switch unconditionally: TX_EN=1 routes SX1280 PA to antenna.
-    // For CW test mode this gives a continuous carrier.
-    // For the keyer, 'key 1' re-asserts TX_EN and 'key 0' + hang lowers it.
-    gpio_put(PIN_TX_EN, 1);
+    // TX_EN stays LOW: no carrier until the first 'key 1' command.
+    // This prevents an unmodulated carrier burst when the user presses "TX ON".
+    gpio_put(PIN_TX_EN, 0);
     gpio_put(PIN_RX_EN, 0);
     gpio_put(PIN_PA_EN, 0);   // PA starts off; keyer drives via 'key 1' / 'key 0'
     g_cw_hang_pending = 0;    // Cancel any stale hang timer
-    cdc_printf("TX_EN=1, RX_EN=0, PA_EN=0\r\n");
+    cdc_printf("TX_EN=0, RX_EN=0, PA_EN=0 (waiting for first key 1)\r\n");
 
     // Start CW – check status immediately (before 5ms) and after
     sx_start_tx_continuous_wave(); tud_task();
@@ -1142,21 +1141,23 @@ static void cdc_handle_line(char *line) {
 
     // CW key command: key 0|1
     // Fast GPIO-only keying — no SPI, safe to call from CDC handler.
-    // Sequencing: key 1 → PA_EN=1 immediately (TX_EN already HIGH from sx_test_cw).
-    //             key 0 → PA stays on; hang timer starts; PA_EN=0 when hang expires.
+    // Sequencing: key 1 → TX_EN=1 immediately (gate carrier ON for each element).
+    //             key 0 → TX_EN=0 immediately (gate carrier OFF, forming CW gaps).
+    //             hang timer starts on key 0 so PA_EN follows after hang_ms if desired.
     if (streqi(argv[0], "key") && argc >= 2) {
         if (!g_cw_test_mode) { cdc_write_str("ERR: key requires CW mode (send 'cw' first)\r\n"); return; }
         uint8_t v;
         if (!parse_bool(argv[1], &v)) { cdc_write_str("ERR: key 0|1\r\n"); return; }
         if (v) {
-            // Key down: cancel hang, gate carrier ON via TX_EN (RF switch) and PA.
-            // TX_EN is the primary gate – it controls the RF switch to the antenna.
-            // PA_EN follows unconditionally (same as before: overrides g_pa_enabled for CW).
+            // Key down: cancel hang, open RF switch and PA immediately.
             g_cw_hang_pending = 0;
             gpio_put(PIN_TX_EN, 1);
             gpio_put(PIN_PA_EN, 1);
         } else {
-            // Key up: start hang timer; TX_EN/PA_EN stay HIGH until hang expires.
+            // Key up: immediately close RF switch (forms CW inter-element gap),
+            // then start hang timer so PA_EN goes low after hang_ms.
+            gpio_put(PIN_TX_EN, 0);
+            gpio_put(PIN_PA_EN, 0);
             g_cw_hang_pending = 1;
             g_cw_hang_dl_us   = time_us_32() + g_cw_hang_ms * 1000u;
         }
@@ -1723,11 +1724,11 @@ int main(void) {
                 g_stop_cw_requested = 0;
                 sx_stop_cw();
             }
-            // Hang timer: lower TX_EN + PA_EN after hang_ms of key-up silence.
-            // TX_EN=0 gates the RF switch so no carrier reaches the antenna.
+            // Hang timer: TX_EN/PA_EN are already LOW from 'key 0'; this just
+            // clears the pending flag after hang_ms so state is consistent.
             if (g_cw_hang_pending && ((int32_t)(time_us_32() - g_cw_hang_dl_us) >= 0)) {
                 g_cw_hang_pending = 0;
-                gpio_put(PIN_TX_EN, 0);  // Gate carrier OFF via RF switch
+                gpio_put(PIN_TX_EN, 0);
                 gpio_put(PIN_PA_EN, 0);
             }
 #endif
