@@ -654,21 +654,23 @@ static void sx_test_cw(void) {
     sx_set_tx_params_dbm(g_tx_power_max_dbm); tud_task();
     cdc_printf("Power: %d dBm\r\n", g_tx_power_max_dbm);
 
-    // Leave SX1280 in STDBY_XOSC – no carrier until first 'key 1'.
-    // 'key 1' will call sx_start_tx_continuous_wave() just-in-time so the
-    // carrier is present only for the duration of each CW element.
-    gpio_put(PIN_TX_EN, 0);
+    // Start continuous carrier: useful for frequency/power verification on a
+    // spectrum analyser.  The keyer gates this carrier element-by-element:
+    //   key 0 → sx_set_standby_auto() + TX_EN=0  (carrier completely off)
+    //   key 1 → sx_start_tx_continuous_wave() + TX_EN=1  (carrier back on)
+    gpio_put(PIN_TX_EN, 1);
     gpio_put(PIN_RX_EN, 0);
-    gpio_put(PIN_PA_EN, 0);   // PA off; keyer drives via 'key 1' / 'key 0'
-    g_cw_hang_pending = 0;    // Cancel any stale hang timer
+    gpio_put(PIN_PA_EN, 0);   // external PA off; keyer drives via 'key 1' / 'key 0'
+    g_cw_hang_pending = 0;    // cancel any stale hang timer
+    sx_start_tx_continuous_wave(); tud_task();
 
+    for (int _i = 0; _i < 5; _i++) { tud_task(); sleep_ms(1); }
     uint8_t status = sx_get_status(); tud_task();
-    cdc_printf("Status: 0x%02X (mode=%d) – expecting 3=STDBY_XOSC\r\n",
-               status, (status >> 5) & 0x07);
-    if (((status >> 5) & 0x07) == 3) {
-        cdc_printf("OK – STDBY_XOSC, ready for keying.\r\n");
+    cdc_printf("Status after 5ms: 0x%02X (mode=%d)\r\n", status, (status >> 5) & 0x07);
+    if (((status >> 5) & 0x07) == 6) {
+        cdc_printf("OK – TX active, carrier on (TX_EN=1).\r\n");
     } else {
-        cdc_printf("*** WARNING: unexpected chip mode! Check TCXO/XOSC. ***\r\n");
+        cdc_printf("*** WARNING: TX not active! Check TCXO/XOSC. ***\r\n");
         cdc_printf("  BUSY pin: %d\r\n", gpio_get(PIN_BUSY));
     }
 #endif
