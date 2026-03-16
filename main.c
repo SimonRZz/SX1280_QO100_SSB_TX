@@ -1088,7 +1088,6 @@ static void cmd_help(void) {
         "  stop          - stop CW mode, return to SSB\r\n"
         "  key 0|1       - key down/up (GPIO only, no SPI; use while in CW mode)\r\n"
         "  hang <ms>     - set hang time 0..10000 ms (PA stays on this long after key-up)\r\n"
-        "  tcxo 0|1      - enable/disable onboard TCXO (GPIO22) at runtime\r\n"
         "  freq <Hz>     - set frequency with sub-Hz precision (e.g. freq 2400100050.5)\r\n"
         "  ppm <value>   - set PPM correction (e.g. ppm -0.5)\r\n"
         "  txpwr <-18..13> - set max TX power in dBm\r\n"
@@ -1195,6 +1194,7 @@ static void cdc_handle_line(char *line) {
         }
         g_target_freq_hz = f;
         if (g_cw_test_mode) {
+            sx_set_standby_auto();          // chip must be in STDBY_XOSC before SetTxCW
             sx_set_rf_frequency_steps(get_base_steps());
             sx_start_tx_continuous_wave();
         }
@@ -1219,6 +1219,7 @@ static void cdc_handle_line(char *line) {
         }
         g_ppm_correction = ppm;
         if (g_cw_test_mode) {
+            sx_set_standby_auto();          // chip must be in STDBY_XOSC before SetTxCW
             sx_set_rf_frequency_steps(get_base_steps());
             sx_start_tx_continuous_wave();
         }
@@ -1259,6 +1260,7 @@ static void cdc_handle_line(char *line) {
         if (pwr > (float)PWR_MAX_DBM) pwr = (float)PWR_MAX_DBM;
         g_tx_power_max_dbm = (int8_t)pwr;
         if (g_cw_test_mode) {
+            sx_set_standby_auto();          // chip must be in STDBY_XOSC before SetTxCW
             sx_set_tx_params_dbm(g_tx_power_max_dbm);
             sx_start_tx_continuous_wave();
         }
