@@ -692,6 +692,7 @@ class SX1280ControlApp(ttk.Frame):
         self.freq_hz_var  = tk.StringVar(value=str(self.config.freq_hz))
         self.ppm_var      = tk.DoubleVar(value=0.0)
         self.txpwr_var    = tk.IntVar(value=self.config.tx_power_dbm)
+        self._cw_test_active         = False                        # True while CW Test Mode is running
         self.tcxo_enabled_var        = tk.BooleanVar(value=True)   # mirrors USE_TCXO_MODULE=1 default
         self.tx_enabled_var          = tk.BooleanVar(value=True)
         self.scroll_tune_enabled_var = tk.BooleanVar(value=False)
@@ -921,8 +922,10 @@ class SX1280ControlApp(ttk.Frame):
         ttk.Label(cwf, text="Transmit continuous carrier for testing:").pack(anchor="w")
         bf = ttk.Frame(cwf)
         bf.pack(pady=10)
-        ttk.Button(bf, text="▶ Start CW", command=self._start_cw, width=15).pack(side="left", padx=10)
-        ttk.Button(bf, text="⏹ Stop",     command=self._stop_cw,  width=15).pack(side="left", padx=10)
+        self.cw_start_btn = ttk.Button(bf, text="▶ Start CW", command=self._start_cw, width=15)
+        self.cw_start_btn.pack(side="left", padx=10)
+        self.cw_stop_btn = ttk.Button(bf, text="⏹ Stop", command=self._stop_cw, width=15, state="disabled")
+        self.cw_stop_btn.pack(side="left", padx=10)
 
         qf = ttk.LabelFrame(tab, text="Quick Commands", padding=20)
         qf.grid(row=1, column=0, sticky="ew", pady=(0, 10))
@@ -1441,6 +1444,10 @@ class SX1280ControlApp(ttk.Frame):
         self.worker.disconnect()
         self.status_var.set("⚫ Disconnected")
         self._log("Disconnected", "info")
+        if self._cw_test_active:
+            self._cw_test_active = False
+            self.cw_start_btn.config(state="normal")
+            self.cw_stop_btn.config(state="disabled")
 
     def _send_cmd_safe(self, cmd):
         try:
@@ -1535,8 +1542,17 @@ class SX1280ControlApp(ttk.Frame):
         except ValueError:
             messagebox.showerror("Invalid frequency", "Frequency must be a number in Hz")
 
-    def _start_cw(self): self._send_cmd_safe("cw")
-    def _stop_cw(self):  self._send_cmd_safe("stop")
+    def _start_cw(self):
+        self._send_cmd_safe("cw")
+        self._cw_test_active = True
+        self.cw_start_btn.config(state="disabled")
+        self.cw_stop_btn.config(state="normal")
+
+    def _stop_cw(self):
+        self._send_cmd_safe("stop")
+        self._cw_test_active = False
+        self.cw_start_btn.config(state="normal")
+        self.cw_stop_btn.config(state="disabled")
 
     def _send_manual_cmd(self):
         cmd = self.manual_cmd_var.get().strip()
