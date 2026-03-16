@@ -1288,11 +1288,17 @@ class SX1280ControlApp(ttk.Frame):
     def _cw_text_send(self):
         """Start transmitting the text-field content as CW.
 
-        Sidetone always plays. RF carrier is gated by _cw_tx_active inside
-        _cb_key_on, so TX On/Off is already respected without blocking here.
+        If TX is not yet active, CW mode is enabled automatically before
+        transmission starts.  A brief startup delay (150 ms) is inserted when
+        CW mode is freshly activated so that sx_test_cw() on the firmware side
+        has time to finish its ~65 ms initialisation before the first key-down
+        command arrives.
+
         Only the text added since the previous send is transmitted; if the
         field was edited non-appendably the whole content is (re)sent.
         """
+        if not self.worker.is_connected():
+            return
         full = self.cw_text_var.get().upper()
         last = self._cw_last_sent
         # Determine the new suffix to send.
@@ -1301,13 +1307,26 @@ class SX1280ControlApp(ttk.Frame):
             return
 
         self._cw_last_sent = full          # remember for next delta
+
+        # Auto-enable CW TX mode if not already active.
+        startup_delay = 0.0
+        if not self._cw_tx_active:
+            self._cw_tx_active = True
+            try:
+                self.worker.send_line("cw")
+                self.worker.send_line(f"hang {int(self.cw_hang_var.get())}")
+            except Exception:
+                pass
+            self.cw_tx_btn.config(text="🔴  TX ON")
+            startup_delay = 0.15  # wait for sx_test_cw() ~65 ms init to finish
+
         # Abort running text TX, then give the new thread its own stop Event
         # so we never race between set() and clear() on a shared Event.
         self._cw_text_abort()
         stop = threading.Event()
         self._cw_text_stop = stop
         self._cw_text_thread = threading.Thread(
-            target=self._cw_text_loop, args=(to_send, stop), daemon=True)
+            target=self._cw_text_loop, args=(to_send, stop, startup_delay), daemon=True)
         self._cw_text_thread.start()
 
     def _cw_text_abort(self):
@@ -1329,13 +1348,16 @@ class SX1280ControlApp(ttk.Frame):
         self.cw_text_var.set("")
         self._cw_last_sent = ""
 
-    def _cw_text_loop(self, text, stop):
+    def _cw_text_loop(self, text, stop, startup_delay=0.0):
         """Background thread: convert text to CW elements and drive callbacks.
 
         Uses absolute-deadline timing (_sleep_until) to prevent per-element
         drift from Python call overhead.  Timing attributes are snapshotted
         under the keyer lock once per character so WPM changes never split a
         single character across two speed settings.
+
+        startup_delay: seconds to wait before the first key-down, used when CW
+        mode was just activated so the firmware has time to finish sx_test_cw().
         """
         cb_on  = self.keyer.cb_key_on
         cb_off = self.keyer.cb_key_off
@@ -1347,6 +1369,9 @@ class SX1280ControlApp(ttk.Frame):
                 if remaining <= 0 or stop.is_set():
                     return
                 time.sleep(min(remaining, 0.001))
+
+        if startup_delay > 0.0 and not stop.is_set():
+            time.sleep(startup_delay)
 
         t = time.monotonic()   # absolute timeline origin
 

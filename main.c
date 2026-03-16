@@ -654,12 +654,14 @@ static void sx_test_cw(void) {
     sx_set_tx_params_dbm(g_tx_power_max_dbm); tud_task();
     cdc_printf("Power: %d dBm\r\n", g_tx_power_max_dbm);
 
-    // Enable RF switch only when PA (RF output) is enabled by the user.
-    if (g_pa_enabled) gpio_put(PIN_TX_EN, 1);
+    // Enable RF switch unconditionally: TX_EN=1 routes SX1280 PA to antenna.
+    // For CW test mode this gives a continuous carrier.
+    // For the keyer, 'key 1' re-asserts TX_EN and 'key 0' + hang lowers it.
+    gpio_put(PIN_TX_EN, 1);
     gpio_put(PIN_RX_EN, 0);
-    gpio_put(PIN_PA_EN, 0);   // External PA pin (unconnected); keyer drives via 'key 1' / 'key 0'
+    gpio_put(PIN_PA_EN, 0);   // PA starts off; keyer drives via 'key 1' / 'key 0'
     g_cw_hang_pending = 0;    // Cancel any stale hang timer
-    cdc_printf("TX_EN=%d, RX_EN=0, PA_EN=0 (pa_enabled=%d)\r\n", g_pa_enabled ? 1 : 0, g_pa_enabled);
+    cdc_printf("TX_EN=1, RX_EN=0, PA_EN=0\r\n");
 
     // Start CW – check status immediately (before 5ms) and after
     sx_start_tx_continuous_wave(); tud_task();
@@ -690,13 +692,13 @@ static void sx_test_cw(void) {
 // tud_task() calls here are safe – no re-entrancy.
 static void sx_stop_cw(void) {
 #if CFG_TUD_CDC
-    g_cw_hang_pending = 0;   // Cancel hang timer before touching GPIOs
-    gpio_put(PIN_PA_EN, 0);  // PA off first (before RF goes quiet)
-    // TX_EN stays HIGH: Core1 already has tx_en_activated=true and won't
-    // re-assert it.  Pulling TX_EN low here would leave the RF switch in
-    // the wrong state for SSB/VOX operation after this function returns.
-    // SX1280 entering standby is sufficient to silence the carrier.
+    g_cw_hang_pending = 0;           // Cancel hang timer before touching GPIOs
+    gpio_put(PIN_PA_EN, 0);          // PA off first (before RF goes quiet)
     sx_set_standby_auto(); tud_task();
+    // Restore TX_EN to the correct level for SSB mode.
+    // Core1 has tx_en_activated=true and will never re-assert TX_EN itself,
+    // so we must restore it here.  The keyer may have left TX_EN=0 (hang fired).
+    gpio_put(PIN_TX_EN, g_pa_enabled ? 1 : 0);
     cdc_printf("TX stopped, back to standby (STDBY_XOSC)\r\n");
 
     // Flush stale audio blocks that accumulated while Core1 was paused.
@@ -1147,14 +1149,14 @@ static void cdc_handle_line(char *line) {
         uint8_t v;
         if (!parse_bool(argv[1], &v)) { cdc_write_str("ERR: key 0|1\r\n"); return; }
         if (v) {
-            // Key down: cancel any pending hang, enable PA immediately.
-            // PA_EN is unconditionally driven HIGH here – the 'key' command
-            // is an explicit CW keying action so PA always needs to follow,
-            // regardless of the g_pa_enabled flag (which only gates SSB PA).
+            // Key down: cancel hang, gate carrier ON via TX_EN (RF switch) and PA.
+            // TX_EN is the primary gate – it controls the RF switch to the antenna.
+            // PA_EN follows unconditionally (same as before: overrides g_pa_enabled for CW).
             g_cw_hang_pending = 0;
+            gpio_put(PIN_TX_EN, 1);
             gpio_put(PIN_PA_EN, 1);
         } else {
-            // Key up: start hang timer; PA_EN stays HIGH until hang expires
+            // Key up: start hang timer; TX_EN/PA_EN stay HIGH until hang expires.
             g_cw_hang_pending = 1;
             g_cw_hang_dl_us   = time_us_32() + g_cw_hang_ms * 1000u;
         }
@@ -1721,10 +1723,12 @@ int main(void) {
                 g_stop_cw_requested = 0;
                 sx_stop_cw();
             }
-            // Hang timer: PA_EN goes LOW after hang_ms of key-up silence
+            // Hang timer: lower TX_EN + PA_EN after hang_ms of key-up silence.
+            // TX_EN=0 gates the RF switch so no carrier reaches the antenna.
             if (g_cw_hang_pending && ((int32_t)(time_us_32() - g_cw_hang_dl_us) >= 0)) {
                 g_cw_hang_pending = 0;
-                gpio_put(PIN_PA_EN, 0);  // Silence PA; SX1280 stays in CW mode
+                gpio_put(PIN_TX_EN, 0);  // Gate carrier OFF via RF switch
+                gpio_put(PIN_PA_EN, 0);
             }
 #endif
             tight_loop_contents();
@@ -1742,6 +1746,7 @@ int main(void) {
         }
         if (g_cw_hang_pending && ((int32_t)(time_us_32() - g_cw_hang_dl_us) >= 0)) {
             g_cw_hang_pending = 0;
+            gpio_put(PIN_TX_EN, 0);
             gpio_put(PIN_PA_EN, 0);
         }
 
