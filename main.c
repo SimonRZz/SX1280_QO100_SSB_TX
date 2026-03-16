@@ -654,34 +654,22 @@ static void sx_test_cw(void) {
     sx_set_tx_params_dbm(g_tx_power_max_dbm); tud_task();
     cdc_printf("Power: %d dBm\r\n", g_tx_power_max_dbm);
 
-    // TX_EN stays LOW: no carrier until the first 'key 1' command.
-    // This prevents an unmodulated carrier burst when the user presses "TX ON".
+    // Leave SX1280 in STDBY_XOSC – no carrier until first 'key 1'.
+    // 'key 1' will call sx_start_tx_continuous_wave() just-in-time so the
+    // carrier is present only for the duration of each CW element.
     gpio_put(PIN_TX_EN, 0);
     gpio_put(PIN_RX_EN, 0);
-    gpio_put(PIN_PA_EN, 0);   // PA starts off; keyer drives via 'key 1' / 'key 0'
+    gpio_put(PIN_PA_EN, 0);   // PA off; keyer drives via 'key 1' / 'key 0'
     g_cw_hang_pending = 0;    // Cancel any stale hang timer
-    cdc_printf("TX_EN=0, RX_EN=0, PA_EN=0 (waiting for first key 1)\r\n");
 
-    // Start CW – check status immediately (before 5ms) and after
-    sx_start_tx_continuous_wave(); tud_task();
-    {
-        uint8_t st_imm = sx_get_status();
-        cdc_printf("Status immediately after SetTxCW: 0x%02X (mode=%d cmd_stat=%d)\r\n",
-                   st_imm, (st_imm>>5)&7, (st_imm>>1)&7);
-    }
-    for (int _i = 0; _i < 5; _i++) { tud_task(); sleep_ms(1); }
     uint8_t status = sx_get_status(); tud_task();
-    cdc_printf("Status after 5ms: 0x%02X (mode=%d)\r\n", status, (status >> 5) & 0x07);
-    cdc_printf("  mode 6=TX, 3=STDBY_XOSC, 2=STDBY_RC\r\n");
-    cdc_printf("  cmd_stat: 5=fail, 3=timeout, 6=TX_done, 2=data_avail\r\n");
-
-    if (((status >> 5) & 0x07) == 6) {
-        cdc_printf("*** TX ACTIVE - check spectrum analyzer! ***\r\n");
+    cdc_printf("Status: 0x%02X (mode=%d) – expecting 3=STDBY_XOSC\r\n",
+               status, (status >> 5) & 0x07);
+    if (((status >> 5) & 0x07) == 3) {
+        cdc_printf("OK – STDBY_XOSC, ready for keying.\r\n");
     } else {
-        cdc_printf("*** WARNING: TX not active! ***\r\n");
-        cdc_printf("  If mode=2 and cmd_stat=5: XOSC/PLL failed (check XTA signal)\r\n");
-        cdc_printf("  If mode=2 and cmd_stat=3: command timeout\r\n");
-        cdc_printf("  BUSY pin: %d (should be 0 after failed cmd)\r\n", gpio_get(PIN_BUSY));
+        cdc_printf("*** WARNING: unexpected chip mode! Check TCXO/XOSC. ***\r\n");
+        cdc_printf("  BUSY pin: %d\r\n", gpio_get(PIN_BUSY));
     }
 #endif
 }
@@ -1149,15 +1137,21 @@ static void cdc_handle_line(char *line) {
         uint8_t v;
         if (!parse_bool(argv[1], &v)) { cdc_write_str("ERR: key 0|1\r\n"); return; }
         if (v) {
-            // Key down: cancel hang, open RF switch and PA immediately.
+            // Key down: cancel hang, start TX_CW, open RF switch.
+            // sx_set_standby_auto() + sx_start_tx_continuous_wave() take ~500 µs
+            // (SPI + PLL lock) which is negligible at any normal CW speed.
+            // Calling SetStandby first is safe even if chip is already in STDBY.
             g_cw_hang_pending = 0;
+            sx_set_standby_auto();
+            sx_start_tx_continuous_wave();
             gpio_put(PIN_TX_EN, 1);
             gpio_put(PIN_PA_EN, 1);
         } else {
-            // Key up: immediately close RF switch (forms CW inter-element gap),
-            // then start hang timer so PA_EN goes low after hang_ms.
+            // Key up: immediately close RF switch and put SX1280 to standby.
+            // Standby completely stops the carrier – no leakage through RF switch.
             gpio_put(PIN_TX_EN, 0);
             gpio_put(PIN_PA_EN, 0);
+            sx_set_standby_auto();
             g_cw_hang_pending = 1;
             g_cw_hang_dl_us   = time_us_32() + g_cw_hang_ms * 1000u;
         }
