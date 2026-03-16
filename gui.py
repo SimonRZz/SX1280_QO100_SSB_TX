@@ -1612,6 +1612,12 @@ class SX1280ControlApp(ttk.Frame):
             while True:
                 line = self.rx_queue.get_nowait()
                 self._log(line, "recv")
+                # Sync GUI state when firmware reports CW mode stopped.
+                # This handles the case where "stop" is sent from the console
+                # (not via the TX OFF button), which leaves _cw_tx_active stale.
+                if "TX stopped" in line and self._cw_tx_active:
+                    self._cw_tx_active = False
+                    self.cw_tx_btn.config(text="⬛  TX OFF")
         except queue.Empty:
             pass
         self.master.after(50, self._poll_rx)
