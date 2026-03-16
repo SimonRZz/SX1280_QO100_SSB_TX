@@ -131,11 +131,9 @@ static volatile float g_ppm_correction = 0.0f;
 static volatile uint8_t g_cw_test_mode      = 0;  // 1 = CW test active (blocks normal Core1 operation)
 static volatile uint8_t g_cw_test_requested = 0;  // set by CDC handler, consumed by main loop
 static volatile uint8_t g_stop_cw_requested = 0;  // set by CDC handler, consumed by main loop
-// TCXO runtime flag – defaults to compile-time USE_TCXO_MODULE, but can be
-// toggled live with 'tcxo 0|1'.  All standby-mode decisions use this at runtime.
+// TCXO always enabled – hardcoded to USE_TCXO_MODULE (must be 1).
+// GPIO22 is driven HIGH unconditionally at startup.
 static volatile uint8_t  g_tcxo_enabled     = USE_TCXO_MODULE;
-static volatile uint8_t  g_tcxo_chg_req     = 0;  // deferred: apply TCXO change in main loop
-static volatile uint8_t  g_tcxo_chg_val     = 0;  // 0 or 1
 
 static volatile uint32_t g_cw_hang_ms       = 1000; // Hang time: carrier stays on this long after key-up
 // These are Core0-only (main loop + CDC handler), no need for volatile:
@@ -490,10 +488,9 @@ static inline void sx_set_standby_xosc(void) {
     sx_write_cmd(OPCODE_SET_STANDBY, &cfg, 1);
 }
 
-// Choose standby mode based on current runtime TCXO setting
+// TCXO always enabled – always use STDBY_XOSC
 static inline void sx_set_standby_auto(void) {
-    if (g_tcxo_enabled) sx_set_standby_xosc();
-    else                sx_set_standby_rc();
+    sx_set_standby_xosc();
 }
 
 static inline void sx_set_packet_type_gfsk(void) {
@@ -609,45 +606,6 @@ static void sx_print_diag(void) {
 #endif
 }
 
-// Apply TCXO enable/disable at runtime.
-// Must be called from the main loop (Core0), NOT from Core1 or CDC handler.
-// Pauses Core1 during the oscillator switch, then resumes it.
-static void sx_apply_tcxo(uint8_t enable) {
-#if CFG_TUD_CDC
-    // Pause Core1 for SPI safety (same mechanism as sx_test_cw)
-    uint8_t was_cw_mode = g_cw_test_mode;
-    if (!was_cw_mode) {
-        g_cw_test_mode = 1;
-        __compiler_memory_barrier();
-        for (int _i = 0; _i < 60; _i++) { tud_task(); sleep_ms(1); }
-    }
-
-    g_tcxo_enabled = enable;
-    if (enable) {
-        gpio_put(PIN_TCXO_EN, 1);
-        for (int _i = 0; _i < 5; _i++) { tud_task(); sleep_ms(1); } // TCXO stabilise ≥3ms
-        sx_set_standby_xosc(); tud_task();
-        {
-            uint8_t st = sx_get_status();
-            uint8_t mode = (st >> 5) & 0x07;
-            if (mode == 3) {
-                cdc_printf("OK TCXO on  → STDBY_XOSC (GPIO%lu=1)\r\n", (unsigned long)PIN_TCXO_EN);
-            } else {
-                cdc_printf("ERR TCXO on: SetStandby(XOSC) failed! chip mode=%d [0x%02X]\r\n"
-                           "  → TCXO signal not valid; check TCXOEN wiring (pin2→GPIO%lu)\r\n",
-                           mode, st, (unsigned long)PIN_TCXO_EN);
-            }
-        }
-    } else {
-        sx_set_standby_rc(); tud_task();
-        gpio_put(PIN_TCXO_EN, 0);
-        cdc_printf("OK TCXO off → STDBY_RC  (GPIO%lu=0)\r\n", (unsigned long)PIN_TCXO_EN);
-    }
-
-    // Resume Core1 only if it was running before we paused it
-    if (!was_cw_mode) g_cw_test_mode = 0;
-#endif
-}
 
 // Test CW transmission
 static void sx_test_cw(void) {
@@ -663,24 +621,20 @@ static void sx_test_cw(void) {
     // while keeping TinyUSB alive so host writes never time out.
     for (int _i = 0; _i < 60; _i++) { tud_task(); sleep_ms(1); }
 
-    // Make sure TCXO is running (safe to call even if already on)
-    if (g_tcxo_enabled) {
-        gpio_put(PIN_TCXO_EN, 1);
-        for (int _i = 0; _i < 5; _i++) { tud_task(); sleep_ms(1); } // stabilise ≥3ms
-        cdc_printf("TCXO on (GPIO%lu=1)\r\n", (unsigned long)PIN_TCXO_EN);
-    }
+    // TCXO is always on (GPIO22 HIGH since boot); re-assert for safety.
+    gpio_put(PIN_TCXO_EN, 1);
+    for (int _i = 0; _i < 5; _i++) { tud_task(); sleep_ms(1); } // stabilise ≥3ms
+    cdc_printf("TCXO on (GPIO%lu=1)\r\n", (unsigned long)PIN_TCXO_EN);
 
-    // Set standby mode matching oscillator selection
+    // Set standby mode – TCXO always enabled so always STDBY_XOSC
     sx_set_standby_auto(); tud_task();
     {
         uint8_t st = sx_get_status();
         uint8_t mode = (st >> 5) & 0x07;
-        const char *expected = g_tcxo_enabled ? "STDBY_XOSC" : "STDBY_RC";
-        uint8_t expected_mode = g_tcxo_enabled ? 3 : 2;
-        cdc_printf("Mode: %s → chip mode=%d [0x%02X] %s\r\n",
-                   expected, mode, st,
-                   (mode == expected_mode) ? "OK" : "*** MISMATCH - XOSC failed? ***");
-        if (g_tcxo_enabled && mode != 3) {
+        cdc_printf("Mode: STDBY_XOSC → chip mode=%d [0x%02X] %s\r\n",
+                   mode, st,
+                   (mode == 3) ? "OK" : "*** MISMATCH - XOSC failed? ***");
+        if (mode != 3) {
             cdc_printf("  TCXO/XOSC not running! TX will fail.\r\n"
                        "  Check: TCXOEN pin2→GPIO%lu, TCXO supply, 52MHz on XTA.\r\n",
                        (unsigned long)PIN_TCXO_EN);
@@ -743,8 +697,7 @@ static void sx_stop_cw(void) {
     // the wrong state for SSB/VOX operation after this function returns.
     // SX1280 entering standby is sufficient to silence the carrier.
     sx_set_standby_auto(); tud_task();
-    cdc_printf("TX stopped, back to standby (%s)\r\n",
-               g_tcxo_enabled ? "STDBY_XOSC" : "STDBY_RC");
+    cdc_printf("TX stopped, back to standby (STDBY_XOSC)\r\n");
 
     // Flush stale audio blocks that accumulated while Core1 was paused.
     // Core1 is still sleeping (g_cw_test_mode=1), so no race condition here.
@@ -1185,17 +1138,6 @@ static void cdc_handle_line(char *line) {
     if (streqi(argv[0], "cw"))   { g_cw_test_requested = 1; cdc_write_str("CW: starting...\r\n"); return; }
     if (streqi(argv[0], "stop")) { g_stop_cw_requested  = 1; cdc_write_str("CW: stopping...\r\n"); return; }
 
-    // tcxo 0|1 – enable/disable onboard TCXO (GPIO22) at runtime.
-    // Must not be changed while in CW test mode (SX1280 in use).
-    if (streqi(argv[0], "tcxo") && argc >= 2) {
-        uint8_t v;
-        if (!parse_bool(argv[1], &v)) { cdc_write_str("ERR: tcxo 0|1\r\n"); return; }
-        if (g_cw_test_mode) { cdc_write_str("ERR: stop CW mode first (send 'stop')\r\n"); return; }
-        g_tcxo_chg_val = v;
-        g_tcxo_chg_req = 1;  // handled in main loop (Core0, after Core1 is paused)
-        cdc_printf("TCXO change to %d queued...\r\n", (int)v);
-        return;
-    }
 
     // CW key command: key 0|1
     // Fast GPIO-only keying — no SPI, safe to call from CDC handler.
@@ -1646,20 +1588,12 @@ int main(void) {
     board_init_after_tusb();
 
     // ---- SX1280 GPIO/SPI init ----
-    // GPIO22 = TCXO_EN on LoRa1280F27-TCXO.  Always initialise so 'tcxo 0|1'
-    // works at runtime regardless of the USE_TCXO_MODULE compile default.
+    // GPIO22 = TCXO_EN on LoRa1280F27-TCXO.  Always HIGH: TCXO is permanently enabled.
     gpio_init(PIN_TCXO_EN);
     gpio_set_dir(PIN_TCXO_EN, GPIO_OUT);
-    if (g_tcxo_enabled) {
-        gpio_put(PIN_TCXO_EN, 1);
-        sleep_ms(5);  // TCXO needs ≥3 ms to stabilise
-        printf("[SX1280] TCXO on  (GPIO%d=1, USE_TCXO_MODULE=%d)\n",
-               (int)PIN_TCXO_EN, USE_TCXO_MODULE);
-    } else {
-        gpio_put(PIN_TCXO_EN, 0);
-        printf("[SX1280] TCXO off (GPIO%d=0, USE_TCXO_MODULE=%d)\n",
-               (int)PIN_TCXO_EN, USE_TCXO_MODULE);
-    }
+    gpio_put(PIN_TCXO_EN, 1);
+    sleep_ms(5);  // TCXO needs ≥3 ms to stabilise
+    printf("[SX1280] TCXO on  (GPIO%d=1)\n", (int)PIN_TCXO_EN);
 
     gpio_init(PIN_NSS);   gpio_set_dir(PIN_NSS, GPIO_OUT);   gpio_put(PIN_NSS, 1);
     gpio_init(PIN_RX_EN); gpio_set_dir(PIN_RX_EN, GPIO_OUT); gpio_put(PIN_RX_EN, 0);
@@ -1807,12 +1741,6 @@ int main(void) {
         if (g_cw_hang_pending && ((int32_t)(time_us_32() - g_cw_hang_dl_us) >= 0)) {
             g_cw_hang_pending = 0;
             gpio_put(PIN_PA_EN, 0);
-        }
-        // TCXO change: needs Core1 paused (sx_apply_tcxo handles that internally).
-        // Only handle outside the inner loop so we never do it while g_cw_test_mode=1.
-        if (g_tcxo_chg_req && !g_cw_test_mode) {
-            g_tcxo_chg_req = 0;
-            sx_apply_tcxo(g_tcxo_chg_val);
         }
 
         if (!greeted && tud_cdc_connected()) {
