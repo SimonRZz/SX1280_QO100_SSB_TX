@@ -1738,18 +1738,14 @@ int main(void) {
                 g_stop_cw_requested = 0;
                 sx_stop_cw();
             }
-            // Hang timer: no keying for hang_ms → restore test carrier.
-            // Operator can monitor frequency between transmissions without
-            // pressing TX OFF / TX ON again.  The carrier has no driver PA
-            // (PA_EN=0), so only SX1280 output reaches the spectrum analyser.
+            // Hang timer: no keying for hang_ms → stay silent (STDBY_RC).
+            // TX_EN=0 and PA_EN=0 were already set by 'key 0'.
             if (g_cw_hang_pending && ((int32_t)(time_us_32() - g_cw_hang_dl_us) >= 0)) {
                 g_cw_hang_pending = 0;
-                // Chip is in STDBY_RC from 'key 0'; restart test carrier.
-                sx_set_standby_auto();          // STDBY_RC → STDBY_XOSC
-                sx_start_tx_continuous_wave();  // PLL lock
-                gpio_put(PIN_TX_EN, 1);         // RF switch open
-                gpio_put(PIN_PA_EN, 0);         // driver PA stays off (test carrier)
-                g_cw_tx_running = 1;
+                gpio_put(PIN_TX_EN, 0);
+                gpio_put(PIN_PA_EN, 0);
+                sx_set_standby_rc();   // XOSC off – no leakage, PA VOX drops
+                g_cw_tx_running = 0;
             }
 #endif
             tight_loop_contents();
