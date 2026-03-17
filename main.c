@@ -139,6 +139,7 @@ static volatile uint32_t g_cw_hang_ms       = 1000; // Hang time: carrier stays 
 // These are Core0-only (main loop + CDC handler), no need for volatile:
 static uint8_t  g_cw_hang_pending  = 0;   // 1 = hang timer running
 static uint32_t g_cw_hang_dl_us    = 0;   // Hang-expiry timestamp (us)
+static uint8_t  g_cw_tx_running    = 0;   // 1 = SX1280 currently in TX_CW mode
 static volatile int8_t g_tx_power_max_dbm = PWR_MAX_DBM;  // Runtime TX power limit
 static volatile uint8_t g_tx_enabled  = 1;  // TX enable flag (for GUI TX button)
 static volatile uint8_t g_pa_enabled  = 1;  // RF output enable: 0=RF muted (TX_EN low), 1=normal TX
@@ -655,13 +656,15 @@ static void sx_test_cw(void) {
     cdc_printf("Power: %d dBm\r\n", g_tx_power_max_dbm);
 
     // Start continuous carrier: useful for frequency/power verification on a
-    // spectrum analyser.  The keyer gates this carrier element-by-element:
-    //   key 0 → sx_set_standby_auto() + TX_EN=0  (carrier completely off)
-    //   key 1 → sx_start_tx_continuous_wave() + TX_EN=1  (carrier back on)
+    // spectrum analyser (TX_EN=1, PA_EN=0 → SX1280 output only, no driver PA).
+    // The keyer uses g_cw_tx_running to decide how to handle 'key 1':
+    //   carrier running → PA_EN=1 only (no SPI, no carrier interruption)
+    //   carrier stopped → full restart: STDBY_XOSC → TX_CW → TX_EN=1 → PA_EN=1
     gpio_put(PIN_TX_EN, 1);
     gpio_put(PIN_RX_EN, 0);
-    gpio_put(PIN_PA_EN, 0);   // external PA off initially
+    gpio_put(PIN_PA_EN, 0);   // keyer drives PA_EN via 'key 1' / 'key 0'
     g_cw_hang_pending = 0;    // cancel any stale hang timer
+    g_cw_tx_running   = 0;    // will be set to 1 after carrier confirmed below
     sx_start_tx_continuous_wave(); tud_task();
 
     for (int _i = 0; _i < 5; _i++) { tud_task(); sleep_ms(1); }
@@ -669,20 +672,11 @@ static void sx_test_cw(void) {
     cdc_printf("Status after 5ms: 0x%02X (mode=%d)\r\n", status, (status >> 5) & 0x07);
     if (((status >> 5) & 0x07) == 6) {
         cdc_printf("OK – TX active, carrier on (TX_EN=1).\r\n");
+        g_cw_tx_running = 1;
     } else {
         cdc_printf("*** WARNING: TX not active! Check TCXO/XOSC. ***\r\n");
         cdc_printf("  BUSY pin: %d\r\n", gpio_get(PIN_BUSY));
     }
-
-    // PA VOX warmup: briefly enable the driver PA so the external PA VOX
-    // is fully triggered before the first key press arrives.
-    // Without this pulse an operator who starts keying immediately after
-    // TX ON may lose the first element (or part of it) to VOX attack time.
-    // The 100 ms pulse is enough for any common amateur PA VOX circuit.
-    gpio_put(PIN_PA_EN, 1);
-    for (int _w = 0; _w < 100; _w++) { tud_task(); sleep_ms(1); }
-    gpio_put(PIN_PA_EN, 0);   // keyer takes over via 'key 1' / 'key 0'
-    cdc_printf("PA warmup done – external PA VOX should be triggered.\r\n");
 #endif
 }
 
@@ -692,6 +686,7 @@ static void sx_test_cw(void) {
 static void sx_stop_cw(void) {
 #if CFG_TUD_CDC
     g_cw_hang_pending = 0;           // Cancel hang timer before touching GPIOs
+    g_cw_tx_running   = 0;           // Carrier will be stopped below
     gpio_put(PIN_PA_EN, 0);          // PA off first (before RF goes quiet)
     sx_set_standby_auto(); tud_task();
     // Restore TX_EN to the correct level for SSB mode.
@@ -1140,39 +1135,43 @@ static void cdc_handle_line(char *line) {
 
 
     // CW key command: key 0|1
-    // Sequencing:
-    //   key 1 → (standby→XOSC→TX_CW ~1.5 ms) + TX_EN=1 + PA_EN=1  — carrier on.
-    //           Chip may be in STDBY_RC (from key 0) so sx_set_standby_auto()
-    //           transitions RC→XOSC (~1 ms), then PLL locks (~500 µs).
-    //   key 0 → TX_EN=0 + PA_EN=0 + STDBY_RC  — carrier AND XOSC completely off.
-    //           STDBY_RC ensures zero TCXO/XOSC leakage so the external PA VOX
-    //           hold timer runs down cleanly and the PA drops after hold_time.
-    //           (STDBY_XOSC still runs the 52 MHz TCXO; harmonics near 2.4 GHz
-    //           can keep the VOX above its 1 mW threshold indefinitely.)
-    //   hang timer → TX_EN=0 + PA_EN=0 + STDBY_RC reinforced after hang_ms.
+    // Uses g_cw_tx_running to avoid interrupting an already-running carrier:
+    //   key 1, carrier running  → PA_EN=1 only (no SPI, no dropout)
+    //   key 1, carrier stopped  → STDBY_RC→XOSC→TX_CW→TX_EN=1→PA_EN=1 (~1.5 ms)
+    //   key 0 → TX_EN=0 + PA_EN=0 + STDBY_RC + hang timer
+    //   hang timer → restore test carrier (TX_CW, TX_EN=1, PA_EN=0)
     if (streqi(argv[0], "key") && argc >= 2) {
         if (!g_cw_test_mode) { cdc_write_str("ERR: key requires CW mode (send 'cw' first)\r\n"); return; }
         uint8_t v;
         if (!parse_bool(argv[1], &v)) { cdc_write_str("ERR: key 0|1\r\n"); return; }
         if (v) {
-            // Key down: transition to TX_CW and open RF path.
-            // sx_set_standby_auto() transitions STDBY_RC→STDBY_XOSC (~1 ms XOSC
-            // startup) if key 0 left the chip in STDBY_RC, then PLL locks (~500 µs).
-            // Total ~1.5 ms from command receipt to TX_EN=1 — negligible at any
-            // normal CW speed (20 WPM dit = 60 ms).
+            // Key down – two paths depending on whether the SX1280 is already
+            // transmitting (test carrier from sx_test_cw or a previous key 1).
             g_cw_hang_pending = 0;
-            sx_set_standby_auto();           // RC→XOSC if needed, or no-op if XOSC
-            sx_start_tx_continuous_wave();   // PLL lock; BUSY goes low when stable
-            gpio_put(PIN_TX_EN, 1);
-            gpio_put(PIN_PA_EN, 1);
+            if (g_cw_tx_running) {
+                // Fast path: carrier is already running (TX_CW, TX_EN=1).
+                // Just enable the driver PA – zero SPI, zero carrier interruption.
+                // The external PA VOX was already triggered by the test carrier,
+                // so no attack-time is wasted on the first element.
+                gpio_put(PIN_PA_EN, 1);
+            } else {
+                // Slow path: chip is in STDBY_RC (key 0 / hang timer fired).
+                // sx_set_standby_auto() wakes XOSC (~1 ms), then PLL locks (~500 µs).
+                // Total ~1.5 ms to TX_EN=1 – fine at any normal CW speed.
+                sx_set_standby_auto();           // STDBY_RC → STDBY_XOSC
+                sx_start_tx_continuous_wave();   // PLL lock; BUSY low when stable
+                gpio_put(PIN_TX_EN, 1);
+                gpio_put(PIN_PA_EN, 1);
+                g_cw_tx_running = 1;
+            }
         } else {
             // Key up: close RF switch, kill driver PA, then enter STDBY_RC.
-            // STDBY_RC turns off the TCXO completely so zero 52 MHz (or harmonic)
-            // leakage reaches the external PA.  With no RF above the 1 mW VOX
-            // threshold the PA hold timer runs down cleanly after each key-up.
+            // STDBY_RC turns the TCXO completely off – zero leakage so the
+            // external PA VOX hold timer runs down cleanly after each key-up.
             gpio_put(PIN_TX_EN, 0);
             gpio_put(PIN_PA_EN, 0);
             sx_set_standby_rc();             // XOSC off – zero leakage
+            g_cw_tx_running   = 0;
             g_cw_hang_pending = 1;
             g_cw_hang_dl_us   = time_us_32() + g_cw_hang_ms * 1000u;
         }
@@ -1739,14 +1738,18 @@ int main(void) {
                 g_stop_cw_requested = 0;
                 sx_stop_cw();
             }
-            // Hang timer: key 0 already set TX_EN=0 / PA_EN=0 / STDBY_RC.
-            // Re-assert here as belt-and-suspenders; also re-enter STDBY_RC in
-            // case the test carrier (sx_test_cw) left the chip in TX_CW.
+            // Hang timer: no keying for hang_ms → restore test carrier.
+            // Operator can monitor frequency between transmissions without
+            // pressing TX OFF / TX ON again.  The carrier has no driver PA
+            // (PA_EN=0), so only SX1280 output reaches the spectrum analyser.
             if (g_cw_hang_pending && ((int32_t)(time_us_32() - g_cw_hang_dl_us) >= 0)) {
                 g_cw_hang_pending = 0;
-                gpio_put(PIN_TX_EN, 0);
-                gpio_put(PIN_PA_EN, 0);
-                sx_set_standby_rc();   // XOSC off – PA VOX drops after its hold time
+                // Chip is in STDBY_RC from 'key 0'; restart test carrier.
+                sx_set_standby_auto();          // STDBY_RC → STDBY_XOSC
+                sx_start_tx_continuous_wave();  // PLL lock
+                gpio_put(PIN_TX_EN, 1);         // RF switch open
+                gpio_put(PIN_PA_EN, 0);         // driver PA stays off (test carrier)
+                g_cw_tx_running = 1;
             }
 #endif
             tight_loop_contents();
