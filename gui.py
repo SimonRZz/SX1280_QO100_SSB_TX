@@ -693,6 +693,7 @@ class SX1280ControlApp(ttk.Frame):
         self.ppm_var      = tk.DoubleVar(value=0.0)
         self.txpwr_var    = tk.IntVar(value=self.config.tx_power_dbm)
         self._cw_test_active         = False                        # True while CW Test Mode is running
+        self._cw_test_stop_pending   = False                        # True when Stop was triggered by test carrier (not keyer)
         self.tx_enabled_var          = tk.BooleanVar(value=True)
         self.scroll_tune_enabled_var = tk.BooleanVar(value=False)
         self.en_bp_var    = tk.BooleanVar(value=self.config.enable_bp)
@@ -1137,9 +1138,9 @@ class SX1280ControlApp(ttk.Frame):
             return
         self._cw_tx_active = not self._cw_tx_active
         if self._cw_tx_active:
-            # Start CW mode once; subsequent key presses use 'key 1'/'key 0'
+            # Start CW keyer mode (no carrier until first key press)
             try:
-                self.worker.send_line("cw")
+                self.worker.send_line("cwkey")
                 self.worker.send_line(f"hang {int(self.cw_hang_var.get())}")
             except Exception: pass
             self.cw_tx_btn.config(text="🔴  TX ON")
@@ -1551,6 +1552,7 @@ class SX1280ControlApp(ttk.Frame):
         self.cw_stop_btn.config(state="normal")
 
     def _stop_cw(self):
+        self._cw_test_stop_pending = True   # suppress keyer TX-button reset in _poll_rx
         self._send_cmd_safe("stop")
         self._cw_test_active = False
         self.cw_start_btn.config(state="normal")
@@ -1615,9 +1617,14 @@ class SX1280ControlApp(ttk.Frame):
                 # Sync GUI state when firmware reports CW mode stopped.
                 # This handles the case where "stop" is sent from the console
                 # (not via the TX OFF button), which leaves _cw_tx_active stale.
-                if "TX stopped" in line and self._cw_tx_active:
-                    self._cw_tx_active = False
-                    self.cw_tx_btn.config(text="⬛  TX OFF")
+                # _cw_test_stop_pending is set by _stop_cw() (test carrier stop)
+                # so that "TX stopped" from there does NOT reset the keyer TX button.
+                if "TX stopped" in line:
+                    if self._cw_test_stop_pending:
+                        self._cw_test_stop_pending = False  # consume; keyer TX unchanged
+                    elif self._cw_tx_active:
+                        self._cw_tx_active = False
+                        self.cw_tx_btn.config(text="⬛  TX OFF")
         except queue.Empty:
             pass
         self.master.after(50, self._poll_rx)

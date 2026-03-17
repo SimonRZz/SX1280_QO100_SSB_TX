@@ -130,6 +130,7 @@ static volatile double g_target_freq_hz = (double)BASE_FREQ_HZ;
 static volatile float g_ppm_correction = 0.0f;
 static volatile uint8_t g_cw_test_mode      = 0;  // 1 = CW test active (blocks normal Core1 operation)
 static volatile uint8_t g_cw_test_requested = 0;  // set by CDC handler, consumed by main loop
+static volatile uint8_t g_cw_with_carrier   = 0;  // 1 = start carrier immediately (cw), 0 = keyer-only (cwkey)
 static volatile uint8_t g_stop_cw_requested = 0;  // set by CDC handler, consumed by main loop
 // TCXO always enabled – hardcoded to USE_TCXO_MODULE (must be 1).
 // GPIO22 is driven HIGH unconditionally at startup.
@@ -608,14 +609,15 @@ static void sx_print_diag(void) {
 }
 
 
-// Test CW transmission
-static void sx_test_cw(void) {
+// Enter CW mode.
+// with_carrier=1: emit continuous carrier immediately (cw command – test mode).
+// with_carrier=0: stay in STDBY_XOSC, wait for first key press  (cwkey command – keyer TX ON).
+// Always called from the main loop (never inside cdc_task/tud_task).
+static void sx_start_cw_mode(uint8_t with_carrier) {
 #if CFG_TUD_CDC
-    cdc_printf("\r\n*** Starting CW test ***\r\n");
+    cdc_printf("\r\n*** %s ***\r\n", with_carrier ? "Starting CW test (carrier)" : "Starting CW keyer mode");
 
     // Signal Core1 to stop SPI operations.
-    // sx_test_cw() is always called from the main loop (never inside cdc_task/tud_task),
-    // so calling tud_task() here is safe – no re-entrancy.
     g_cw_test_mode = 1;
     __compiler_memory_barrier();
     // Wait 60 ms for Core1 to finish its current block (max 32 ms) and see the flag,
@@ -655,27 +657,37 @@ static void sx_test_cw(void) {
     sx_set_tx_params_dbm(g_tx_power_max_dbm); tud_task();
     cdc_printf("Power: %d dBm\r\n", g_tx_power_max_dbm);
 
-    // Start continuous carrier: useful for frequency/power verification on a
-    // spectrum analyser (TX_EN=1, PA_EN=0 → SX1280 output only, no driver PA).
-    // The keyer uses g_cw_tx_running to decide how to handle 'key 1':
-    //   carrier running → PA_EN=1 only (no SPI, no carrier interruption)
-    //   carrier stopped → full restart: STDBY_XOSC → TX_CW → TX_EN=1 → PA_EN=1
     gpio_put(PIN_RX_EN, 0);
-    gpio_put(PIN_PA_EN, 0);   // keyer drives PA_EN via 'key 1' / 'key 0'
-    g_cw_hang_pending = 0;    // cancel any stale hang timer
-    g_cw_tx_running   = 0;    // will be set to 1 after carrier confirmed below
-    sx_start_tx_continuous_wave(); tud_task();
-    gpio_put(PIN_TX_EN, 1);
+    gpio_put(PIN_PA_EN, 0);
+    g_cw_hang_pending = 0;
+    g_cw_tx_running   = 0;
 
-    for (int _i = 0; _i < 5; _i++) { tud_task(); sleep_ms(1); }
-    uint8_t status = sx_get_status(); tud_task();
-    cdc_printf("Status after 5ms: 0x%02X (mode=%d)\r\n", status, (status >> 5) & 0x07);
-    if (((status >> 5) & 0x07) == 6) {
-        cdc_printf("OK – TX active, carrier on (TX_EN=1, PA_EN=0).\r\n");
-        g_cw_tx_running = 1;
+    if (with_carrier) {
+        // Start continuous carrier: useful for frequency/power verification on a
+        // spectrum analyser (TX_EN=1, PA_EN=0 → SX1280 output only, no driver PA).
+        // The keyer uses g_cw_tx_running to decide how to handle 'key 1':
+        //   carrier running → PA_EN=1 only (no SPI, no carrier interruption)
+        //   carrier stopped → full restart: STDBY_XOSC → TX_CW → TX_EN=1 → PA_EN=1
+        sx_start_tx_continuous_wave(); tud_task();
+        gpio_put(PIN_TX_EN, 1);
+
+        for (int _i = 0; _i < 5; _i++) { tud_task(); sleep_ms(1); }
+        uint8_t status = sx_get_status(); tud_task();
+        cdc_printf("Status after 5ms: 0x%02X (mode=%d)\r\n", status, (status >> 5) & 0x07);
+        if (((status >> 5) & 0x07) == 6) {
+            cdc_printf("OK – TX active, carrier on (TX_EN=1, PA_EN=0).\r\n");
+            g_cw_tx_running = 1;
+        } else {
+            cdc_printf("*** WARNING: TX not active! Check TCXO/XOSC. ***\r\n");
+            cdc_printf("  BUSY pin: %d\r\n", gpio_get(PIN_BUSY));
+        }
     } else {
-        cdc_printf("*** WARNING: TX not active! Check TCXO/XOSC. ***\r\n");
-        cdc_printf("  BUSY pin: %d\r\n", gpio_get(PIN_BUSY));
+        // No carrier – stay in STDBY_XOSC.  First 'key 1' takes the slow path
+        // (STDBY_XOSC → TX_CW → TX_EN=1 → PA_EN=1, ~500 µs).
+        gpio_put(PIN_TX_EN, 0);
+        uint8_t status = sx_get_status(); tud_task();
+        cdc_printf("Status: 0x%02X (mode=%d) – ready for keying.\r\n",
+                   status, (status >> 5) & 0x07);
     }
 #endif
 }
@@ -1130,8 +1142,9 @@ static void cdc_handle_line(char *line) {
     if (streqi(argv[0], "help")) { cmd_help(); return; }
     if (streqi(argv[0], "get"))  { cfg_print(); return; }
     if (streqi(argv[0], "diag")) { sx_print_diag(); return; }
-    if (streqi(argv[0], "cw"))   { g_cw_test_requested = 1; cdc_write_str("CW: starting...\r\n"); return; }
-    if (streqi(argv[0], "stop")) { g_stop_cw_requested  = 1; cdc_write_str("CW: stopping...\r\n"); return; }
+    if (streqi(argv[0], "cw"))    { g_cw_with_carrier = 1; g_cw_test_requested = 1; cdc_write_str("CW: starting (carrier)...\r\n"); return; }
+    if (streqi(argv[0], "cwkey")) { g_cw_with_carrier = 0; g_cw_test_requested = 1; cdc_write_str("CW: keyer mode starting...\r\n"); return; }
+    if (streqi(argv[0], "stop"))  { g_stop_cw_requested  = 1; cdc_write_str("CW: stopping...\r\n"); return; }
 
 
     // CW key command: key 0|1
@@ -1146,7 +1159,7 @@ static void cdc_handle_line(char *line) {
         if (!parse_bool(argv[1], &v)) { cdc_write_str("ERR: key 0|1\r\n"); return; }
         if (v) {
             // Key down – two paths depending on whether the SX1280 is already
-            // transmitting (test carrier from sx_test_cw or a previous key 1).
+            // transmitting (test carrier from 'cw' command or a previous key 1).
             g_cw_hang_pending = 0;
             if (g_cw_tx_running) {
                 // Fast path: carrier is already running (TX_CW, TX_EN=1).
@@ -1732,7 +1745,7 @@ int main(void) {
 #if CFG_TUD_CDC
             if (g_cw_test_requested) {
                 g_cw_test_requested = 0;
-                sx_test_cw();
+                sx_start_cw_mode(g_cw_with_carrier);
             }
             if (g_stop_cw_requested) {
                 g_stop_cw_requested = 0;
