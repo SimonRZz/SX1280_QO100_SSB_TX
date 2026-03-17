@@ -655,28 +655,19 @@ static void sx_test_cw(void) {
     sx_set_tx_params_dbm(g_tx_power_max_dbm); tud_task();
     cdc_printf("Power: %d dBm\r\n", g_tx_power_max_dbm);
 
-    // Start continuous carrier: useful for frequency/power verification on a
-    // spectrum analyser (TX_EN=1, PA_EN=0 → SX1280 output only, no driver PA).
-    // The keyer uses g_cw_tx_running to decide how to handle 'key 1':
-    //   carrier running → PA_EN=1 only (no SPI, no carrier interruption)
-    //   carrier stopped → full restart: STDBY_XOSC → TX_CW → TX_EN=1 → PA_EN=1
-    gpio_put(PIN_TX_EN, 1);
+    // Leave SX1280 in STDBY_XOSC – no carrier until the first 'key 1'.
+    // STDBY_XOSC keeps the TCXO running so PLL lock on the first key press
+    // takes only ~500 µs instead of ~1.5 ms from STDBY_RC.
+    // The external PA VOX is not triggered until actual keying starts.
+    gpio_put(PIN_TX_EN, 0);
     gpio_put(PIN_RX_EN, 0);
-    gpio_put(PIN_PA_EN, 0);   // keyer drives PA_EN via 'key 1' / 'key 0'
-    g_cw_hang_pending = 0;    // cancel any stale hang timer
-    g_cw_tx_running   = 0;    // will be set to 1 after carrier confirmed below
-    sx_start_tx_continuous_wave(); tud_task();
+    gpio_put(PIN_PA_EN, 0);
+    g_cw_hang_pending = 0;
+    g_cw_tx_running   = 0;
 
-    for (int _i = 0; _i < 5; _i++) { tud_task(); sleep_ms(1); }
     uint8_t status = sx_get_status(); tud_task();
-    cdc_printf("Status after 5ms: 0x%02X (mode=%d)\r\n", status, (status >> 5) & 0x07);
-    if (((status >> 5) & 0x07) == 6) {
-        cdc_printf("OK – TX active, carrier on (TX_EN=1).\r\n");
-        g_cw_tx_running = 1;
-    } else {
-        cdc_printf("*** WARNING: TX not active! Check TCXO/XOSC. ***\r\n");
-        cdc_printf("  BUSY pin: %d\r\n", gpio_get(PIN_BUSY));
-    }
+    cdc_printf("Status: 0x%02X (mode=%d) – ready for keying.\r\n",
+               status, (status >> 5) & 0x07);
 #endif
 }
 
