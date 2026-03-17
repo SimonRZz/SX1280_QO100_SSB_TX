@@ -1768,7 +1768,7 @@ int main(void) {
         // Also check outside the inner loop for the normal (non-CW-mode) path.
         if (g_cw_test_requested) {
             g_cw_test_requested = 0;
-            sx_test_cw();
+            sx_start_cw_mode(g_cw_with_carrier);
         }
         if (g_stop_cw_requested) {
             g_stop_cw_requested = 0;
