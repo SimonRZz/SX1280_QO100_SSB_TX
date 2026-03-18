@@ -585,9 +585,22 @@ class SX1280ControlApp(ttk.Frame):
         # FIX B: shared key state written only by _cw_loop (background thread),
         # read only by _cw_gui_update (GUI thread) – eliminates serial port race.
         self._cw_key_state = (False, False)
+        self._cw_tx_active        = False  # True while firmware is in CW keyer mode
+        self._cw_test_stop_pending = False  # True when test carrier stop triggered (not keyer stop)
 
-        self.keyer.cb_key_on  = self.audio.on
-        self.keyer.cb_key_off = self.audio.off
+        # Keyer callbacks: sidetone + firmware keying (key 1 / key 0)
+        def _on_key_on():
+            self.audio.on()
+            if self._cw_tx_active:
+                try: self.worker.send_line("key 1")
+                except: pass
+        def _on_key_off():
+            self.audio.off()
+            if self._cw_tx_active:
+                try: self.worker.send_line("key 0")
+                except: pass
+        self.keyer.cb_key_on  = _on_key_on
+        self.keyer.cb_key_off = _on_key_off
         self.keyer.cb_char    = self._cw_on_char
         self.keyer.cb_word_sp = self._cw_on_word_space
 
@@ -928,6 +941,9 @@ class SX1280ControlApp(ttk.Frame):
         self.cw_sym_lbl = ttk.Label(sf, text="",
                                      font=("Consolas", 20, "bold"), foreground="#cc8800")
         self.cw_sym_lbl.pack(pady=4)
+        self.cw_tx_btn = ttk.Button(sf, text="⬛  TX OFF",
+                                    command=self._cw_toggle_tx)
+        self.cw_tx_btn.pack(fill='x', pady=(4, 0))
 
         df = ttk.LabelFrame(tab, text="Dekodierter Text", padding=8)
         df.grid(row=3, column=1, sticky="nsew", pady=(0, 8))
@@ -1201,7 +1217,27 @@ class SX1280ControlApp(ttk.Frame):
             messagebox.showerror("Invalid frequency", "Frequency must be a number in Hz")
 
     def _start_cw(self): self._send_cmd_safe("cw")
-    def _stop_cw(self):  self._send_cmd_safe("stop")
+    def _stop_cw(self):
+        self._cw_test_stop_pending = True   # suppress keyer TX-button reset in _poll_rx
+        self._send_cmd_safe("stop")
+
+    def _cw_toggle_tx(self):
+        if not self.worker.is_connected():
+            messagebox.showwarning("Nicht verbunden",
+                                   "Bitte zuerst mit dem SX1280 verbinden!")
+            return
+        self._cw_tx_active = not self._cw_tx_active
+        if self._cw_tx_active:
+            # Enter CW keyer mode (no carrier until first key press)
+            try:
+                self.worker.send_line("cwkey")
+                self.worker.send_line("hang 1000")
+            except Exception: pass
+            self.cw_tx_btn.config(text="🔴  TX ON")
+        else:
+            try: self.worker.send_line("stop")
+            except Exception: pass
+            self.cw_tx_btn.config(text="⬛  TX OFF")
 
     def _send_manual_cmd(self):
         cmd = self.manual_cmd_var.get().strip()
@@ -1258,6 +1294,15 @@ class SX1280ControlApp(ttk.Frame):
             while True:
                 line = self.rx_queue.get_nowait()
                 self._log(line, "recv")
+                # Sync GUI when firmware reports CW stopped.
+                # _cw_test_stop_pending is set by _stop_cw() (test carrier stop)
+                # so that "TX stopped" from there does NOT reset the keyer TX button.
+                if "TX stopped" in line:
+                    if self._cw_test_stop_pending:
+                        self._cw_test_stop_pending = False  # consume; keyer TX unchanged
+                    elif self._cw_tx_active:
+                        self._cw_tx_active = False
+                        self.cw_tx_btn.config(text="⬛  TX OFF")
         except queue.Empty:
             pass
         self.master.after(50, self._poll_rx)
