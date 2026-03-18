@@ -2,16 +2,21 @@
 // Original sketch: CT2GQV_GPSDO_52MHz.ino (Arduino Nano / CT2GQV)
 // Ported to RP2350 with the arduino-pico framework.
 //
-// Hardware wiring:
-//   u-blox NEO-7M GPS  → UART1  GP5 = RX (← GPS TX), GP4 = TX (→ GPS RX)
-//   SI5351 clock gen   → I2C0   GP2 = SDA, GP3 = SCL
-//   TCXOEN             → GP22   permanently HIGH (first GPIO action in setup)
-//   SX1280 NRESET      → GP15   held LOW until GPSDO declares READY
+// Hardware wiring (only free pins used; master SX1280 assignments unchanged):
+//   u-blox NEO-7M GPS  → UART1  GP4 = TX (→ GPS RX), GP5 = RX (← GPS TX)
+//   SI5351 clock gen   → I2C0   GP0 = SDA, GP1 = SCL   (Wire default pins)
+//   TCXOEN             → GP22   permanently HIGH — same as master PIN_TCXO_EN
+//   SX1280 NRESET      → GP20   held LOW until GPSDO declares READY
+//                                same as master PIN_RESET — no conflict
 //   CW key input       → GP10   (active LOW, internal pull-up; unused in Step 1)
+//
+// Master pin assignments NOT touched: GP13=PA_EN, GP14=RX_EN, GP15=TX_EN,
+//   GP16=MISO, GP17=NSS, GP18=SCK, GP19=MOSI, GP20=RESET, GP21=BUSY, GP22=TCXO_EN.
+// New GPSDO pins (all free): GP0, GP1, GP4, GP5, GP10.
 //
 // Boot sequence (Step 1 — GPSDO only, SX1280 not initialised yet):
 //   1. GP22 HIGH immediately.
-//   2. GP15 (SX1280 NRESET) LOW — SX1280 stays in reset.
+//   2. GP20 (SX1280 NRESET) LOW — SX1280 stays in reset.
 //   3. I2C0 and SI5351 initialised → 52 MHz on CLK1.
 //   4. UART1 opened at 9600 baud.
 //   5. UBX-CFG-TP5 (24 MHz continuous) and UBX-CFG-NAV5 (stationary) sent.
@@ -23,7 +28,7 @@
 //
 // Key changes from the Nano original:
 //   • SoftwareSerial   → Hardware UART1 (Serial2) with setRX/setTX
-//   • Wire.begin()     → Wire.setSDA(2) / Wire.setSCL(3) before begin()
+//   • Wire.begin()     → Wire.setSDA(0) / Wire.setSCL(1) before begin()
 //   • gpsSerial.listen() removed (UART1 is always active on RP2350)
 //   • SI5351 init failure no longer halts — clk1=fail is reported instead
 //   • gpsdoReady flag gates the SX1280 release point (future integration)
@@ -44,13 +49,24 @@
 
 // ---------------------------------------------------------------------------
 // Pin assignments — RP2350 / Pico 2W
+//
+// Pins shared with master (identical function, no conflict):
+//   GP22 = TCXO_EN  (master: PIN_TCXO_EN)
+//   GP20 = SX RESET (master: PIN_RESET)
+//
+// New GPSDO-only pins (all free in master):
+//   GP0  = I2C0 SDA → SI5351
+//   GP1  = I2C0 SCL → SI5351
+//   GP4  = UART1 TX → NEO-7M RX
+//   GP5  = UART1 RX ← NEO-7M TX
+//   GP10 = CW key (future Step 2; active LOW, internal pull-up)
 // ---------------------------------------------------------------------------
-static const uint8_t PIN_TCXOEN   = 22;  // TCXO enable — permanently HIGH
-static const uint8_t PIN_SX_RESET = 15;  // SX1280 NRESET — LOW until GPSDO ready
-static const uint8_t PIN_GPS_TX   =  4;  // UART1 TX → NEO-7M RX
-static const uint8_t PIN_GPS_RX   =  5;  // UART1 RX ← NEO-7M TX
-static const uint8_t PIN_SI_SDA   =  2;  // I2C0 SDA → SI5351
-static const uint8_t PIN_SI_SCL   =  3;  // I2C0 SCL → SI5351
+static const uint8_t PIN_TCXOEN   = 22;  // same as master PIN_TCXO_EN
+static const uint8_t PIN_SX_RESET = 20;  // same as master PIN_RESET
+static const uint8_t PIN_GPS_TX   =  4;  // UART1 TX → NEO-7M RX  (free)
+static const uint8_t PIN_GPS_RX   =  5;  // UART1 RX ← NEO-7M TX  (free)
+static const uint8_t PIN_SI_SDA   =  0;  // I2C0 SDA → SI5351      (free)
+static const uint8_t PIN_SI_SCL   =  1;  // I2C0 SCL → SI5351      (free)
 
 // ---------------------------------------------------------------------------
 // User configuration
@@ -575,7 +591,8 @@ void setup()
   digitalWrite(PIN_TCXOEN, HIGH);
 
   // ── 2. Hold SX1280 in reset (Step 1 — SX1280 not yet initialised) ────────
-  // GP15 LOW keeps the SX1280 in hardware reset until gpsdoReady is set.
+  // GP20 LOW keeps the SX1280 in hardware reset until gpsdoReady is set.
+  // GP20 is master PIN_RESET — same function, no conflict.
   // In Step 2 this line will be released: digitalWrite(PIN_SX_RESET, HIGH).
   pinMode(PIN_SX_RESET, OUTPUT);
   digitalWrite(PIN_SX_RESET, LOW);
@@ -587,8 +604,8 @@ void setup()
   Serial.println(F("CT2GQV GPSDO | RP2350 port | CLK1 always ON"));
 
   // ── 4. I2C0 with explicit pin assignment ──────────────────────────────────
-  Wire.setSDA(PIN_SI_SDA);   // GP2
-  Wire.setSCL(PIN_SI_SCL);   // GP3
+  Wire.setSDA(PIN_SI_SDA);   // GP0
+  Wire.setSCL(PIN_SI_SCL);   // GP1
   Wire.begin();
 
   // ── 5. SI5351 clock — initialised before GPS loop starts ─────────────────
