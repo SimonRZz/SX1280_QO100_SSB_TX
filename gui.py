@@ -655,6 +655,10 @@ class SX1280ControlApp(ttk.Frame):
         self.cw_tone_var        = tk.DoubleVar(value=700)
         self.cw_vol_var         = tk.DoubleVar(value=70)
         self.cw_conn_status_var = tk.StringVar(value='● GETRENNT')
+        # GPSDO state
+        self.gpsdo_lock_var  = tk.StringVar(value="--")
+        self.gpsdo_sats_var  = tk.StringVar(value="--")
+        self.gpsdo_clk1_var  = tk.StringVar(value="--")
 
     def _build_ui(self):
         self.master.title("SX1280 QO-100 SSB TX Control")
@@ -668,6 +672,7 @@ class SX1280ControlApp(ttk.Frame):
         self._build_dsp_tab()
         self._build_tx_tab()
         self._build_cw_tab()
+        self._build_gpsdo_tab()
         self._build_console_tab()
 
     def _build_connection_bar(self):
@@ -960,6 +965,37 @@ class SX1280ControlApp(ttk.Frame):
                    command=self._cw_clear_dec).grid(row=1, column=0, sticky="w", pady=3)
         ttk.Label(tab, text="ESC = Abbruch  |  Pin → Taste → GND  |  Active Low",
                   foreground="gray").grid(row=4, column=0, columnspan=2, pady=2)
+
+    def _build_gpsdo_tab(self):
+        tab = ttk.Frame(self.notebook, padding=10)
+        self.notebook.add(tab, text="GPSDO")
+        tab.columnconfigure(0, weight=1)
+
+        # Lock status indicator
+        lf = ttk.LabelFrame(tab, text="GPS Lock", padding=10)
+        lf.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        lf.columnconfigure(1, weight=1)
+        self.gpsdo_lock_label = ttk.Label(
+            lf, textvariable=self.gpsdo_lock_var,
+            font=("TkDefaultFont", 14, "bold"), anchor="center")
+        self.gpsdo_lock_label.grid(row=0, column=0, columnspan=2, sticky="ew", pady=4)
+
+        # Status fields
+        sf = ttk.LabelFrame(tab, text="Status", padding=10)
+        sf.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        sf.columnconfigure(1, weight=1)
+
+        ttk.Label(sf, text="Satellites used:").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ttk.Label(sf, textvariable=self.gpsdo_sats_var, anchor="w").grid(row=0, column=1, sticky="w")
+
+        ttk.Label(sf, text="CLK1 (52 MHz):").grid(row=1, column=0, sticky="w", padx=(0, 8))
+        ttk.Label(sf, textvariable=self.gpsdo_clk1_var, anchor="w").grid(row=1, column=1, sticky="w")
+
+        # Manual poll button
+        bf = ttk.Frame(tab)
+        bf.grid(row=2, column=0, sticky="w", pady=(4, 0))
+        ttk.Button(bf, text="Poll GPSDO",
+                   command=lambda: self._send_cmd_safe("gpsdo")).pack(side="left")
 
     def _build_console_tab(self):
         tab = ttk.Frame(self.notebook, padding=10)
@@ -1289,6 +1325,24 @@ class SX1280ControlApp(ttk.Frame):
         self.info_text.delete("1.0", "end")
         self.info_text.config(state="disabled")
 
+    def _parse_gpsdo_line(self, line):
+        """Parse 'GPSDO: lock=X sats=N clk1=ok|fail' and update the GPSDO tab."""
+        import re
+        m = re.search(r'lock=(\d+)\s+sats=(\d+)\s+clk1=(\S+)', line)
+        if not m:
+            return
+        locked = m.group(1) == "1"
+        sats   = m.group(2)
+        clk1   = m.group(3)
+        if locked:
+            self.gpsdo_lock_var.set("LOCKED")
+            self.gpsdo_lock_label.config(foreground="#007700")
+        else:
+            self.gpsdo_lock_var.set("SEARCHING...")
+            self.gpsdo_lock_label.config(foreground="#cc4400")
+        self.gpsdo_sats_var.set(sats)
+        self.gpsdo_clk1_var.set(clk1)
+
     def _poll_rx(self):
         try:
             while True:
@@ -1303,6 +1357,8 @@ class SX1280ControlApp(ttk.Frame):
                     elif self._cw_tx_active:
                         self._cw_tx_active = False
                         self.cw_tx_btn.config(text="⬛  TX OFF")
+                if line.startswith("GPSDO:"):
+                    self._parse_gpsdo_line(line)
         except queue.Empty:
             pass
         self.master.after(50, self._poll_rx)
