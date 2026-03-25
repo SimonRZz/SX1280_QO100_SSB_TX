@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 SX1280 QO-100 SSB TX Control GUI
-Original: SP8ESA  |  CW Keyer Tab: erweitert
+Original: SP8ESA  |  CW Keyer Tab: erweitert  |  v2.0.0 Status Sync
 pip install pyserial pyaudio numpy
 """
 
@@ -577,6 +577,8 @@ class SX1280ControlApp(ttk.Frame):
         self.debounced_send = Debouncer(master, 150, self._send_cmd_safe)
         self.freq_debouncer = Debouncer(master, 200, self._send_freq)
 
+        self._status_updating = False  # guard against feedback loops during !S sync
+
         self.audio       = AudioEngine()
         self.keyer       = Keyer()
         self.key_reader  = None
@@ -620,6 +622,8 @@ class SX1280ControlApp(ttk.Frame):
     def _create_variables(self):
         self.port_var    = tk.StringVar()
         self.status_var  = tk.StringVar(value="⚫ Disconnected")
+        self.mode_var    = tk.StringVar(value="usb")
+        self.tune_var    = tk.BooleanVar(value=False)
         self.freq_mhz_var = tk.DoubleVar(value=self.config.freq_hz / 1_000_000)
         self.freq_hz_var  = tk.StringVar(value=str(self.config.freq_hz))
         self.ppm_var      = tk.DoubleVar(value=0.0)
@@ -702,6 +706,20 @@ class SX1280ControlApp(ttk.Frame):
 
         tbf = ttk.Frame(rf)
         tbf.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 10))
+        # Mode (USB/CW) radio buttons
+        ttk.Label(tbf, text="Mode:").pack(side="left", padx=(0, 4))
+        ttk.Radiobutton(tbf, text="USB (SSB)", variable=self.mode_var,
+                        value="usb", command=self._on_mode_change).pack(side="left", padx=3)
+        ttk.Radiobutton(tbf, text="CW", variable=self.mode_var,
+                        value="cw",  command=self._on_mode_change).pack(side="left", padx=3)
+        ttk.Separator(tbf, orient="vertical").pack(side="left", fill="y", padx=12, pady=2)
+        # TUNE carrier button
+        self.tune_button = tk.Button(tbf, text="TUNE OFF", width=11,
+                                      font=("TkDefaultFont", 10, "bold"),
+                                      command=self._toggle_tune, relief="raised", bd=3,
+                                      bg="#cccccc", fg="black")
+        self.tune_button.pack(side="left", padx=5)
+        ttk.Separator(tbf, orient="vertical").pack(side="left", fill="y", padx=12, pady=2)
         self.tx_button = tk.Button(tbf, text="TX OFF", width=12,
                                     font=("TkDefaultFont", 11, "bold"),
                                     command=self._toggle_tx, relief="raised", bd=3)
@@ -1102,6 +1120,82 @@ class SX1280ControlApp(ttk.Frame):
         if self._cw_running:
             self._cw_stop()
 
+    def _handle_status_push(self, line):
+        """Parse firmware !S status push and sync GUI widgets.
+
+        Format: '!S mode=0 tune=0 tx=1 pwr=13 ppm=0.0000 freq=2400400000.0'
+        Sent by firmware on state change or heartbeat.
+        """
+        try:
+            parts = line.strip().split()
+            kv = {}
+            for p in parts[1:]:
+                if "=" in p:
+                    k, v = p.split("=", 1)
+                    kv[k] = v
+
+            self._status_updating = True
+
+            if "mode" in kv:
+                new_mode = "cw" if kv["mode"] == "1" else "usb"
+                if self.mode_var.get() != new_mode:
+                    self.mode_var.set(new_mode)
+
+            if "tune" in kv:
+                new_tune = kv["tune"] == "1"
+                if self.tune_var.get() != new_tune:
+                    self.tune_var.set(new_tune)
+                    self._update_tune_button()
+
+            if "tx" in kv:
+                new_tx = kv["tx"] == "1"
+                if self.tx_enabled_var.get() != new_tx:
+                    self.tx_enabled_var.set(new_tx)
+                    self._update_tx_button()
+
+            if "pwr" in kv:
+                new_pwr = int(kv["pwr"])
+                if self.txpwr_var.get() != new_pwr:
+                    self.txpwr_var.set(new_pwr)
+
+            if "ppm" in kv:
+                new_ppm = float(kv["ppm"])
+                if abs(self.ppm_var.get() - new_ppm) > 0.0001:
+                    self.ppm_var.set(new_ppm)
+                    self.ppm_label.config(text=f"{new_ppm:.3f} ppm")
+
+            if "freq" in kv:
+                new_freq = float(kv["freq"])
+                if abs(self.config.freq_hz - new_freq) > 0.5:
+                    self.config.freq_hz = new_freq
+                    self.freq_mhz_var.set(new_freq / 1_000_000)
+                    self.freq_hz_var.set(f"{new_freq:.0f}")
+                    self._update_freq_display()
+
+            self._status_updating = False
+        except Exception as e:
+            self._status_updating = False
+            self._log(f"[STATUS PARSE ERROR] {e}: {line!r}", "error")
+
+    def _on_mode_change(self):
+        if self._status_updating:
+            return
+        self._send_cmd_safe(f"mode {self.mode_var.get()}")
+
+    def _toggle_tune(self):
+        new_state = not self.tune_var.get()
+        self.tune_var.set(new_state)
+        self._update_tune_button()
+        self._send_cmd_safe(f"tune {'1' if new_state else '0'}")
+
+    def _update_tune_button(self):
+        if self.tune_var.get():
+            self.tune_button.config(text="TUNE ON",  bg="#ff8800", fg="white",
+                                     activebackground="#ffaa00", activeforeground="white")
+        else:
+            self.tune_button.config(text="TUNE OFF", bg="#cccccc", fg="black",
+                                     activebackground="#dddddd", activeforeground="black")
+
     # ORIGINAL
     def _refresh_ports(self):
         ports = list_serial_ports()
@@ -1162,6 +1256,8 @@ class SX1280ControlApp(ttk.Frame):
                                    activebackground="#dddddd", activeforeground="black")
 
     def _on_ppm_slider(self, _val):
+        if self._status_updating:
+            return
         ppm = self.ppm_var.get()
         self.ppm_label.config(text=f"{ppm:.3f} ppm")
         self._update_freq_display()
@@ -1230,12 +1326,13 @@ class SX1280ControlApp(ttk.Frame):
         if self._cw_tx_active:
             # Enter CW keyer mode (no carrier until first key press)
             try:
-                self.worker.send_line("cwkey")
-                self.worker.send_line("hang 1000")
+                self.worker.send_line("mode cw")  # switch firmware to CW mode
             except Exception: pass
             self.cw_tx_btn.config(text="🔴  TX ON")
         else:
-            try: self.worker.send_line("stop")
+            try:
+                self.worker.send_line("stop")      # stop any active carrier
+                self.worker.send_line("mode usb")  # return to SSB mode
             except Exception: pass
             self.cw_tx_btn.config(text="⬛  TX OFF")
 
@@ -1246,6 +1343,7 @@ class SX1280ControlApp(ttk.Frame):
             self.manual_cmd_var.set("")
 
     def _send_all(self):
+        self._send_cmd_safe(f"mode {self.mode_var.get()}")
         hz = max(self.FREQ_MIN_HZ, min(self.FREQ_MAX_HZ, int(float(self.freq_hz_var.get()))))
         self._send_cmd_safe(f"freq {hz}")
         try:
@@ -1290,22 +1388,30 @@ class SX1280ControlApp(ttk.Frame):
         self.info_text.config(state="disabled")
 
     def _poll_rx(self):
+        processed = 0
+        latest_status = None
         try:
-            while True:
+            while processed < 20:
                 line = self.rx_queue.get_nowait()
-                self._log(line, "recv")
-                # Sync GUI when firmware reports CW stopped.
-                # _cw_test_stop_pending is set by _stop_cw() (test carrier stop)
-                # so that "TX stopped" from there does NOT reset the keyer TX button.
-                if "TX stopped" in line:
-                    if self._cw_test_stop_pending:
-                        self._cw_test_stop_pending = False  # consume; keyer TX unchanged
-                    elif self._cw_tx_active:
-                        self._cw_tx_active = False
-                        self.cw_tx_btn.config(text="⬛  TX OFF")
+                processed += 1
+                if line.startswith("!S "):
+                    latest_status = line  # keep only the newest status push
+                else:
+                    self._log(line, "recv")
+                    # Sync CW keyer TX button when firmware reports tune/CW stopped.
+                    # _cw_test_stop_pending suppresses this for test-carrier stops.
+                    if "OK tune=OFF" in line or "TX stopped" in line:
+                        if self._cw_test_stop_pending:
+                            self._cw_test_stop_pending = False
+                        elif self._cw_tx_active:
+                            self._cw_tx_active = False
+                            self.cw_tx_btn.config(text="⬛  TX OFF")
         except queue.Empty:
             pass
-        self.master.after(50, self._poll_rx)
+        if latest_status is not None:
+            self._handle_status_push(latest_status)
+        delay = 10 if processed >= 20 else 50
+        self.master.after(delay, self._poll_rx)
 
 
 def main():
