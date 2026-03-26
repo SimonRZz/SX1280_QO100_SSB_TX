@@ -194,12 +194,15 @@ class AudioEngine:
         except Exception as e:
             print(f"Audio init: {e}")
 
+    _CHUNK    = 256          # samples per buffer (≈5.8 ms @ 44100 Hz)
+    _RAMP_MS  = 8            # attack/release ramp length in milliseconds
+
     def _open_stream(self):
         try:
             return self.pa.open(
                 format=pyaudio.paInt16, channels=1,
                 rate=self.sample_rate, output=True,
-                frames_per_buffer=512)
+                frames_per_buffer=self._CHUNK)
         except Exception:
             # pa selbst neu initialisieren
             try: self.pa.terminate()
@@ -209,7 +212,7 @@ class AudioEngine:
                 return self.pa.open(
                     format=pyaudio.paInt16, channels=1,
                     rate=self.sample_rate, output=True,
-                    frames_per_buffer=512)
+                    frames_per_buffer=self._CHUNK)
             except Exception:
                 return None
 
@@ -224,18 +227,24 @@ class AudioEngine:
                 time.sleep(0.5)
 
     def _stream_loop(self, stream):
-        chunk = 512
-        current_vol = 0.0
-        phase = 0
+        chunk        = self._CHUNK
+        ramp_samples = max(1, int(self.sample_rate * self._RAMP_MS / 1000))
+        max_step     = chunk / ramp_samples   # max volume change per chunk
+        current_vol  = 0.0
+        phase        = 0
         try:
             while self._running:
                 with self._lock:
                     target = self.volume if self._playing else 0.0
                     freq   = self.tone_freq
-                # FIX C: coefficient 0.5 (was 0.12) – tail ≈46 ms instead of ≈200 ms
-                current_vol += (target - current_vol) * 0.5
-                t = (np.arange(chunk) + phase) / self.sample_rate
-                s = (np.sin(2 * np.pi * freq * t) * current_vol * 32767).astype(np.int16)
+                # Linear ramp: spread the volume change evenly across the chunk
+                # so there are no amplitude steps at chunk boundaries → no clicks.
+                delta   = max(min(target - current_vol, max_step), -max_step)
+                env     = np.linspace(current_vol, current_vol + delta,
+                                      chunk, endpoint=False, dtype=np.float32)
+                current_vol += delta
+                t = (np.arange(chunk, dtype=np.float32) + phase) / self.sample_rate
+                s = (np.sin(2 * np.pi * freq * t) * env * 32767).astype(np.int16)
                 phase = (phase + chunk) % self.sample_rate
                 try:
                     stream.write(s.tobytes(), exception_on_underflow=False)
@@ -320,7 +329,7 @@ class Keyer:
 
     def __init__(self):
         self.mode       = self.IAMBIC_A
-        self.wpm        = 20
+        self.wpm        = 18
         self.weight     = 3.0
         self._update_timing()
         self._state     = 'IDLE'
@@ -711,9 +720,9 @@ class SX1280ControlApp(ttk.Frame):
         self.cw_baud_var        = tk.StringVar(value='9600')
         self.cw_mode_var        = tk.StringVar(value='Iambic A')
         self.cw_dit_var         = tk.StringVar(value='CTS')
-        self.cw_dah_var         = tk.StringVar(value='DSR')
+        self.cw_dah_var         = tk.StringVar(value='CD')
         self.cw_active_low_var  = tk.BooleanVar(value=True)
-        self.cw_wpm_var         = tk.DoubleVar(value=20)
+        self.cw_wpm_var         = tk.DoubleVar(value=18)
         self.cw_tone_var        = tk.DoubleVar(value=700)
         self.cw_vol_var         = tk.DoubleVar(value=70)
         self.cw_conn_status_var = tk.StringVar(value='● GETRENNT')
