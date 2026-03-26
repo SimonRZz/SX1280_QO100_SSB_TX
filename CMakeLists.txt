@@ -42,6 +42,7 @@ set(TINYUSB_FAMILY_DIR ${TINYUSB_DIR}/hw/bsp/rp2040)
 # Add executable
 add_executable(SX1280SDR
     main.c
+    ssd1306.c
     usb_descriptors.c
 )
 
