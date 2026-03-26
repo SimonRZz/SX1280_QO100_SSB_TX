@@ -111,6 +111,7 @@ static const uint32_t SX_SPI_BAUD = 18000000;
 
 // ---------------- SX1280 opcodes ----------------
 #define OPCODE_SET_STANDBY         0x80
+#define OPCODE_SET_FS              0xC1
 #define OPCODE_SET_PACKET_TYPE     0x8A
 #define OPCODE_SET_RF_FREQUENCY    0x86
 #define OPCODE_SET_TX_PARAMS       0x8E
@@ -677,11 +678,29 @@ static void sx_start_cw_mode(uint8_t with_carrier) {
     g_cw_tx_running   = 0;
 
     if (with_carrier) {
-        // Start continuous carrier: useful for frequency/power verification on a
-        // spectrum analyser (TX_EN=1, PA_EN=0 → SX1280 output only, no driver PA).
-        // The keyer uses g_cw_tx_running to decide how to handle 'key 1':
-        //   carrier running → PA_EN=1 only (no SPI, no carrier interruption)
-        //   carrier stopped → full restart: STDBY_XOSC → TX_CW → TX_EN=1 → PA_EN=1
+        // Step 1: explicit STDBY_XOSC so the XOSC is running before FS/TX.
+        sx_set_standby_xosc(); tud_task();
+        for (int _i = 0; _i < 5; _i++) { tud_task(); sleep_ms(1); }
+
+        // Step 2: SetFs – lock the RF PLL before SetTxCW.
+        // If this reaches mode=4 (FS) the PLL is working; if it stays at mode=3
+        // the 52 MHz reference is missing or too noisy for the PLL to lock.
+        sx_write_cmd(OPCODE_SET_FS, NULL, 0); tud_task();
+        for (int _i = 0; _i < 5; _i++) { tud_task(); sleep_ms(1); }
+        {
+            uint8_t st_fs = sx_get_status(); tud_task();
+            uint8_t m_fs  = (st_fs >> 5) & 0x07;
+            cdc_printf("FS mode: %d [0x%02X] %s\r\n", m_fs, st_fs,
+                       (m_fs == 4) ? "PLL locked OK"
+                                   : "*** PLL lock FAILED – 52MHz missing/unstable ***");
+            if (m_fs != 4) {
+                cdc_printf("  → SI5351 not outputting 52MHz on XTA.\r\n"
+                           "  → Check GPS TP→SI5351 XA wire; add 100-470Ω series resistor.\r\n");
+                return;  // no point trying SetTxCW without a working PLL
+            }
+        }
+
+        // Step 3: SetTxCW from FS mode (PLL already locked).
         sx_start_tx_continuous_wave(); tud_task();
         gpio_put(PIN_TX_EN, 1);
 
@@ -692,7 +711,7 @@ static void sx_start_cw_mode(uint8_t with_carrier) {
             cdc_printf("OK – TX active, carrier on (TX_EN=1, PA_EN=0).\r\n");
             g_cw_tx_running = 1;
         } else {
-            cdc_printf("*** WARNING: TX not active! Check TCXO/XOSC. ***\r\n");
+            cdc_printf("*** WARNING: TX not active! (PLL was OK, SetTxCW failed)\r\n");
             cdc_printf("  BUSY pin: %d\r\n", gpio_get(PIN_BUSY));
         }
     } else {
