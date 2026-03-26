@@ -721,7 +721,7 @@ class SX1280ControlApp(ttk.Frame):
         self.cw_mode_var        = tk.StringVar(value='Iambic A')
         self.cw_dit_var         = tk.StringVar(value='CTS')
         self.cw_dah_var         = tk.StringVar(value='CD')
-        self.cw_active_low_var  = tk.BooleanVar(value=True)
+        self.cw_active_low_var  = tk.BooleanVar(value=False)
         self.cw_wpm_var         = tk.DoubleVar(value=18)
         self.cw_tone_var        = tk.DoubleVar(value=700)
         self.cw_vol_var         = tk.DoubleVar(value=70)
@@ -993,7 +993,7 @@ class SX1280ControlApp(ttk.Frame):
             r = ttk.Frame(cpf)
             r.pack(fill='x', pady=2)
             ttk.Label(r, text=label, width=16, anchor='w').pack(side='left')
-            lbl = ttk.Label(r, text=fmt(from_), width=10, anchor='e')
+            lbl = ttk.Label(r, text=fmt(var.get()), width=10, anchor='e')
             lbl.pack(side='right')
             def _cb(v):
                 lbl.config(text=fmt(float(v)))
