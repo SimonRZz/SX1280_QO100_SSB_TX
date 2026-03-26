@@ -1346,7 +1346,7 @@ class SX1280ControlApp(ttk.Frame):
         import re
         m = re.search(
             r'lock=(\d+)\s+sats=(\d+)\s+clk1=(\S+)'
-            r'(?:\s+i2c=(0x[0-9a-fA-F]+))?'
+            r'(?:\s+i2c=(\S+))?'
             r'(?:\s+baud=(\d+))?'
             r'(?:\s+uart_rx=(\d+))?'
             r'(?:\s+nmea=(\d+))?',

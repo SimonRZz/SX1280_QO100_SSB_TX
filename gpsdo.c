@@ -56,7 +56,9 @@
 // ---------------------------------------------------------------------------
 // SI5351 I2C address — auto-detected in gpsdo_init().
 // Common values: 0x60 (SDO/AD0=GND), 0x61 (SDO/AD0=VCC).
-static uint8_t s_si_addr = 0x60u;
+// Some boards use 0x62 or 0x63; all four are tried.
+// 0x00 means "not found yet".
+static uint8_t s_si_addr = 0x00u;
 
 #define SI_REG_OEB         3u    // Output Enable (active LOW per bit)
 #define SI_REG_CLK0_CTRL   16u
@@ -67,18 +69,24 @@ static uint8_t s_si_addr = 0x60u;
 #define SI_REG_PLL_RESET   177u
 #define SI_REG_XTAL_LOAD   183u
 
-// Scan 0x60 and 0x61; returns true and sets s_si_addr if found.
+// Scan 0x60–0x63 (all valid SI5351 I2C addresses).
+// Retries up to 3 times with a short delay between attempts.
+// Sets s_si_addr on success; leaves it 0x00 on failure.
 static bool si5351_scan(void)
 {
-    static const uint8_t candidates[] = { 0x60u, 0x61u };
-    for (size_t i = 0; i < sizeof(candidates); i++) {
-        uint8_t dummy;
-        int ret = i2c_read_blocking(GPSDO_I2C, candidates[i], &dummy, 1, false);
-        if (ret == 1) {
-            s_si_addr = candidates[i];
-            return true;
+    static const uint8_t candidates[] = { 0x60u, 0x61u, 0x62u, 0x63u };
+    for (int attempt = 0; attempt < 3; attempt++) {
+        for (size_t i = 0; i < sizeof(candidates); i++) {
+            uint8_t dummy;
+            int ret = i2c_read_blocking(GPSDO_I2C, candidates[i], &dummy, 1, false);
+            if (ret == 1) {
+                s_si_addr = candidates[i];
+                return true;
+            }
         }
+        sleep_ms(20);  // brief pause before retry
     }
+    s_si_addr = 0x00u;  // explicit "not found"
     return false;
 }
 
@@ -112,13 +120,9 @@ static bool si5351_init_52mhz(void)
     si_write_reg(SI_REG_CLK2_CTRL, 0x80u);
 
     // CLK1: PDN=0, INT=1 (integer mode), MS_SRC=PLLA, INV=0,
-    //        CLK_SRC=MS1(self)=0b11, IDRV=8mA=0b11
-    // 8 mA drive is needed: at 2 mA the output only reaches ~1-2 Vpp into typical PCB
-    // parasitic capacitance at 52 MHz (triangle wave), which is insufficient for the
-    // SX1280 RF PLL.  8 mA gives a full 3.3 V CMOS swing, matching what the original
-    // TCXO was providing.
-    //   Byte: 0b 0 1 0 0 11 11 = 0x4F
-    si_write_reg(SI_REG_CLK1_CTRL, 0x4Fu);
+    //        CLK_SRC=MS1(self)=0b11, IDRV=4mA=0b01
+    //   Byte: 0b 0 1 0 0 11 01 = 0x4D
+    si_write_reg(SI_REG_CLK1_CTRL, 0x4Du);
 
     // Crystal load capacitance: 8 pF (bits[7:6]=0b10) + reserved 0x12.
     si_write_reg(SI_REG_XTAL_LOAD, 0x92u);
@@ -478,11 +482,17 @@ int gpsdo_format_status(char *buf, size_t size)
                              ((now - s_lastGgaMs) <= GPSDO_GGA_STALE_MS);
     const int     sats     = ggaFresh ? s_satsUsed : 0;
     (void)get_visible_sats(); // keep function referenced
+    char i2c_str[12];
+    if (s_si_addr != 0x00u) {
+        snprintf(i2c_str, sizeof(i2c_str), "0x%02X", (unsigned)s_si_addr);
+    } else {
+        snprintf(i2c_str, sizeof(i2c_str), "not_found");
+    }
     return snprintf(buf, size,
-                    "GPSDO: lock=%d sats=%d clk1=%s i2c=0x%02X baud=%lu uart_rx=%lu nmea=%lu\r\n",
+                    "GPSDO: lock=%d sats=%d clk1=%s i2c=%s baud=%lu uart_rx=%lu nmea=%lu\r\n",
                     locked ? 1 : 0, sats,
                     s_clk1Ok ? "ok" : "fail",
-                    (unsigned)s_si_addr,
+                    i2c_str,
                     (unsigned long)s_detected_baud,
                     (unsigned long)s_uartBytesRx,
                     (unsigned long)s_nmeaCount);
