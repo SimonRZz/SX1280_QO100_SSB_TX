@@ -431,6 +431,12 @@ class Keyer:
                     if not dit: self._pend_dit = False
                     if not dah: self._pend_dah = False
                 self._state = 'IEL'; self._t0 = now
+            elif self.mode == self.IAMBIC_B and dah:
+                # Iambic B squeeze latch: set pending flag as long as opposite
+                # paddle is held during the element – not just on rising edge.
+                # Ensures the next dah isn't missed if the paddle is released
+                # just before IEL runs its level check.
+                self._pend_dah = True
             return True
 
         elif self._state == 'DAH':
@@ -442,6 +448,9 @@ class Keyer:
                     if not dit: self._pend_dit = False
                     if not dah: self._pend_dah = False
                 self._state = 'IEL'; self._t0 = now
+            elif self.mode == self.IAMBIC_B and dit:
+                # Iambic B squeeze latch (symmetric for dit side)
+                self._pend_dit = True
             return True
 
         elif self._state == 'IEL':
