@@ -112,9 +112,13 @@ static bool si5351_init_52mhz(void)
     si_write_reg(SI_REG_CLK2_CTRL, 0x80u);
 
     // CLK1: PDN=0, INT=1 (integer mode), MS_SRC=PLLA, INV=0,
-    //        CLK_SRC=MS1(self)=0b11, IDRV=2mA=0b00
-    //   Byte: 0b 0 1 0 0 11 00 = 0x4C
-    si_write_reg(SI_REG_CLK1_CTRL, 0x4Cu);
+    //        CLK_SRC=MS1(self)=0b11, IDRV=8mA=0b11
+    // 8 mA drive is needed: at 2 mA the output only reaches ~1-2 Vpp into typical PCB
+    // parasitic capacitance at 52 MHz (triangle wave), which is insufficient for the
+    // SX1280 RF PLL.  8 mA gives a full 3.3 V CMOS swing, matching what the original
+    // TCXO was providing.
+    //   Byte: 0b 0 1 0 0 11 11 = 0x4F
+    si_write_reg(SI_REG_CLK1_CTRL, 0x4Fu);
 
     // Crystal load capacitance: 8 pF (bits[7:6]=0b10) + reserved 0x12.
     si_write_reg(SI_REG_XTAL_LOAD, 0x92u);
