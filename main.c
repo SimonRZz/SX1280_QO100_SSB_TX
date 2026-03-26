@@ -87,7 +87,8 @@
 // required.  GPIO22 (PIN_TCXO_EN) is always initialised regardless of this.
 //   1 = boot with TCXO on  (LoRa1280F27-TCXO module, STDBY_XOSC)
 //   0 = boot with TCXO off (external 52 MHz clock on XTA, STDBY_RC)
-#define USE_TCXO_MODULE     1
+// SX1280 V1.0 (no PA): TCXO removed, SI5351 52 MHz on XTA → use 0
+#define USE_TCXO_MODULE     0
 // ====================================================
 
 // ---------------- Pin mapping ----------------
@@ -135,8 +136,6 @@ static volatile uint8_t g_cw_test_mode      = 0;  // 1 = CW test active (blocks 
 static volatile uint8_t g_cw_test_requested = 0;  // set by CDC handler, consumed by main loop
 static volatile uint8_t g_cw_with_carrier   = 0;  // 1 = start carrier immediately (cw), 0 = keyer-only (cwkey)
 static volatile uint8_t g_stop_cw_requested = 0;  // set by CDC handler, consumed by main loop
-// TCXO always enabled – hardcoded to USE_TCXO_MODULE (must be 1).
-// GPIO22 is driven HIGH unconditionally at startup.
 static volatile uint8_t  g_tcxo_enabled     = USE_TCXO_MODULE;
 
 static volatile uint32_t g_cw_hang_ms       = 1000; // Hang time: carrier stays on this long after key-up
@@ -493,9 +492,13 @@ static inline void sx_set_standby_xosc(void) {
     sx_write_cmd(OPCODE_SET_STANDBY, &cfg, 1);
 }
 
-// TCXO always enabled – always use STDBY_XOSC
+// TCXO module: stay in STDBY_XOSC (XOSC always running, faster TX).
+// External clock on XTA (no TCXO): use STDBY_RC so SetTxCW runs the full
+// XOSC→PLL startup sequence internally, which is more reliable on modules
+// that have the SI5351 driving XTA directly (e.g. SX1280 V1.0 no-PA).
 static inline void sx_set_standby_auto(void) {
-    sx_set_standby_xosc();
+    if (g_tcxo_enabled) sx_set_standby_xosc();
+    else                sx_set_standby_rc();
 }
 
 static inline void sx_set_packet_type_gfsk(void) {
@@ -627,23 +630,31 @@ static void sx_start_cw_mode(uint8_t with_carrier) {
     // while keeping TinyUSB alive so host writes never time out.
     for (int _i = 0; _i < 60; _i++) { tud_task(); sleep_ms(1); }
 
-    // TCXO is always on (GPIO22 HIGH since boot); re-assert for safety.
-    gpio_put(PIN_TCXO_EN, 1);
-    for (int _i = 0; _i < 5; _i++) { tud_task(); sleep_ms(1); } // stabilise ≥3ms
-    cdc_printf("TCXO on (GPIO%lu=1)\r\n", (unsigned long)PIN_TCXO_EN);
+    if (g_tcxo_enabled) {
+        // TCXO module: re-assert enable for safety, then wait for stabilisation.
+        gpio_put(PIN_TCXO_EN, 1);
+        for (int _i = 0; _i < 5; _i++) { tud_task(); sleep_ms(1); }
+        cdc_printf("TCXO on (GPIO%lu=1)\r\n", (unsigned long)PIN_TCXO_EN);
+    } else {
+        cdc_printf("No TCXO (GPIO%lu=0), using SI5351 52MHz on XTA\r\n",
+                   (unsigned long)PIN_TCXO_EN);
+    }
 
-    // Set standby mode – TCXO always enabled so always STDBY_XOSC
+    // Set standby mode: STDBY_XOSC for TCXO module, STDBY_RC for external clock.
+    // With external clock (SI5351), SetTxCW runs the full XOSC→PLL startup internally.
     sx_set_standby_auto(); tud_task();
     {
         uint8_t st = sx_get_status();
         uint8_t mode = (st >> 5) & 0x07;
-        cdc_printf("Mode: STDBY_XOSC → chip mode=%d [0x%02X] %s\r\n",
-                   mode, st,
-                   (mode == 3) ? "OK" : "*** MISMATCH - XOSC failed? ***");
-        if (mode != 3) {
-            cdc_printf("  TCXO/XOSC not running! TX will fail.\r\n"
-                       "  Check: TCXOEN pin2→GPIO%lu, TCXO supply, 52MHz on XTA.\r\n",
-                       (unsigned long)PIN_TCXO_EN);
+        uint8_t expected = g_tcxo_enabled ? 3 : 2;  // 3=STDBY_XOSC, 2=STDBY_RC
+        const char *mode_name = g_tcxo_enabled ? "STDBY_XOSC" : "STDBY_RC";
+        cdc_printf("Mode: %s → chip mode=%d [0x%02X] %s\r\n",
+                   mode_name, mode, st,
+                   (mode == expected) ? "OK" : "*** MISMATCH ***");
+        if (mode != expected) {
+            cdc_printf("  Standby mode mismatch! TX may fail.\r\n"
+                       "  Check: 52MHz on XTA (GPIO%lu=%d).\r\n",
+                       (unsigned long)PIN_TCXO_EN, gpio_get(PIN_TCXO_EN));
         }
     }
 
@@ -1178,9 +1189,9 @@ static void cdc_handle_line(char *line) {
                 gpio_put(PIN_PA_EN, 1);
             } else {
                 // Slow path: chip is in STDBY_RC (key 0 / hang timer fired).
-                // sx_set_standby_auto() wakes XOSC (~1 ms), then PLL locks (~500 µs).
-                // Total ~1.5 ms to TX_EN=1 – fine at any normal CW speed.
-                sx_set_standby_auto();           // STDBY_RC → STDBY_XOSC
+                // sx_set_standby_auto(): TCXO=STDBY_XOSC, ext.clk=STDBY_RC.
+                // SetTxCW then activates XOSC+PLL internally (~1.5 ms total).
+                sx_set_standby_auto();           // back to preferred standby
                 sx_start_tx_continuous_wave();   // PLL lock; BUSY low when stable
                 gpio_put(PIN_TX_EN, 1);
                 gpio_put(PIN_PA_EN, 1);
@@ -1629,12 +1640,17 @@ int main(void) {
     board_init_after_tusb();
 
     // ---- SX1280 GPIO/SPI init ----
-    // GPIO22 = TCXO_EN on LoRa1280F27-TCXO.  Always HIGH: TCXO is permanently enabled.
+    // GPIO22 = TCXO_EN on LoRa1280F27-TCXO.  Drive HIGH only when USE_TCXO_MODULE=1.
+    // With SX1280 V1.0 (no PA, TCXO removed, SI5351 on XTA): drive LOW – no TCXO to enable.
     gpio_init(PIN_TCXO_EN);
     gpio_set_dir(PIN_TCXO_EN, GPIO_OUT);
-    gpio_put(PIN_TCXO_EN, 1);
-    sleep_ms(5);  // TCXO needs ≥3 ms to stabilise
-    printf("[SX1280] TCXO on  (GPIO%d=1)\n", (int)PIN_TCXO_EN);
+    gpio_put(PIN_TCXO_EN, g_tcxo_enabled ? 1 : 0);
+    if (g_tcxo_enabled) {
+        sleep_ms(5);  // TCXO needs ≥3 ms to stabilise
+        printf("[SX1280] TCXO on  (GPIO%d=1)\n", (int)PIN_TCXO_EN);
+    } else {
+        printf("[SX1280] No TCXO (GPIO%d=0), SI5351 52MHz on XTA\n", (int)PIN_TCXO_EN);
+    }
 
     gpio_init(PIN_NSS);   gpio_set_dir(PIN_NSS, GPIO_OUT);   gpio_put(PIN_NSS, 1);
     gpio_init(PIN_RX_EN); gpio_set_dir(PIN_RX_EN, GPIO_OUT); gpio_put(PIN_RX_EN, 0);
