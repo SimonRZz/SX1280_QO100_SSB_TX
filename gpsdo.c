@@ -27,7 +27,7 @@
 #define GPSDO_I2C           i2c0
 #define GPSDO_I2C_SDA       0u
 #define GPSDO_I2C_SCL       1u
-#define GPSDO_I2C_BAUD      400000u   // 400 kHz fast-mode
+#define GPSDO_I2C_BAUD      100000u   // 100 kHz — reliable with internal pull-ups
 
 #define GPSDO_UART          uart1
 #define GPSDO_UART_TX       4u        // GP4 → NEO-7M RX
@@ -52,7 +52,9 @@
 //   PLL A: p1=4202 (0x106A), p2=4, p3=6
 //   MS1:   p1=1664 (0x0680), p2=0, p3=1
 // ---------------------------------------------------------------------------
-#define SI_ADDR            0x60u
+// SI5351 I2C address — auto-detected in gpsdo_init().
+// Common values: 0x60 (SDO/AD0=GND), 0x61 (SDO/AD0=VCC).
+static uint8_t s_si_addr = 0x60u;
 
 #define SI_REG_OEB         3u    // Output Enable (active LOW per bit)
 #define SI_REG_CLK0_CTRL   16u
@@ -63,10 +65,25 @@
 #define SI_REG_PLL_RESET   177u
 #define SI_REG_XTAL_LOAD   183u
 
+// Scan 0x60 and 0x61; returns true and sets s_si_addr if found.
+static bool si5351_scan(void)
+{
+    static const uint8_t candidates[] = { 0x60u, 0x61u };
+    for (size_t i = 0; i < sizeof(candidates); i++) {
+        uint8_t dummy;
+        int ret = i2c_read_blocking(GPSDO_I2C, candidates[i], &dummy, 1, false);
+        if (ret == 1) {
+            s_si_addr = candidates[i];
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool si_write_reg(uint8_t reg, uint8_t val)
 {
     uint8_t buf[2] = { reg, val };
-    return i2c_write_blocking(GPSDO_I2C, SI_ADDR, buf, 2, false) == 2;
+    return i2c_write_blocking(GPSDO_I2C, s_si_addr, buf, 2, false) == 2;
 }
 
 static bool si_write_regs(uint8_t base, const uint8_t *data, size_t len)
@@ -76,12 +93,15 @@ static bool si_write_regs(uint8_t base, const uint8_t *data, size_t len)
     if (len == 0u || len > 8u) return false;
     buf[0] = base;
     memcpy(buf + 1, data, len);
-    return i2c_write_blocking(GPSDO_I2C, SI_ADDR, buf, len + 1u, false)
+    return i2c_write_blocking(GPSDO_I2C, s_si_addr, buf, len + 1u, false)
            == (int)(len + 1u);
 }
 
 static bool si5351_init_52mhz(void)
 {
+    // Scan for SI5351 at 0x60 or 0x61 before writing any registers.
+    if (!si5351_scan()) return false;
+
     // Disable all outputs while configuring.
     if (!si_write_reg(SI_REG_OEB, 0xFFu)) return false;
 
@@ -147,6 +167,8 @@ static uint32_t s_lastNmeaMs      = 0;
 static uint32_t s_lastTimeMs      = 0;
 static uint32_t s_lastGgaMs       = 0;
 static uint32_t s_lastPrintMs     = 0;
+static uint32_t s_uartBytesRx     = 0;   // raw bytes received from GPS UART
+static uint32_t s_nmeaCount       = 0;   // valid NMEA sentences parsed
 
 // GSV buckets: GP=0, GL=1, GA=2, GB/BD=3, GQ=4, GI=5, GN=6
 #define GSV_BUCKETS 7u
@@ -284,6 +306,7 @@ static void process_nmea_sentence(const char *s)
         s[3] == '\0' || s[4] == '\0' || s[5] == '\0') return;
     if (!nmea_checksum_ok(s)) return;
     s_lastNmeaMs = gpsdo_ms();
+    s_nmeaCount++;
     char c4 = s[3], c5 = s[4], c6 = s[5];
     if (c4 == 'G' && c5 == 'G' && c6 == 'A') { parse_gga(s); return; }
     if (c4 == 'R' && c5 == 'M' && c6 == 'C') { parse_rmc(s); return; }
@@ -294,6 +317,7 @@ static void process_incoming_gps(void)
 {
     while (uart_is_readable(GPSDO_UART)) {
         char c = (char)uart_getc(GPSDO_UART);
+        s_uartBytesRx++;
         if (c == '$') {
             s_collecting   = true;
             s_nmeaOverflow = false;
@@ -406,6 +430,11 @@ bool gpsdo_is_ready(void)
     return s_gpsdoReady;
 }
 
+bool gpsdo_si5351_ok(void)
+{
+    return s_clk1Ok;
+}
+
 int gpsdo_format_status(char *buf, size_t size)
 {
     const bool    locked   = s_clk1Ok && (s_fixQuality > 0) && (s_satsUsed >= 1);
@@ -414,8 +443,13 @@ int gpsdo_format_status(char *buf, size_t size)
                              ((now - s_lastGgaMs) <= GPSDO_GGA_STALE_MS);
     const int     sats     = ggaFresh ? s_satsUsed : 0;
     (void)get_visible_sats(); // keep function referenced
-    return snprintf(buf, size, "GPSDO: lock=%d sats=%d clk1=%s\r\n",
-                    locked ? 1 : 0, sats, s_clk1Ok ? "ok" : "fail");
+    return snprintf(buf, size,
+                    "GPSDO: lock=%d sats=%d clk1=%s i2c=0x%02X uart_rx=%lu nmea=%lu\r\n",
+                    locked ? 1 : 0, sats,
+                    s_clk1Ok ? "ok" : "fail",
+                    (unsigned)s_si_addr,
+                    (unsigned long)s_uartBytesRx,
+                    (unsigned long)s_nmeaCount);
 }
 
 bool gpsdo_status_due(void)

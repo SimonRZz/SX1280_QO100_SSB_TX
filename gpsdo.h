@@ -26,7 +26,12 @@ void gpsdo_task(void);
 
 // Returns true once the SI5351 CLK1 is running AND at least one GPS
 // satellite has been acquired (fixQuality > 0, satsUsed >= 1).
+// Only when this returns true will main.c release the SX1280 reset.
 bool gpsdo_is_ready(void);
+
+// Returns true if the SI5351 was found and CLK1 is running.
+// False means SI5351 is not connected or not responding.
+bool gpsdo_si5351_ok(void);
 
 // Fill buf with the machine-parseable status line:
 //   "GPSDO: lock=<0|1> sats=<N> clk1=<ok|fail>\r\n"

@@ -1650,29 +1650,36 @@ int main(void) {
     gpio_set_function(PIN_SCK,  GPIO_FUNC_SPI);
 
     // ---- GPSDO init: SI5351 52 MHz + NEO-7M GPS lock ----
-    // SX1280 stays in reset (PIN_RESET=0) until GPSDO declares ready.
+    // SX1280 NRESET stays LOW until BOTH SI5351 CLK1 and GPS lock are ready.
+    // If SI5351 is not connected the SX1280 will NEVER be released.
     gpsdo_init();
     {
-        uint32_t last_status_ms = 0u;
+        uint32_t last_status_ms  = 0u;
+        uint8_t  si_warn_printed = 0u;  // warn once about missing SI5351
         while (!gpsdo_is_ready()) {
             gpsdo_task();
             tud_task();  // keep USB alive during GPS lock wait
             uint32_t now_ms = to_ms_since_boot(get_absolute_time());
-            if (tud_cdc_connected() &&
-                (now_ms - last_status_ms) >= 2000u) {
-                last_status_ms = now_ms;
-                char gbuf[80];
-                gpsdo_format_status(gbuf, sizeof(gbuf));
-                tud_cdc_write(gbuf, strlen(gbuf));
-                tud_cdc_write_flush();
+            if (tud_cdc_connected()) {
+                // One-time warning if SI5351 not found.
+                if (!si_warn_printed && !gpsdo_si5351_ok()) {
+                    si_warn_printed = 1u;
+                    cdc_write_str("GPSDO: WARNING — SI5351 not found (GP0/GP1).\r\n"
+                                  "GPSDO: SX1280 will NOT start until SI5351 is connected.\r\n"
+                                  "GPSDO: GPS NMEA parsing active — satellites visible below.\r\n");
+                }
+                if ((now_ms - last_status_ms) >= 2000u) {
+                    last_status_ms = now_ms;
+                    char gbuf[120];
+                    gpsdo_format_status(gbuf, sizeof(gbuf));
+                    tud_cdc_write(gbuf, strlen(gbuf));
+                    tud_cdc_write_flush();
+                }
             }
         }
-        // Print final READY status.
+        // GPSDO ready: both SI5351 CLK1 and GPS lock confirmed.
         if (tud_cdc_connected()) {
-            char gbuf[80];
-            gpsdo_format_status(gbuf, sizeof(gbuf));
-            tud_cdc_write(gbuf, strlen(gbuf));
-            tud_cdc_write_flush();
+            cdc_write_str("GPSDO: READY — SI5351 locked, GPS fix acquired. Starting SX1280.\r\n");
         }
     }
 

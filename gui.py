@@ -991,6 +991,18 @@ class SX1280ControlApp(ttk.Frame):
         ttk.Label(sf, text="CLK1 (52 MHz):").grid(row=1, column=0, sticky="w", padx=(0, 8))
         ttk.Label(sf, textvariable=self.gpsdo_clk1_var, anchor="w").grid(row=1, column=1, sticky="w")
 
+        ttk.Label(sf, text="SI5351 I2C addr:").grid(row=2, column=0, sticky="w", padx=(0, 8))
+        self.gpsdo_i2c_var = tk.StringVar(value="--")
+        ttk.Label(sf, textvariable=self.gpsdo_i2c_var, anchor="w").grid(row=2, column=1, sticky="w")
+
+        ttk.Label(sf, text="GPS UART bytes rx:").grid(row=3, column=0, sticky="w", padx=(0, 8))
+        self.gpsdo_uart_var = tk.StringVar(value="--")
+        ttk.Label(sf, textvariable=self.gpsdo_uart_var, anchor="w").grid(row=3, column=1, sticky="w")
+
+        ttk.Label(sf, text="NMEA sentences:").grid(row=4, column=0, sticky="w", padx=(0, 8))
+        self.gpsdo_nmea_var = tk.StringVar(value="--")
+        ttk.Label(sf, textvariable=self.gpsdo_nmea_var, anchor="w").grid(row=4, column=1, sticky="w")
+
         # Manual poll button
         bf = ttk.Frame(tab)
         bf.grid(row=2, column=0, sticky="w", pady=(4, 0))
@@ -1326,22 +1338,38 @@ class SX1280ControlApp(ttk.Frame):
         self.info_text.config(state="disabled")
 
     def _parse_gpsdo_line(self, line):
-        """Parse 'GPSDO: lock=X sats=N clk1=ok|fail' and update the GPSDO tab."""
+        """Parse GPSDO status line and update the GPSDO tab."""
         import re
-        m = re.search(r'lock=(\d+)\s+sats=(\d+)\s+clk1=(\S+)', line)
+        m = re.search(
+            r'lock=(\d+)\s+sats=(\d+)\s+clk1=(\S+)'
+            r'(?:\s+i2c=(0x[0-9a-fA-F]+))?'
+            r'(?:\s+uart_rx=(\d+))?'
+            r'(?:\s+nmea=(\d+))?',
+            line)
         if not m:
             return
         locked = m.group(1) == "1"
         sats   = m.group(2)
         clk1   = m.group(3)
+        i2c    = m.group(4) or "--"
+        uart   = m.group(5) or "--"
+        nmea   = m.group(6) or "--"
+
         if locked:
             self.gpsdo_lock_var.set("LOCKED")
             self.gpsdo_lock_label.config(foreground="#007700")
+        elif clk1 == "fail":
+            self.gpsdo_lock_var.set("SI5351 not found")
+            self.gpsdo_lock_label.config(foreground="#cc0000")
         else:
             self.gpsdo_lock_var.set("SEARCHING...")
             self.gpsdo_lock_label.config(foreground="#cc4400")
+
         self.gpsdo_sats_var.set(sats)
         self.gpsdo_clk1_var.set(clk1)
+        self.gpsdo_i2c_var.set(i2c)
+        self.gpsdo_uart_var.set(uart)
+        self.gpsdo_nmea_var.set(nmea)
 
     def _poll_rx(self):
         try:
