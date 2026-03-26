@@ -72,6 +72,10 @@ MORSE_TABLE = {
     '.-..-.':'"', '.--.-.':'@',
 }
 
+# Inverse table: char → morse code string (for text-to-CW sending)
+MORSE_CODE = {v: k for k, v in MORSE_TABLE.items()}
+MORSE_CODE[' '] = ' '  # word space
+
 READABLE_PINS = ['CTS', 'DSR', 'RI', 'CD']
 
 
@@ -79,7 +83,7 @@ READABLE_PINS = ['CTS', 'DSR', 'RI', 'CD']
 class TxConfig:
     freq_hz: float = 2_400_400_000.0
     ppm: float = 0.0
-    tx_power_dbm: int = 13
+    tx_power_dbm: int = 4
     tx_enabled: bool = True
     enable_bp: bool = True
     enable_eq: bool = True
@@ -317,6 +321,7 @@ class Keyer:
     def __init__(self):
         self.mode       = self.IAMBIC_A
         self.wpm        = 20
+        self.weight     = 3.0
         self._update_timing()
         self._state     = 'IDLE'
         self._t0        = 0.0
@@ -335,13 +340,17 @@ class Keyer:
 
     def _update_timing(self):
         self.dit_ms = 1200.0 / self.wpm
-        self.dah_ms = self.dit_ms * 3.0
+        self.dah_ms = self.dit_ms * self.weight
         self.iel_ms = self.dit_ms
         self.ich_ms = self.dit_ms * 3.0
         self.iwd_ms = self.dit_ms * 7.0
 
     def set_wpm(self, w):
         self.wpm = max(5, min(60, int(w)))
+        self._update_timing()
+
+    def set_weight(self, w):
+        self.weight = max(2.0, min(5.0, float(w)))
         self._update_timing()
 
     def set_mode(self, m):
@@ -428,10 +437,17 @@ class Keyer:
 
         elif self._state == 'IEL':
             if el >= self.iel_ms:
-                # IEL still checks current key state directly for squeeze-keying auto-repeat
-                if self._pend_dah or dah:
+                have_dit = self._pend_dit or dit
+                have_dah = self._pend_dah or dah
+                if have_dit and have_dah:
+                    # Squeeze: alternate based on what was last sent
+                    if self._was_dit:
+                        self._send_dah(now); self._pend_dah = False
+                    else:
+                        self._send_dit(now); self._pend_dit = False
+                elif have_dah:
                     self._send_dah(now); self._pend_dah = False
-                elif self._pend_dit or dit:
+                elif have_dit:
                     self._send_dit(now); self._pend_dit = False
                 else:
                     self._state = 'ICH'; self._t0 = now
@@ -622,8 +638,10 @@ class SX1280ControlApp(ttk.Frame):
         self.audio       = AudioEngine()
         self.keyer       = Keyer()
         self.key_reader  = None
-        self._cw_running = False
-        self._cw_thread  = None
+        self._cw_running      = False
+        self._cw_thread       = None
+        self._cw_text_thread  = None
+        self._cw_stop_evt     = threading.Event()
         # FIX B: shared key state written only by _cw_loop (background thread),
         # read only by _cw_gui_update (GUI thread) – eliminates serial port race.
         self._cw_key_state = (False, False)
@@ -699,6 +717,8 @@ class SX1280ControlApp(ttk.Frame):
         self.cw_tone_var        = tk.DoubleVar(value=700)
         self.cw_vol_var         = tk.DoubleVar(value=70)
         self.cw_conn_status_var = tk.StringVar(value='● GETRENNT')
+        self.cw_text_var        = tk.StringVar(value='CQ CQ DE SX1280')
+        self.cw_weight_var      = tk.DoubleVar(value=3.0)
 
     def _build_ui(self):
         self.master.title("SX1280 QO-100 SSB TX Control")
@@ -972,9 +992,11 @@ class SX1280ControlApp(ttk.Frame):
             ttk.Scale(cpf, from_=from_, to=to, orient='horizontal',
                       variable=var, command=_cb).pack(fill='x')
 
-        cw_slider("Geschw. (WPM)", self.cw_wpm_var,   5,   60,
+        cw_slider("Geschw. (WPM)", self.cw_wpm_var,    5,   60,
                   lambda v: f"{int(v)} WPM", lambda v: self.keyer.set_wpm(v))
-        cw_slider("Sidetone (Hz)", self.cw_tone_var, 400, 1000,
+        cw_slider("Gewicht (Dah)", self.cw_weight_var, 2.0, 5.0,
+                  lambda v: f"{v:.2f}×", lambda v: self.keyer.set_weight(v))
+        cw_slider("Sidetone (Hz)", self.cw_tone_var,  400, 1000,
                   lambda v: f"{int(v)} Hz",  lambda v: self.audio.set_freq(v))
         cw_slider("Lautstaerke",   self.cw_vol_var,    0,  100,
                   lambda v: f"{int(v)} %",   lambda v: self.audio.set_vol(v / 100))
@@ -982,6 +1004,19 @@ class SX1280ControlApp(ttk.Frame):
         if not HAS_AUDIO:
             ttk.Label(cpf, text="pyaudio fehlt\npip install pyaudio numpy",
                       foreground="red").pack(pady=5)
+
+        # === CW Text senden ===
+        tf = ttk.LabelFrame(tab, text="Text als CW senden", padding=8)
+        tf.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        tf.columnconfigure(0, weight=1)
+        self.cw_text_entry = ttk.Entry(tf, textvariable=self.cw_text_var)
+        self.cw_text_entry.grid(row=0, column=0, sticky="ew", padx=(0, 5))
+        self.cw_text_entry.bind("<Return>", lambda _: self._start_cw_text())
+        tbf2 = ttk.Frame(tf)
+        tbf2.grid(row=0, column=1)
+        self.cw_text_btn = ttk.Button(tbf2, text="▶ Senden", command=self._start_cw_text, width=10)
+        self.cw_text_btn.pack(side="left", padx=(0, 4))
+        ttk.Button(tbf2, text="⛔ Stop", command=self._abort_cw_text, width=8).pack(side="left")
 
         sf = ttk.LabelFrame(tab, text="Status", padding=8)
         sf.grid(row=3, column=0, sticky="nsew", padx=(0, 5), pady=(0, 8))
@@ -1152,8 +1187,75 @@ class SX1280ControlApp(ttk.Frame):
         self.cw_sym_lbl.config(text='')
 
     def _cw_on_esc(self, _=None):
+        self._abort_cw_text()
         if self._cw_running:
             self._cw_stop()
+
+    def _start_cw_text(self):
+        text = self.cw_text_var.get().strip().upper()
+        if not text:
+            return
+        unsupported = sorted({c for c in text if c != ' ' and c not in MORSE_CODE})
+        if unsupported:
+            messagebox.showerror("CW Text", f"Nicht unterstuetzte Zeichen: {' '.join(unsupported)}")
+            return
+        if self._cw_text_thread and self._cw_text_thread.is_alive():
+            messagebox.showinfo("CW Text", "CW-Text wird bereits gesendet.")
+            return
+        if not self.worker.is_connected():
+            messagebox.showwarning("Nicht verbunden", "Bitte zuerst mit dem SX1280 verbinden!")
+            return
+        self._cw_stop_evt.clear()
+        wpm = max(5, min(60, int(self.cw_wpm_var.get())))
+        self._cw_text_thread = threading.Thread(
+            target=self._cw_text_worker, args=(text, wpm), daemon=True)
+        self._cw_text_thread.start()
+
+    def _abort_cw_text(self):
+        self._cw_stop_evt.set()
+        try: self._send_cmd_safe("stop")
+        except: pass
+
+    def _cw_text_worker(self, text, wpm):
+        unit_s = 1.2 / float(wpm)
+        weight = self.cw_weight_var.get()
+
+        def sleep_ok(dur):
+            end = time.monotonic() + dur
+            while time.monotonic() < end:
+                if self._cw_stop_evt.is_set():
+                    return False
+                time.sleep(min(0.02, end - time.monotonic()))
+            return True
+
+        self.master.after(0, lambda: self.cw_text_btn.config(state='disabled'))
+        try:
+            for ch in text:
+                if self._cw_stop_evt.is_set():
+                    break
+                if ch == ' ':
+                    self.master.after(0, lambda: self.cw_sym_lbl.config(text='_'))
+                    if not sleep_ok(unit_s * 7): break
+                    continue
+                code = MORSE_CODE[ch]
+                for j, sym in enumerate(code):
+                    if self._cw_stop_evt.is_set(): break
+                    self.master.after(0, lambda s=sym: self.cw_sym_lbl.config(text=s))
+                    try: self.worker.send_line("cw")
+                    except: break
+                    dur = unit_s if sym == '.' else unit_s * weight
+                    if not sleep_ok(dur): break
+                    try: self.worker.send_line("stop")
+                    except: break
+                    if j < len(code) - 1 and not sleep_ok(unit_s): break
+                if self._cw_stop_evt.is_set(): break
+                # inter-character gap (3 units total, 1 already done)
+                if not sleep_ok(unit_s * 2): break
+        finally:
+            try: self.worker.send_line("stop")
+            except: pass
+            self.master.after(0, lambda: self.cw_sym_lbl.config(text=''))
+            self.master.after(0, lambda: self.cw_text_btn.config(state='normal'))
 
     def _handle_status_push(self, line):
         """Parse firmware !S status push and sync GUI widgets.
