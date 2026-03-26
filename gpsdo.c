@@ -60,6 +60,10 @@
 // 0x00 means "not found yet".
 static uint8_t s_si_addr = 0x00u;
 
+#define SI_REG_STATUS      0u    // Device status (read-only)
+#define SI_STATUS_SYS_INIT (1u << 7) // 1 = calibrating (not ready)
+#define SI_STATUS_LOL_A    (1u << 5) // 1 = PLL A loss-of-lock
+#define SI_STATUS_LOS_XTAL (1u << 3) // 1 = no signal on XA pin
 #define SI_REG_OEB         3u    // Output Enable (active LOW per bit)
 #define SI_REG_CLK0_CTRL   16u
 #define SI_REG_CLK1_CTRL   17u
@@ -107,9 +111,15 @@ static bool si_write_regs(uint8_t base, const uint8_t *data, size_t len)
            == (int)(len + 1u);
 }
 
+static bool si_read_reg(uint8_t reg, uint8_t *val)
+{
+    if (i2c_write_blocking(GPSDO_I2C, s_si_addr, &reg, 1, true) != 1) return false;
+    return i2c_read_blocking(GPSDO_I2C, s_si_addr, val, 1, false) == 1;
+}
+
 static bool si5351_init_52mhz(void)
 {
-    // Scan for SI5351 at 0x60 or 0x61 before writing any registers.
+    // Scan for SI5351 at 0x60–0x63 before writing any registers.
     if (!si5351_scan()) return false;
 
     // Disable all outputs while configuring.
@@ -165,8 +175,24 @@ static bool si5351_init_52mhz(void)
 static int      s_fixQuality      = 0;
 static int      s_satsUsed        = 0;
 static char     s_utc[7]          = "------";
-static bool     s_clk1Ok          = false;
+static bool     s_clk1Ok          = false;   // I2C init succeeded
+static uint8_t  s_si5351_status   = 0xFFu;   // SI5351 reg 0; 0xFF = not yet read
+static uint32_t s_si5351_pollMs   = 0u;
 static bool     s_gpsdoReady      = false;
+
+// Returns the clk1= status string based on SI5351 register 0.
+// "ok"  – PLL A locked, XA signal present
+// "lol" – PLL A loss of lock (XA seen but PLL not locked)
+// "los" – loss of signal on XA (GPS 24 MHz not reaching SI5351)
+// "fail"– I2C init failed (SI5351 not found or bus error)
+static const char *si5351_clk_status(void)
+{
+    if (!s_clk1Ok)                              return "fail";
+    if (s_si5351_status == 0xFFu)               return "ok";   // not yet polled
+    if (s_si5351_status & SI_STATUS_LOS_XTAL)   return "los";
+    if (s_si5351_status & SI_STATUS_LOL_A)      return "lol";
+    return "ok";
+}
 
 static char     s_nmeaBuf[GPSDO_NMEA_BUF];
 static size_t   s_nmeaIdx         = 0;
@@ -405,7 +431,19 @@ void gpsdo_init(void)
     sleep_ms(10u); // SI5351 power-on stabilisation
 
     s_clk1Ok = si5351_init_52mhz();
-    printf("[GPSDO] SI5351 52MHz CLK1: %s\n", s_clk1Ok ? "OK" : "FAIL");
+    if (s_clk1Ok) {
+        sleep_ms(50u);  // give PLL time to lock before reading status
+        si_read_reg(SI_REG_STATUS, &s_si5351_status);
+        s_si5351_pollMs = to_ms_since_boot(get_absolute_time());
+        printf("[GPSDO] SI5351 reg0=0x%02X: clk1=%s  "
+               "(LOL_A=%d LOS_XTAL=%d SYS_INIT=%d)\n",
+               (unsigned)s_si5351_status, si5351_clk_status(),
+               !!(s_si5351_status & SI_STATUS_LOL_A),
+               !!(s_si5351_status & SI_STATUS_LOS_XTAL),
+               !!(s_si5351_status & SI_STATUS_SYS_INIT));
+    } else {
+        printf("[GPSDO] SI5351 not found or I2C error\n");
+    }
 
     // ── UART1 for NEO-7M GPS ─────────────────────────────────────────────────
     gpio_set_function(GPSDO_UART_TX, GPIO_FUNC_UART);
@@ -458,9 +496,21 @@ void gpsdo_task(void)
 {
     process_incoming_gps();
 
-    if (!s_gpsdoReady && s_clk1Ok && s_fixQuality > 0 && s_satsUsed >= 1) {
+    // Re-read SI5351 status register every 5 s to track PLL lock in real time.
+    if (s_clk1Ok) {
+        uint32_t now_ms = to_ms_since_boot(get_absolute_time());
+        if ((now_ms - s_si5351_pollMs) >= 5000u) {
+            s_si5351_pollMs = now_ms;
+            si_read_reg(SI_REG_STATUS, &s_si5351_status);
+        }
+    }
+
+    const bool si_locked = s_clk1Ok &&
+                           !(s_si5351_status & SI_STATUS_LOS_XTAL) &&
+                           !(s_si5351_status & SI_STATUS_LOL_A);
+    if (!s_gpsdoReady && si_locked && s_fixQuality > 0 && s_satsUsed >= 1) {
         s_gpsdoReady = true;
-        printf("[GPSDO] READY — satellite lock acquired\n");
+        printf("[GPSDO] READY — SI5351 locked + GPS fix\n");
     }
 }
 
@@ -491,7 +541,7 @@ int gpsdo_format_status(char *buf, size_t size)
     return snprintf(buf, size,
                     "GPSDO: lock=%d sats=%d clk1=%s i2c=%s baud=%lu uart_rx=%lu nmea=%lu\r\n",
                     locked ? 1 : 0, sats,
-                    s_clk1Ok ? "ok" : "fail",
+                    si5351_clk_status(),
                     i2c_str,
                     (unsigned long)s_detected_baud,
                     (unsigned long)s_uartBytesRx,
