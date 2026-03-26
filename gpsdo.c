@@ -69,7 +69,7 @@ static uint8_t s_si_addr = 0x00u;
 #define SI_REG_CLK1_CTRL   17u
 #define SI_REG_CLK2_CTRL   18u
 #define SI_REG_PLLA_BASE   26u   // 8 bytes: regs 26-33
-#define SI_REG_MS1_BASE    58u   // 8 bytes: regs 58-65
+#define SI_REG_MS1_BASE    50u   // 8 bytes: regs 50-57  (MS2/CLK2 starts at 58)
 #define SI_REG_PLL_RESET   177u
 #define SI_REG_XTAL_LOAD   183u
 
