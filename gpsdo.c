@@ -29,9 +29,11 @@
 #define GPSDO_I2C_SCL       1u
 #define GPSDO_I2C_BAUD      100000u   // 100 kHz — reliable with internal pull-ups
 
+// UART1 pin assignment.
+// If uart_rx stays 0, try swapping these two lines (swap GP4 and GP5).
 #define GPSDO_UART          uart1
-#define GPSDO_UART_TX       4u        // GP4 → NEO-7M RX
-#define GPSDO_UART_RX       5u        // GP5 ← NEO-7M TX
+#define GPSDO_UART_TX       4u        // Pico TX (output) → NEO-7M RX
+#define GPSDO_UART_RX       5u        // Pico RX (input)  ← NEO-7M TX
 #define GPSDO_GPS_BAUD      9600u
 
 #define GPSDO_PRINT_MS      2000u     // status line interval
@@ -398,14 +400,23 @@ void gpsdo_init(void)
 
     // ── UART1 for NEO-7M GPS ─────────────────────────────────────────────────
     uart_init(GPSDO_UART, GPSDO_GPS_BAUD);
+    uart_set_format(GPSDO_UART, 8, 1, UART_PARITY_NONE);
     gpio_set_function(GPSDO_UART_TX, GPIO_FUNC_UART);
     gpio_set_function(GPSDO_UART_RX, GPIO_FUNC_UART);
 
     // Allow the NEO-7M to boot before sending UBX commands.
-    sleep_ms(GPSDO_BOOT_DELAY_MS);
-
-    // Drain any stale bytes.
-    while (uart_is_readable(GPSDO_UART)) { uart_getc(GPSDO_UART); }
+    // Also acts as a quick UART RX sanity check: count bytes during boot delay.
+    uint32_t sniff_bytes = 0u;
+    uint32_t sniff_end = to_ms_since_boot(get_absolute_time()) + GPSDO_BOOT_DELAY_MS;
+    while ((int32_t)(to_ms_since_boot(get_absolute_time()) - sniff_end) < 0) {
+        if (uart_is_readable(GPSDO_UART)) {
+            uart_getc(GPSDO_UART);
+            sniff_bytes++;
+        }
+    }
+    // sniff_bytes > 0 means UART RX is wired correctly.
+    // sniff_bytes == 0 likely means GPS TX is not connected to GPSDO_UART_RX (GP5).
+    s_uartBytesRx = sniff_bytes;
 
     send_ubx_packet(UBX_CFG_TP5_24MHZ,       sizeof(UBX_CFG_TP5_24MHZ));
     sleep_ms(50u);
