@@ -995,13 +995,17 @@ class SX1280ControlApp(ttk.Frame):
         self.gpsdo_i2c_var = tk.StringVar(value="--")
         ttk.Label(sf, textvariable=self.gpsdo_i2c_var, anchor="w").grid(row=2, column=1, sticky="w")
 
-        ttk.Label(sf, text="GPS UART bytes rx:").grid(row=3, column=0, sticky="w", padx=(0, 8))
-        self.gpsdo_uart_var = tk.StringVar(value="--")
-        ttk.Label(sf, textvariable=self.gpsdo_uart_var, anchor="w").grid(row=3, column=1, sticky="w")
+        ttk.Label(sf, text="GPS baud (auto):").grid(row=3, column=0, sticky="w", padx=(0, 8))
+        self.gpsdo_baud_var = tk.StringVar(value="--")
+        ttk.Label(sf, textvariable=self.gpsdo_baud_var, anchor="w").grid(row=3, column=1, sticky="w")
 
-        ttk.Label(sf, text="NMEA sentences:").grid(row=4, column=0, sticky="w", padx=(0, 8))
+        ttk.Label(sf, text="GPS UART bytes rx:").grid(row=4, column=0, sticky="w", padx=(0, 8))
+        self.gpsdo_uart_var = tk.StringVar(value="--")
+        ttk.Label(sf, textvariable=self.gpsdo_uart_var, anchor="w").grid(row=4, column=1, sticky="w")
+
+        ttk.Label(sf, text="NMEA sentences:").grid(row=5, column=0, sticky="w", padx=(0, 8))
         self.gpsdo_nmea_var = tk.StringVar(value="--")
-        ttk.Label(sf, textvariable=self.gpsdo_nmea_var, anchor="w").grid(row=4, column=1, sticky="w")
+        ttk.Label(sf, textvariable=self.gpsdo_nmea_var, anchor="w").grid(row=5, column=1, sticky="w")
 
         # Manual poll button
         bf = ttk.Frame(tab)
@@ -1343,6 +1347,7 @@ class SX1280ControlApp(ttk.Frame):
         m = re.search(
             r'lock=(\d+)\s+sats=(\d+)\s+clk1=(\S+)'
             r'(?:\s+i2c=(0x[0-9a-fA-F]+))?'
+            r'(?:\s+baud=(\d+))?'
             r'(?:\s+uart_rx=(\d+))?'
             r'(?:\s+nmea=(\d+))?',
             line)
@@ -1352,8 +1357,9 @@ class SX1280ControlApp(ttk.Frame):
         sats   = m.group(2)
         clk1   = m.group(3)
         i2c    = m.group(4) or "--"
-        uart   = m.group(5) or "--"
-        nmea   = m.group(6) or "--"
+        baud   = m.group(5) or "--"
+        uart   = m.group(6) or "--"
+        nmea   = m.group(7) or "--"
 
         if locked:
             self.gpsdo_lock_var.set("LOCKED")
@@ -1368,6 +1374,7 @@ class SX1280ControlApp(ttk.Frame):
         self.gpsdo_sats_var.set(sats)
         self.gpsdo_clk1_var.set(clk1)
         self.gpsdo_i2c_var.set(i2c)
+        self.gpsdo_baud_var.set(baud)
         self.gpsdo_uart_var.set(uart)
         self.gpsdo_nmea_var.set(nmea)
 

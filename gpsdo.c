@@ -171,6 +171,7 @@ static uint32_t s_lastGgaMs       = 0;
 static uint32_t s_lastPrintMs     = 0;
 static uint32_t s_uartBytesRx     = 0;   // raw bytes received from GPS UART
 static uint32_t s_nmeaCount       = 0;   // valid NMEA sentences parsed
+static uint32_t s_detected_baud   = 0;   // baud rate confirmed during auto-detect
 
 // GSV buckets: GP=0, GL=1, GA=2, GB/BD=3, GQ=4, GI=5, GN=6
 #define GSV_BUCKETS 7u
@@ -399,24 +400,43 @@ void gpsdo_init(void)
     printf("[GPSDO] SI5351 52MHz CLK1: %s\n", s_clk1Ok ? "OK" : "FAIL");
 
     // ── UART1 for NEO-7M GPS ─────────────────────────────────────────────────
-    uart_init(GPSDO_UART, GPSDO_GPS_BAUD);
-    uart_set_format(GPSDO_UART, 8, 1, UART_PARITY_NONE);
     gpio_set_function(GPSDO_UART_TX, GPIO_FUNC_UART);
     gpio_set_function(GPSDO_UART_RX, GPIO_FUNC_UART);
 
-    // Allow the NEO-7M to boot before sending UBX commands.
-    // Also acts as a quick UART RX sanity check: count bytes during boot delay.
-    uint32_t sniff_bytes = 0u;
-    uint32_t sniff_end = to_ms_since_boot(get_absolute_time()) + GPSDO_BOOT_DELAY_MS;
-    while ((int32_t)(to_ms_since_boot(get_absolute_time()) - sniff_end) < 0) {
-        if (uart_is_readable(GPSDO_UART)) {
-            uart_getc(GPSDO_UART);
-            sniff_bytes++;
+    // Auto-detect GPS baud rate.
+    // NEO-7M default is 9600, but u-center or prior config may have changed it.
+    // We try each rate for 400 ms and look for a '$' (NMEA sentence start).
+    static const uint32_t baud_candidates[] = { 9600u, 38400u, 57600u, 115200u };
+    uint32_t detected_baud = 9600u; // fallback
+    for (size_t bi = 0u; bi < sizeof(baud_candidates)/sizeof(baud_candidates[0]); bi++) {
+        uart_init(GPSDO_UART, baud_candidates[bi]);
+        uart_set_format(GPSDO_UART, 8, 1, UART_PARITY_NONE);
+        // Drain stale bytes from previous attempt.
+        while (uart_is_readable(GPSDO_UART)) { uart_getc(GPSDO_UART); }
+        uint32_t t_end = to_ms_since_boot(get_absolute_time()) + 400u;
+        uint32_t rx_count = 0u;
+        bool found_dollar = false;
+        while ((int32_t)(to_ms_since_boot(get_absolute_time()) - t_end) < 0) {
+            if (uart_is_readable(GPSDO_UART)) {
+                char c = (char)uart_getc(GPSDO_UART);
+                rx_count++;
+                if (c == '$') { found_dollar = true; }
+            }
+        }
+        if (found_dollar && rx_count >= 10u) {
+            // Enough data with a proper NMEA start — baud rate confirmed.
+            detected_baud = baud_candidates[bi];
+            s_uartBytesRx = rx_count;
+            break;
         }
     }
-    // sniff_bytes > 0 means UART RX is wired correctly.
-    // sniff_bytes == 0 likely means GPS TX is not connected to GPSDO_UART_RX (GP5).
-    s_uartBytesRx = sniff_bytes;
+    // Re-init at confirmed baud rate (already set in loop, but make it explicit).
+    uart_init(GPSDO_UART, detected_baud);
+    uart_set_format(GPSDO_UART, 8, 1, UART_PARITY_NONE);
+    while (uart_is_readable(GPSDO_UART)) { uart_getc(GPSDO_UART); }
+
+    // Store detected baud for status reporting.
+    s_detected_baud = detected_baud;
 
     send_ubx_packet(UBX_CFG_TP5_24MHZ,       sizeof(UBX_CFG_TP5_24MHZ));
     sleep_ms(50u);
@@ -455,10 +475,11 @@ int gpsdo_format_status(char *buf, size_t size)
     const int     sats     = ggaFresh ? s_satsUsed : 0;
     (void)get_visible_sats(); // keep function referenced
     return snprintf(buf, size,
-                    "GPSDO: lock=%d sats=%d clk1=%s i2c=0x%02X uart_rx=%lu nmea=%lu\r\n",
+                    "GPSDO: lock=%d sats=%d clk1=%s i2c=0x%02X baud=%lu uart_rx=%lu nmea=%lu\r\n",
                     locked ? 1 : 0, sats,
                     s_clk1Ok ? "ok" : "fail",
                     (unsigned)s_si_addr,
+                    (unsigned long)s_detected_baud,
                     (unsigned long)s_uartBytesRx,
                     (unsigned long)s_nmeaCount);
 }
