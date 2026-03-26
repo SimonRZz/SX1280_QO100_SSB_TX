@@ -547,6 +547,8 @@ class LabeledScale(ttk.Frame):
         self.value_label.grid(row=0, column=2, sticky="e")
         self._update_value_label()
         self.scale.bind("<ButtonRelease-1>", self._on_release)
+        # Auto-update label on programmatic .set() (e.g. from !S status push)
+        var.trace_add("write", lambda *_: self._update_value_label())
 
     def _on_scale(self, _val):
         self._update_value_label()
@@ -564,6 +566,43 @@ class LabeledScale(ttk.Frame):
         self.value_label.config(text=text)
 
 
+class ScrollableFrame(ttk.Frame):
+    """Frame with vertical scrollbar – used for the RF & DSP tab."""
+    def __init__(self, parent, **kwargs):
+        super().__init__(parent, **kwargs)
+        self.canvas = tk.Canvas(self, highlightthickness=0, borderwidth=0)
+        self.scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        self.inner = ttk.Frame(self.canvas)
+        self.inner.bind("<Configure>",   self._on_inner_cfg)
+        self.canvas.bind("<Configure>",  self._on_canvas_cfg)
+        self._win = self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
+        self.canvas.configure(yscrollcommand=self.scrollbar.set)
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.scrollbar.pack(side="right", fill="y")
+        self.canvas.bind("<Enter>", lambda _: self._bind_wheel())
+        self.canvas.bind("<Leave>", lambda _: self._unbind_wheel())
+
+    def _on_inner_cfg(self, _e):
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+
+    def _on_canvas_cfg(self, e):
+        self.canvas.itemconfig(self._win, width=e.width)
+
+    def _bind_wheel(self):
+        self.canvas.bind_all("<Button-4>",   self._scroll)
+        self.canvas.bind_all("<Button-5>",   self._scroll)
+        self.canvas.bind_all("<MouseWheel>", self._scroll)
+
+    def _unbind_wheel(self):
+        for ev in ("<Button-4>", "<Button-5>", "<MouseWheel>"):
+            self.canvas.unbind_all(ev)
+
+    def _scroll(self, e):
+        if   e.num == 4: self.canvas.yview_scroll(-3, "units")
+        elif e.num == 5: self.canvas.yview_scroll( 3, "units")
+        elif hasattr(e, 'delta'): self.canvas.yview_scroll(-1*(e.delta//120), "units")
+
+
 class SX1280ControlApp(ttk.Frame):
     FREQ_MIN_HZ = 2_400_000_000
     FREQ_MAX_HZ = 2_400_500_000
@@ -578,6 +617,7 @@ class SX1280ControlApp(ttk.Frame):
         self.freq_debouncer = Debouncer(master, 200, self._send_freq)
 
         self._status_updating = False  # guard against feedback loops during !S sync
+        self._heartbeat_id   = None    # after() id for periodic status requests
 
         self.audio       = AudioEngine()
         self.keyer       = Keyer()
@@ -624,8 +664,8 @@ class SX1280ControlApp(ttk.Frame):
         self.status_var  = tk.StringVar(value="⚫ Disconnected")
         self.mode_var    = tk.StringVar(value="usb")
         self.tune_var    = tk.BooleanVar(value=False)
-        self.freq_mhz_var = tk.DoubleVar(value=self.config.freq_hz / 1_000_000)
-        self.freq_hz_var  = tk.StringVar(value=str(self.config.freq_hz))
+        self.freq_mhz_var  = tk.DoubleVar(value=self.config.freq_hz / 1_000_000)
+        self.freq_khz_var  = tk.StringVar(value=f"{self.config.freq_hz / 1000:.1f}")
         self.ppm_var      = tk.DoubleVar(value=0.0)
         self.txpwr_var    = tk.IntVar(value=self.config.tx_power_dbm)
         self.tx_enabled_var          = tk.BooleanVar(value=True)
@@ -694,15 +734,14 @@ class SX1280ControlApp(ttk.Frame):
         ttk.Label(f, textvariable=self.status_var).grid(row=0, column=3, padx=(10, 0))
 
     def _build_dsp_tab(self):
-        tab = ttk.Frame(self.notebook, padding=10)
-        self.notebook.add(tab, text="RF & DSP")
+        sc = ScrollableFrame(self.notebook)
+        self.notebook.add(sc, text="RF & DSP")
+        tab = sc.inner
         tab.columnconfigure(0, weight=1)
 
         rf = ttk.LabelFrame(tab, text="RF / Frequency", padding=10)
         rf.grid(row=0, column=0, sticky="ew", pady=(0, 10))
         rf.columnconfigure(1, weight=1)
-        for ev in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
-            rf.bind(ev, self._on_freq_scroll)
 
         tbf = ttk.Frame(rf)
         tbf.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 10))
@@ -738,20 +777,16 @@ class SX1280ControlApp(ttk.Frame):
         self.freq_scale.grid(row=0, column=0, sticky="ew")
         fef = ttk.Frame(rf)
         fef.grid(row=1, column=2)
-        self.freq_entry = ttk.Entry(fef, textvariable=self.freq_hz_var, width=14)
+        self.freq_entry = ttk.Entry(fef, textvariable=self.freq_khz_var, width=14)
         self.freq_entry.pack(side="left")
         self.freq_entry.bind("<Return>", lambda e: self._send_freq_from_entry())
-        for ev in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
-            self.freq_entry.bind(ev, self._on_freq_scroll)
-        ttk.Label(fef, text=" Hz").pack(side="left")
+        ttk.Label(fef, text=" kHz").pack(side="left")
 
         fdf = ttk.Frame(rf)
         fdf.grid(row=2, column=1, columnspan=2, sticky="w", padx=5)
         self.freq_mhz_label = ttk.Label(fdf, text="2400.4000 MHz ↑",
                                          font=("TkDefaultFont", 12, "bold"))
         self.freq_mhz_label.pack(side="left")
-        for ev in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
-            self.freq_mhz_label.bind(ev, self._on_freq_scroll)
         ttk.Label(fdf, text="   →   ").pack(side="left")
         self.downlink_label = ttk.Label(fdf, text="10489.9000 MHz ↓",
                                          font=("TkDefaultFont", 12, "bold"), foreground="blue")
@@ -1169,7 +1204,7 @@ class SX1280ControlApp(ttk.Frame):
                 if abs(self.config.freq_hz - new_freq) > 0.5:
                     self.config.freq_hz = new_freq
                     self.freq_mhz_var.set(new_freq / 1_000_000)
-                    self.freq_hz_var.set(f"{new_freq:.0f}")
+                    self.freq_khz_var.set(f"{new_freq / 1000:.1f}")
                     self._update_freq_display()
 
             self._status_updating = False
@@ -1219,14 +1254,30 @@ class SX1280ControlApp(ttk.Frame):
             self.status_var.set(f"🟢 Connected: {port}")
             self._log(f"Connected to {port}", "info")
             self.master.after(500, lambda: self._send_cmd_safe("get"))
+            self.master.after(800, lambda: self._send_cmd_safe("status"))
+            self._start_heartbeat()
         except Exception as e:
             messagebox.showerror("Connection failed", str(e))
             self.status_var.set("🔴 Connection failed")
 
     def _disconnect(self):
+        if self._heartbeat_id is not None:
+            self.master.after_cancel(self._heartbeat_id)
+            self._heartbeat_id = None
         self.worker.disconnect()
         self.status_var.set("⚫ Disconnected")
         self._log("Disconnected", "info")
+
+    def _start_heartbeat(self):
+        """Request !S status every 2 s so GUI stays in sync with hardware encoder."""
+        if not self.worker.is_connected():
+            self._heartbeat_id = None
+            return
+        try:
+            self.worker.send_line("status")
+        except Exception:
+            pass
+        self._heartbeat_id = self.master.after(2000, self._start_heartbeat)
 
     def _send_cmd_safe(self, cmd):
         try:
@@ -1264,7 +1315,7 @@ class SX1280ControlApp(ttk.Frame):
         self._send_cmd_safe(f"ppm {ppm:.4f}")
 
     def _update_freq_display(self):
-        try:    hz = float(self.freq_hz_var.get())
+        try:    hz = float(self.freq_khz_var.get()) * 1000
         except: hz = self.config.freq_hz
         self.freq_mhz_label.config(text=f"{hz/1_000_000:.4f} MHz ↑")
         self.downlink_label.config(text=f"{(hz+8089_500_000)/1_000_000:.4f} MHz ↓")
@@ -1282,19 +1333,21 @@ class SX1280ControlApp(ttk.Frame):
         elif event.num == 5: delta = -50
         elif hasattr(event, 'delta'): delta = 50 if event.delta > 0 else -50
         else: return
-        try:    hz = float(self.freq_hz_var.get())
+        try:    hz = float(self.freq_khz_var.get()) * 1000
         except: hz = self.config.freq_hz
         new_hz = max(self.FREQ_MIN_HZ, min(self.FREQ_MAX_HZ, hz + delta))
-        self.freq_hz_var.set(f"{new_hz:.0f}")
+        self.freq_khz_var.set(f"{new_hz / 1000:.1f}")
         self.freq_mhz_var.set(new_hz / 1_000_000)
         self._update_freq_display()
         self._send_cmd_safe(f"freq {new_hz:.1f}")
         return "break"
 
     def _on_freq_slider(self, _val):
+        if self._status_updating:
+            return
         hz = max(self.FREQ_MIN_HZ, min(self.FREQ_MAX_HZ,
-                 int(round(self.freq_mhz_var.get() * 1_000_000))))
-        self.freq_hz_var.set(str(hz))
+                 int(round(self.freq_mhz_var.get() * 1_000_000 / 100)) * 100))
+        self.freq_khz_var.set(f"{hz / 1000:.1f}")
         self._update_freq_display()
         self._send_cmd_safe(f"freq {hz}")
 
@@ -1303,14 +1356,15 @@ class SX1280ControlApp(ttk.Frame):
 
     def _send_freq_from_entry(self):
         try:
-            hz = float(self.freq_hz_var.get().replace(",", "."))
+            khz = float(self.freq_khz_var.get().replace(",", "."))
+            hz = round(khz * 1000 / 100) * 100  # snap to 0.1 kHz
             hz = max(self.FREQ_MIN_HZ, min(self.FREQ_MAX_HZ, hz))
-            self.freq_hz_var.set(f"{hz:.0f}")
+            self.freq_khz_var.set(f"{hz / 1000:.1f}")
             self.freq_mhz_var.set(hz / 1_000_000)
             self._update_freq_display()
             self._send_cmd_safe(f"freq {hz:.1f}")
         except ValueError:
-            messagebox.showerror("Invalid frequency", "Frequency must be a number in Hz")
+            messagebox.showerror("Invalid frequency", "Frequency must be a number in kHz")
 
     def _start_cw(self): self._send_cmd_safe("cw")
     def _stop_cw(self):
@@ -1344,7 +1398,11 @@ class SX1280ControlApp(ttk.Frame):
 
     def _send_all(self):
         self._send_cmd_safe(f"mode {self.mode_var.get()}")
-        hz = max(self.FREQ_MIN_HZ, min(self.FREQ_MAX_HZ, int(float(self.freq_hz_var.get()))))
+        try:
+            hz = round(float(self.freq_khz_var.get()) * 1000 / 100) * 100
+            hz = max(self.FREQ_MIN_HZ, min(self.FREQ_MAX_HZ, hz))
+        except ValueError:
+            hz = int(self.config.freq_hz)
         self._send_cmd_safe(f"freq {hz}")
         try:
             ppm = float(str(self.ppm_var.get()).replace(",", "."))
@@ -1427,7 +1485,7 @@ def main():
     def on_close():
         app._cw_stop()
         app.audio.close()
-        app.worker.disconnect()
+        app._disconnect()
         root.destroy()
 
     root.protocol("WM_DELETE_WINDOW", on_close)
