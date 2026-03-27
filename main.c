@@ -1176,7 +1176,7 @@ static void cdc_handle_line(char *line) {
     if (streqi(argv[0], "get"))  { cfg_print(); return; }
     if (streqi(argv[0], "diag")) { sx_print_diag(); return; }
     if (streqi(argv[0], "gpsdo")) {
-        char gbuf[80];
+        char gbuf[128];
         gpsdo_format_status(gbuf, sizeof(gbuf));
         cdc_write_str(gbuf);
         return;
@@ -1693,7 +1693,8 @@ int main(void) {
         uint8_t  si_warn_printed = 0u;  // warn once about missing SI5351
         while (!gpsdo_is_ready()) {
             gpsdo_task();
-            tud_task();  // keep USB alive during GPS lock wait
+            tud_task();   // keep USB alive
+            cdc_task();   // process incoming commands (e.g. 'gpsdo') while waiting
             uint32_t now_ms = to_ms_since_boot(get_absolute_time());
             if (tud_cdc_connected()) {
                 // One-time warning if SI5351 not found.
@@ -1705,7 +1706,7 @@ int main(void) {
                 }
                 if ((now_ms - last_status_ms) >= 2000u) {
                     last_status_ms = now_ms;
-                    char gbuf[120];
+                    char gbuf[128];
                     gpsdo_format_status(gbuf, sizeof(gbuf));
                     tud_cdc_write(gbuf, strlen(gbuf));
                     tud_cdc_write_flush();
@@ -1868,7 +1869,7 @@ int main(void) {
         // GPSDO: service GPS UART and send periodic status to CDC.
         gpsdo_task();
         if (gpsdo_status_due()) {
-            char gbuf[80];
+            char gbuf[128];
             gpsdo_format_status(gbuf, sizeof(gbuf));
             cdc_write_str(gbuf);
         }
