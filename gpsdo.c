@@ -616,17 +616,30 @@ bool gpsdo_si5351_ok(void)
 
 int gpsdo_format_status(char *buf, size_t size)
 {
-    // lock=1: SI5351 running + GPS UTC received (= 24 MHz disciplined)
-    const bool     locked   = s_clk1Ok && (s_utc[0] != '-');
-    const uint32_t now      = gpsdo_ms();
-    const bool     ggaFresh = (s_lastGgaMs != 0u) &&
-                              ((now - s_lastGgaMs) <= GPSDO_GGA_STALE_MS);
-    const int      sats     = ggaFresh ? s_satsUsed : 0;
-    const uint16_t vis      = get_visible_sats();
+    const uint32_t now = gpsdo_ms();
 
-    // Format UTC as HH:MM:SS
+    // sig: GPS time-discipline status
+    //   "stable" – UTC received, GGA fresh (<60 s)  → 24 MHz disciplined
+    //   "stale"  – had UTC but no GGA for >60 s     → keep last values, signal briefly lost
+    //   "wait"   – no UTC ever received              → cold start / no satellite yet
+    const bool utc_valid  = (s_utc[0] != '-');
+    const bool gga_recent = (s_lastGgaMs != 0u) && ((now - s_lastGgaMs) <= 60000u);
+    const char *sig = !utc_valid       ? "wait"
+                    : gga_recent       ? "stable"
+                    :                    "stale";
+
+    // fix: position fix (needs ≥3 sats — consistent with Arduino "LCK" = sats≥3)
+    //   "locked" – position fix active, locator valid
+    //   "wait"   – no fix yet
+    const char *fix = (s_fixQuality > 0 && s_satsUsed >= 3) ? "locked" : "wait";
+
+    // Always use last known sats/vis — do NOT zero on stale (robustness against
+    // brief interruptions, same approach as the reference Arduino sketch).
+    const uint16_t vis = get_visible_sats();
+
+    // Format UTC as HH:MM:SS (last known value, never zeroed)
     char utc_str[9];
-    if (s_utc[0] != '-') {
+    if (utc_valid) {
         snprintf(utc_str, sizeof(utc_str), "%c%c:%c%c:%c%c",
                  s_utc[0], s_utc[1], s_utc[2], s_utc[3], s_utc[4], s_utc[5]);
     } else {
@@ -634,9 +647,11 @@ int gpsdo_format_status(char *buf, size_t size)
     }
 
     return snprintf(buf, size,
-                    "GPSDO: lock=%d sats=%d vis=%d clk1=%s"
+                    "GPSDO: sig=%s fix=%s sats=%d vis=%d clk1=%s"
                     " utc=%s loc=%s alt=%dm\r\n",
-                    locked ? 1 : 0, sats, (int)vis,
+                    sig, fix,
+                    s_satsUsed,   // last known — not zeroed on stale
+                    (int)vis,
                     si5351_clk_status(),
                     utc_str,
                     s_has_position ? s_locator : "------",
