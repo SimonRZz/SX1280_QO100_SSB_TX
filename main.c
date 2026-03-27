@@ -1712,9 +1712,9 @@ int main(void) {
                 }
             }
         }
-        // GPSDO ready: both SI5351 CLK1 and GPS lock confirmed.
+        // GPSDO ready: SI5351 52 MHz confirmed locked.
         if (tud_cdc_connected()) {
-            cdc_write_str("GPSDO: READY — SI5351 locked, GPS fix acquired. Starting SX1280.\r\n");
+            cdc_write_str("GPSDO: READY — SI5351 52 MHz locked. Starting SX1280.\r\n");
         }
     }
 

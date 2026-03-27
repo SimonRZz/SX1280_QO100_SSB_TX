@@ -594,9 +594,11 @@ void gpsdo_task(void)
                            !(s_si5351_status & SI_STATUS_LOS_XTAL) &&
                            !(s_si5351_status & SI_STATUS_LOL_A);
     // One satellite is enough for a valid time signal.
-    if (!s_gpsdoReady && si_locked && s_satsUsed >= 1) {
+    // The GPS TP 24 MHz runs regardless of fix — SI5351 lock alone is sufficient
+    // for a stable 52 MHz reference.  Start SX1280 as soon as PLL is confirmed.
+    if (!s_gpsdoReady && si_locked) {
         s_gpsdoReady = true;
-        printf("[GPSDO] READY — SI5351 locked, %d sat(s) in use\n", s_satsUsed);
+        printf("[GPSDO] READY — SI5351 52 MHz locked, starting SX1280\n");
     }
 }
 
