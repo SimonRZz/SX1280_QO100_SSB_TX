@@ -659,6 +659,10 @@ class SX1280ControlApp(ttk.Frame):
         self.gpsdo_lock_var  = tk.StringVar(value="--")
         self.gpsdo_sats_var  = tk.StringVar(value="--")
         self.gpsdo_clk1_var  = tk.StringVar(value="--")
+        self.gpsdo_vis_var   = tk.StringVar(value="--")
+        self.gpsdo_utc_var   = tk.StringVar(value="--:--:--")
+        self.gpsdo_loc_var   = tk.StringVar(value="------")
+        self.gpsdo_alt_var   = tk.StringVar(value="--")
 
     def _build_ui(self):
         self.master.title("SX1280 QO-100 SSB TX Control")
@@ -972,7 +976,7 @@ class SX1280ControlApp(ttk.Frame):
         tab.columnconfigure(0, weight=1)
 
         # Lock status indicator
-        lf = ttk.LabelFrame(tab, text="GPS Lock", padding=10)
+        lf = ttk.LabelFrame(tab, text="Status", padding=10)
         lf.grid(row=0, column=0, sticky="ew", pady=(0, 8))
         lf.columnconfigure(1, weight=1)
         self.gpsdo_lock_label = ttk.Label(
@@ -980,32 +984,30 @@ class SX1280ControlApp(ttk.Frame):
             font=("TkDefaultFont", 14, "bold"), anchor="center")
         self.gpsdo_lock_label.grid(row=0, column=0, columnspan=2, sticky="ew", pady=4)
 
-        # Status fields
-        sf = ttk.LabelFrame(tab, text="Status", padding=10)
+        # GPS info fields
+        sf = ttk.LabelFrame(tab, text="GPS", padding=10)
         sf.grid(row=1, column=0, sticky="ew", pady=(0, 8))
         sf.columnconfigure(1, weight=1)
 
-        ttk.Label(sf, text="Satellites used:").grid(row=0, column=0, sticky="w", padx=(0, 8))
-        ttk.Label(sf, textvariable=self.gpsdo_sats_var, anchor="w").grid(row=0, column=1, sticky="w")
+        ttk.Label(sf, text="UTC time:").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ttk.Label(sf, textvariable=self.gpsdo_utc_var, anchor="w",
+                  font=("Consolas", 11)).grid(row=0, column=1, sticky="w")
 
-        ttk.Label(sf, text="CLK1 (52 MHz):").grid(row=1, column=0, sticky="w", padx=(0, 8))
-        ttk.Label(sf, textvariable=self.gpsdo_clk1_var, anchor="w").grid(row=1, column=1, sticky="w")
+        ttk.Label(sf, text="Locator:").grid(row=1, column=0, sticky="w", padx=(0, 8))
+        ttk.Label(sf, textvariable=self.gpsdo_loc_var, anchor="w",
+                  font=("Consolas", 11)).grid(row=1, column=1, sticky="w")
 
-        ttk.Label(sf, text="SI5351 I2C addr:").grid(row=2, column=0, sticky="w", padx=(0, 8))
-        self.gpsdo_i2c_var = tk.StringVar(value="--")
-        ttk.Label(sf, textvariable=self.gpsdo_i2c_var, anchor="w").grid(row=2, column=1, sticky="w")
+        ttk.Label(sf, text="Satellites used:").grid(row=2, column=0, sticky="w", padx=(0, 8))
+        ttk.Label(sf, textvariable=self.gpsdo_sats_var, anchor="w").grid(row=2, column=1, sticky="w")
 
-        ttk.Label(sf, text="GPS baud (auto):").grid(row=3, column=0, sticky="w", padx=(0, 8))
-        self.gpsdo_baud_var = tk.StringVar(value="--")
-        ttk.Label(sf, textvariable=self.gpsdo_baud_var, anchor="w").grid(row=3, column=1, sticky="w")
+        ttk.Label(sf, text="Satellites visible:").grid(row=3, column=0, sticky="w", padx=(0, 8))
+        ttk.Label(sf, textvariable=self.gpsdo_vis_var, anchor="w").grid(row=3, column=1, sticky="w")
 
-        ttk.Label(sf, text="GPS UART bytes rx:").grid(row=4, column=0, sticky="w", padx=(0, 8))
-        self.gpsdo_uart_var = tk.StringVar(value="--")
-        ttk.Label(sf, textvariable=self.gpsdo_uart_var, anchor="w").grid(row=4, column=1, sticky="w")
+        ttk.Label(sf, text="Altitude:").grid(row=4, column=0, sticky="w", padx=(0, 8))
+        ttk.Label(sf, textvariable=self.gpsdo_alt_var, anchor="w").grid(row=4, column=1, sticky="w")
 
-        ttk.Label(sf, text="NMEA sentences:").grid(row=5, column=0, sticky="w", padx=(0, 8))
-        self.gpsdo_nmea_var = tk.StringVar(value="--")
-        ttk.Label(sf, textvariable=self.gpsdo_nmea_var, anchor="w").grid(row=5, column=1, sticky="w")
+        ttk.Label(sf, text="CLK1 (52 MHz):").grid(row=5, column=0, sticky="w", padx=(0, 8))
+        ttk.Label(sf, textvariable=self.gpsdo_clk1_var, anchor="w").grid(row=5, column=1, sticky="w")
 
         # Manual poll button
         bf = ttk.Frame(tab)
@@ -1345,38 +1347,40 @@ class SX1280ControlApp(ttk.Frame):
         """Parse GPSDO status line and update the GPSDO tab."""
         import re
         m = re.search(
-            r'lock=(\d+)\s+sats=(\d+)\s+clk1=(\S+)'
-            r'(?:\s+i2c=(\S+))?'
-            r'(?:\s+baud=(\d+))?'
-            r'(?:\s+uart_rx=(\d+))?'
-            r'(?:\s+nmea=(\d+))?',
+            r'lock=(\d+)\s+sats=(\d+)\s+vis=(\d+)\s+clk1=(\S+)'
+            r'(?:\s+utc=(\S+))?'
+            r'(?:\s+loc=(\S+))?'
+            r'(?:\s+alt=(-?\d+)m)?',
             line)
         if not m:
             return
         locked = m.group(1) == "1"
         sats   = m.group(2)
-        clk1   = m.group(3)
-        i2c    = m.group(4) or "--"
-        baud   = m.group(5) or "--"
-        uart   = m.group(6) or "--"
-        nmea   = m.group(7) or "--"
+        vis    = m.group(3)
+        clk1   = m.group(4)
+        utc    = m.group(5) or "--:--:--"
+        loc    = m.group(6) or "------"
+        alt    = (m.group(7) + " m") if m.group(7) else "--"
 
         if locked:
             self.gpsdo_lock_var.set("LOCKED")
             self.gpsdo_lock_label.config(foreground="#007700")
         elif clk1 == "fail":
-            self.gpsdo_lock_var.set("SI5351 not found")
+            self.gpsdo_lock_var.set("SI5351 nicht gefunden")
+            self.gpsdo_lock_label.config(foreground="#cc0000")
+        elif clk1 in ("lol", "los"):
+            self.gpsdo_lock_var.set(f"CLK1: {clk1.upper()}")
             self.gpsdo_lock_label.config(foreground="#cc0000")
         else:
-            self.gpsdo_lock_var.set("SEARCHING...")
+            self.gpsdo_lock_var.set("Suche Satelliten...")
             self.gpsdo_lock_label.config(foreground="#cc4400")
 
         self.gpsdo_sats_var.set(sats)
+        self.gpsdo_vis_var.set(vis)
         self.gpsdo_clk1_var.set(clk1)
-        self.gpsdo_i2c_var.set(i2c)
-        self.gpsdo_baud_var.set(baud)
-        self.gpsdo_uart_var.set(uart)
-        self.gpsdo_nmea_var.set(nmea)
+        self.gpsdo_utc_var.set(utc)
+        self.gpsdo_loc_var.set(loc)
+        self.gpsdo_alt_var.set(alt)
 
     def _poll_rx(self):
         try:

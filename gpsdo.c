@@ -36,10 +36,11 @@
 #define GPSDO_UART_RX       5u        // Pico RX (input)  ← NEO-7M TX
 #define GPSDO_GPS_BAUD      9600u
 
-#define GPSDO_PRINT_MS      2000u     // status line interval
+#define GPSDO_PRINT_MS      10000u    // status line interval (10 s — keeps RF quiet)
 #define GPSDO_NMEA_STALE_MS 3000u
-#define GPSDO_GGA_STALE_MS  3000u
-#define GPSDO_GSV_FRESH_MS  5000u
+#define GPSDO_GGA_STALE_MS  5000u
+#define GPSDO_GSV_FRESH_MS  10000u
+#define GPSDO_SI5351_POLL_MS 30000u   // SI5351 reg-0 re-read interval
 #define GPSDO_NMEA_BUF      128u
 #define GPSDO_BOOT_DELAY_MS 300u      // wait before sending UBX commands
 
@@ -150,7 +151,7 @@ static bool si5351_init_52mhz(void)
     if (!si_write_regs(SI_REG_PLLA_BASE, plla, 8u)) return false;
 
     // MS1 (CLK1): p1=1664=0x0680, p2=0, p3=1
-    //   Regs 58-65
+    //   Regs 50-57
     static const uint8_t ms1[8] = {
         0x00u, 0x01u,   // p3=1
         0x00u,          // R_DIV=/1, DIVBY4=0, p1[17:16]=0
@@ -179,6 +180,13 @@ static bool     s_clk1Ok          = false;   // I2C init succeeded
 static uint8_t  s_si5351_status   = 0xFFu;   // SI5351 reg 0; 0xFF = not yet read
 static uint32_t s_si5351_pollMs   = 0u;
 static bool     s_gpsdoReady      = false;
+
+// Position & locator (updated from GGA when fixQuality > 0)
+static float    s_lat             = 0.0f;    // decimal degrees, positive = N
+static float    s_lon             = 0.0f;    // decimal degrees, positive = E
+static int16_t  s_alt_m           = 0;       // altitude in metres
+static bool     s_has_position    = false;
+static char     s_locator[7]      = "------"; // 6-char Maidenhead
 
 // Returns the clk1= status string based on SI5351 register 0.
 // "ok"  – PLL A locked, XA signal present
@@ -305,6 +313,65 @@ static uint16_t get_visible_sats(void)
 }
 
 // ---------------------------------------------------------------------------
+// Coordinate helpers
+// ---------------------------------------------------------------------------
+
+// Parse "DDMM.MMMM" (lat, deg_digits=2) or "DDDMM.MMMM" (lon, deg_digits=3)
+// into decimal degrees. Returns 0 on malformed input. Apply N/S/E/W sign outside.
+static float parse_nmea_coord(const char *p, int deg_digits)
+{
+    if (!p || *p < '0' || *p > '9') return 0.0f;
+    int32_t deg = 0;
+    for (int i = 0; i < deg_digits; i++) {
+        if (p[i] < '0' || p[i] > '9') return 0.0f;
+        deg = deg * 10 + (p[i] - '0');
+    }
+    const char *mp = p + deg_digits;
+    float min = 0.0f, frac = 0.1f;
+    bool dot = false;
+    while (*mp && *mp != ',' && *mp != '*') {
+        if (*mp == '.') { dot = true; mp++; continue; }
+        if (*mp < '0' || *mp > '9') break;
+        if (!dot) { min = min * 10.0f + (float)(*mp - '0'); }
+        else      { min += (float)(*mp - '0') * frac; frac *= 0.1f; }
+        mp++;
+    }
+    return (float)deg + min / 60.0f;
+}
+
+// Parse altitude field (metres, may be fractional — truncate to integer).
+static int16_t parse_alt(const char *p)
+{
+    if (!p || (*p != '-' && (*p < '0' || *p > '9'))) return 0;
+    bool neg = (*p == '-'); if (neg) p++;
+    int32_t v = 0;
+    while (*p >= '0' && *p <= '9') { v = v * 10 + (*p - '0'); p++; }
+    if (v > 32767) v = 32767;
+    return (int16_t)(neg ? -v : v);
+}
+
+// Compute 6-character Maidenhead locator from decimal degrees.
+static void compute_maidenhead(float lat, float lon, char *loc6)
+{
+    lon += 180.0f;  lat += 90.0f;           // shift to positive range
+    int fl = (int)(lon / 20.0f);  if (fl > 17) fl = 17;
+    int fa = (int)(lat / 10.0f);  if (fa > 17) fa = 17;
+    lon -= fl * 20.0f;  lat -= fa * 10.0f;
+    int sl = (int)(lon / 2.0f);   if (sl > 9) sl = 9;
+    int sa = (int)(lat);          if (sa > 9) sa = 9;
+    lon -= sl * 2.0f;  lat -= (float)sa;
+    int ssl = (int)(lon * 12.0f); if (ssl > 23) ssl = 23;
+    int ssa = (int)(lat * 24.0f); if (ssa > 23) ssa = 23;
+    loc6[0] = (char)('A' + fl);
+    loc6[1] = (char)('A' + fa);
+    loc6[2] = (char)('0' + sl);
+    loc6[3] = (char)('0' + sa);
+    loc6[4] = (char)('a' + ssl);
+    loc6[5] = (char)('a' + ssa);
+    loc6[6] = '\0';
+}
+
+// ---------------------------------------------------------------------------
 // NMEA parsers
 // ---------------------------------------------------------------------------
 static void parse_time(const char *s, uint8_t fn)
@@ -323,6 +390,24 @@ static void parse_gga(const char *s)
     parse_time(s, 1u);
     s_fixQuality = (int)parse_uint(nmea_field(s, 6u));
     s_satsUsed   = (int)parse_uint(nmea_field(s, 7u));
+    if (s_fixQuality > 0) {
+        const char *lat_f = nmea_field(s, 2u);
+        const char *ns_f  = nmea_field(s, 3u);
+        const char *lon_f = nmea_field(s, 4u);
+        const char *ew_f  = nmea_field(s, 5u);
+        const char *alt_f = nmea_field(s, 9u);
+        if (lat_f && ns_f && lon_f && ew_f &&
+            lat_f[0] >= '0' && lat_f[0] <= '9') {
+            float lat = parse_nmea_coord(lat_f, 2);
+            float lon = parse_nmea_coord(lon_f, 3);
+            if (ns_f[0] == 'S') lat = -lat;
+            if (ew_f[0] == 'W') lon = -lon;
+            s_lat = lat; s_lon = lon;
+            s_has_position = true;
+            compute_maidenhead(lat, lon, s_locator);
+        }
+        if (alt_f) s_alt_m = parse_alt(alt_f);
+    }
 }
 
 static void parse_rmc(const char *s) { parse_time(s, 1u); }
@@ -496,10 +581,10 @@ void gpsdo_task(void)
 {
     process_incoming_gps();
 
-    // Re-read SI5351 status register every 5 s to track PLL lock in real time.
+    // Re-read SI5351 status register every 30 s (infrequent to avoid I2C noise during TX).
     if (s_clk1Ok) {
         uint32_t now_ms = to_ms_since_boot(get_absolute_time());
-        if ((now_ms - s_si5351_pollMs) >= 5000u) {
+        if ((now_ms - s_si5351_pollMs) >= GPSDO_SI5351_POLL_MS) {
             s_si5351_pollMs = now_ms;
             si_read_reg(SI_REG_STATUS, &s_si5351_status);
         }
@@ -508,9 +593,10 @@ void gpsdo_task(void)
     const bool si_locked = s_clk1Ok &&
                            !(s_si5351_status & SI_STATUS_LOS_XTAL) &&
                            !(s_si5351_status & SI_STATUS_LOL_A);
-    if (!s_gpsdoReady && si_locked && s_fixQuality > 0 && s_satsUsed >= 1) {
+    // One satellite is enough for a valid time signal.
+    if (!s_gpsdoReady && si_locked && s_satsUsed >= 1) {
         s_gpsdoReady = true;
-        printf("[GPSDO] READY — SI5351 locked + GPS fix\n");
+        printf("[GPSDO] READY — SI5351 locked, %d sat(s) in use\n", s_satsUsed);
     }
 }
 
@@ -526,26 +612,30 @@ bool gpsdo_si5351_ok(void)
 
 int gpsdo_format_status(char *buf, size_t size)
 {
-    const bool    locked   = s_clk1Ok && (s_fixQuality > 0) && (s_satsUsed >= 1);
-    const uint32_t now     = gpsdo_ms();
-    const bool    ggaFresh = (s_lastGgaMs != 0u) &&
-                             ((now - s_lastGgaMs) <= GPSDO_GGA_STALE_MS);
-    const int     sats     = ggaFresh ? s_satsUsed : 0;
-    (void)get_visible_sats(); // keep function referenced
-    char i2c_str[12];
-    if (s_si_addr != 0x00u) {
-        snprintf(i2c_str, sizeof(i2c_str), "0x%02X", (unsigned)s_si_addr);
+    const bool     locked   = s_clk1Ok && (s_satsUsed >= 1);
+    const uint32_t now      = gpsdo_ms();
+    const bool     ggaFresh = (s_lastGgaMs != 0u) &&
+                              ((now - s_lastGgaMs) <= GPSDO_GGA_STALE_MS);
+    const int      sats     = ggaFresh ? s_satsUsed : 0;
+    const uint16_t vis      = get_visible_sats();
+
+    // Format UTC as HH:MM:SS
+    char utc_str[9];
+    if (s_utc[0] != '-') {
+        snprintf(utc_str, sizeof(utc_str), "%c%c:%c%c:%c%c",
+                 s_utc[0], s_utc[1], s_utc[2], s_utc[3], s_utc[4], s_utc[5]);
     } else {
-        snprintf(i2c_str, sizeof(i2c_str), "not_found");
+        snprintf(utc_str, sizeof(utc_str), "--:--:--");
     }
+
     return snprintf(buf, size,
-                    "GPSDO: lock=%d sats=%d clk1=%s i2c=%s baud=%lu uart_rx=%lu nmea=%lu\r\n",
-                    locked ? 1 : 0, sats,
+                    "GPSDO: lock=%d sats=%d vis=%d clk1=%s"
+                    " utc=%s loc=%s alt=%dm\r\n",
+                    locked ? 1 : 0, sats, (int)vis,
                     si5351_clk_status(),
-                    i2c_str,
-                    (unsigned long)s_detected_baud,
-                    (unsigned long)s_uartBytesRx,
-                    (unsigned long)s_nmeaCount);
+                    utc_str,
+                    s_has_position ? s_locator : "------",
+                    (int)s_alt_m);
 }
 
 bool gpsdo_status_due(void)
