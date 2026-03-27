@@ -737,6 +737,15 @@ class SX1280ControlApp(ttk.Frame):
         self.cw_conn_status_var = tk.StringVar(value='● GETRENNT')
         self.cw_text_var        = tk.StringVar(value='CQ CQ DE SX1280')
         self.cw_weight_var      = tk.DoubleVar(value=3.0)
+        # GPSDO state
+        self.gpsdo_sig_var  = tk.StringVar(value="--")
+        self.gpsdo_fix_var  = tk.StringVar(value="--")
+        self.gpsdo_sats_var = tk.StringVar(value="--")
+        self.gpsdo_vis_var  = tk.StringVar(value="--")
+        self.gpsdo_clk1_var = tk.StringVar(value="--")
+        self.gpsdo_utc_var  = tk.StringVar(value="--:--:--")
+        self.gpsdo_loc_var  = tk.StringVar(value="------")
+        self.gpsdo_alt_var  = tk.StringVar(value="--")
 
     def _build_ui(self):
         self.master.title("SX1280 QO-100 SSB TX Control")
@@ -750,6 +759,7 @@ class SX1280ControlApp(ttk.Frame):
         self._build_dsp_tab()
         self._build_tx_tab()
         self._build_cw_tab()
+        self._build_gpsdo_tab()
         self._build_console_tab()
 
     def _build_connection_bar(self):
@@ -1066,6 +1076,64 @@ class SX1280ControlApp(ttk.Frame):
                    command=self._cw_clear_dec).grid(row=1, column=0, sticky="w", pady=3)
         ttk.Label(tab, text="ESC = Abbruch  |  Pin → Taste → GND  |  Active Low",
                   foreground="gray").grid(row=4, column=0, columnspan=2, pady=2)
+
+    def _build_gpsdo_tab(self):
+        tab = ttk.Frame(self.notebook, padding=10)
+        self.notebook.add(tab, text="GPSDO")
+        tab.columnconfigure(0, weight=1)
+
+        # Two big status indicators
+        sf = ttk.LabelFrame(tab, text="Status", padding=10)
+        sf.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        sf.columnconfigure(0, weight=1)
+        sf.columnconfigure(1, weight=1)
+
+        ttk.Label(sf, text="GPS Signal:", anchor="w").grid(
+            row=0, column=0, sticky="w", padx=(0, 4))
+        self.gpsdo_sig_label = ttk.Label(
+            sf, textvariable=self.gpsdo_sig_var,
+            font=("TkDefaultFont", 11, "bold"), anchor="w")
+        self.gpsdo_sig_label.grid(row=0, column=1, sticky="w", pady=2)
+
+        ttk.Label(sf, text="GPS Position:", anchor="w").grid(
+            row=1, column=0, sticky="w", padx=(0, 4))
+        self.gpsdo_fix_label = ttk.Label(
+            sf, textvariable=self.gpsdo_fix_var,
+            font=("TkDefaultFont", 11, "bold"), anchor="w")
+        self.gpsdo_fix_label.grid(row=1, column=1, sticky="w", pady=2)
+
+        # GPS detail fields
+        df = ttk.LabelFrame(tab, text="GPS", padding=10)
+        df.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        df.columnconfigure(1, weight=1)
+
+        ttk.Label(df, text="UTC time:").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ttk.Label(df, textvariable=self.gpsdo_utc_var, anchor="w",
+                  font=("Consolas", 11)).grid(row=0, column=1, sticky="w")
+
+        ttk.Label(df, text="Locator:").grid(row=1, column=0, sticky="w", padx=(0, 8))
+        ttk.Label(df, textvariable=self.gpsdo_loc_var, anchor="w",
+                  font=("Consolas", 11)).grid(row=1, column=1, sticky="w")
+
+        ttk.Label(df, text="Satellites used:").grid(row=2, column=0, sticky="w", padx=(0, 8))
+        ttk.Label(df, textvariable=self.gpsdo_sats_var, anchor="w").grid(row=2, column=1, sticky="w")
+
+        ttk.Label(df, text="Satellites visible:").grid(row=3, column=0, sticky="w", padx=(0, 8))
+        ttk.Label(df, textvariable=self.gpsdo_vis_var, anchor="w").grid(row=3, column=1, sticky="w")
+
+        ttk.Label(df, text="Altitude:").grid(row=4, column=0, sticky="w", padx=(0, 8))
+        ttk.Label(df, textvariable=self.gpsdo_alt_var, anchor="w").grid(row=4, column=1, sticky="w")
+
+        ttk.Label(df, text="CLK1 (52 MHz):").grid(row=5, column=0, sticky="w", padx=(0, 8))
+        ttk.Label(df, textvariable=self.gpsdo_clk1_var, anchor="w").grid(row=5, column=1, sticky="w")
+
+        # Manual refresh button
+        bf = ttk.Frame(tab)
+        bf.grid(row=2, column=0, sticky="w", pady=(4, 0))
+        ttk.Button(bf, text="Refresh now",
+                   command=lambda: self._send_cmd_safe("gpsdo")).pack(side="left")
+        ttk.Label(bf, text="  (requests immediate status update)",
+                  foreground="gray").pack(side="left")
 
     def _build_console_tab(self):
         tab = ttk.Frame(self.notebook, padding=10)
@@ -1565,6 +1633,56 @@ class SX1280ControlApp(ttk.Frame):
         self.info_text.delete("1.0", "end")
         self.info_text.config(state="disabled")
 
+    def _parse_gpsdo_line(self, line):
+        """Parse a GPSDO status line and update the GPSDO tab."""
+        import re
+        m = re.search(
+            r'sig=(\S+)\s+fix=(\S+)\s+sats=(\d+)\s+vis=(\d+)\s+clk1=(\S+)'
+            r'(?:\s+utc=(\S+))?'
+            r'(?:\s+loc=(\S+))?'
+            r'(?:\s+alt=(-?\d+)m)?',
+            line)
+        if not m:
+            return
+        sig  = m.group(1)
+        fix  = m.group(2)
+        sats = m.group(3)
+        vis  = m.group(4)
+        clk1 = m.group(5)
+        utc  = m.group(6) or "--:--:--"
+        loc  = m.group(7) or "------"
+        alt  = (m.group(8) + " m") if m.group(8) else "--"
+
+        if clk1 == "fail":
+            self.gpsdo_sig_var.set("SI5351 not found")
+            self.gpsdo_sig_label.config(foreground="#cc0000")
+        elif clk1 in ("lol", "los"):
+            self.gpsdo_sig_var.set(f"CLK1 error: {clk1.upper()}")
+            self.gpsdo_sig_label.config(foreground="#cc0000")
+        elif sig == "stable":
+            self.gpsdo_sig_var.set("GPS signal stable")
+            self.gpsdo_sig_label.config(foreground="#007700")
+        elif sig == "stale":
+            self.gpsdo_sig_var.set("GPS signal lost (stale)")
+            self.gpsdo_sig_label.config(foreground="#cc4400")
+        else:
+            self.gpsdo_sig_var.set("Waiting for satellite...")
+            self.gpsdo_sig_label.config(foreground="#cc4400")
+
+        if fix == "locked":
+            self.gpsdo_fix_var.set("Position locked")
+            self.gpsdo_fix_label.config(foreground="#007700")
+        else:
+            self.gpsdo_fix_var.set("No position fix")
+            self.gpsdo_fix_label.config(foreground="#888888")
+
+        self.gpsdo_sats_var.set(sats)
+        self.gpsdo_vis_var.set(vis)
+        self.gpsdo_clk1_var.set(clk1)
+        self.gpsdo_utc_var.set(utc)
+        self.gpsdo_loc_var.set(loc)
+        self.gpsdo_alt_var.set(alt)
+
     def _poll_rx(self):
         processed = 0
         latest_status = None
@@ -1584,6 +1702,8 @@ class SX1280ControlApp(ttk.Frame):
                         elif self._cw_tx_active:
                             self._cw_tx_active = False
                             self.cw_tx_btn.config(text="⬛  TX OFF")
+                    if line.startswith("GPSDO:"):
+                        self._parse_gpsdo_line(line)
         except queue.Empty:
             pass
         if latest_status is not None:

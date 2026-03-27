@@ -22,6 +22,9 @@
 // OLED display
 #include "ssd1306.h"
 
+// GPSDO (SI5351 52 MHz clock gen + NEO-7M GPS)
+#include "gpsdo.h"
+
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -84,8 +87,8 @@
 
 // ================== MODULE VARIANT ==================
 // Set to 1 if using LoRa1280F27-TCXO module
-// Set to 0 if using LoRa1280F27 or LoRa1281F27 (standard crystal)
-#define USE_TCXO_MODULE     1
+// Set to 0 if using SX1280 V1.0 (no PA) with SI5351 52 MHz on XTA
+#define USE_TCXO_MODULE     0
 // ====================================================
 
 // ---------------- Pin mapping ----------------
@@ -122,6 +125,7 @@ static const uint32_t SX_SPI_BAUD = 18000000;
 
 // ---------------- SX1280 opcodes ----------------
 #define OPCODE_SET_STANDBY         0x80
+#define OPCODE_SET_FS              0xC1   // Lock PLL without starting TX
 #define OPCODE_SET_PACKET_TYPE     0x8A
 #define OPCODE_SET_RF_FREQUENCY    0x86
 #define OPCODE_SET_TX_PARAMS       0x8E
@@ -1347,6 +1351,12 @@ static void cdc_handle_line(char *line) {
     if (streqi(argv[0], "get"))  { cfg_print(); return; }
     if (streqi(argv[0], "status")) { cdc_status_push_ex(true); return; }
     if (streqi(argv[0], "diag")) { sx_print_diag(); return; }
+    if (streqi(argv[0], "gpsdo")) {
+        char gbuf[128];
+        gpsdo_format_status(gbuf, sizeof(gbuf));
+        cdc_write_str(gbuf);
+        return;
+    }
     if (streqi(argv[0], "cw"))   { g_tune_active = 1; cdc_printf("OK tune=ON (carrier_poll handles SPI)\r\n"); return; }
     if (streqi(argv[0], "stop")) { g_tune_active = 0; g_soft_ptt_key = 0; cdc_printf("OK tune=OFF\r\n"); return; }
 
@@ -2179,7 +2189,8 @@ int main(void) {
     gpio_init(PIN_NSS);   gpio_set_dir(PIN_NSS, GPIO_OUT);   gpio_put(PIN_NSS, 1);
     gpio_init(PIN_RX_EN); gpio_set_dir(PIN_RX_EN, GPIO_OUT); gpio_put(PIN_RX_EN, 0);
     gpio_init(PIN_TX_EN); gpio_set_dir(PIN_TX_EN, GPIO_OUT); gpio_put(PIN_TX_EN, 0);  // Start with TX disabled!
-    gpio_init(PIN_RESET); gpio_set_dir(PIN_RESET, GPIO_OUT); gpio_put(PIN_RESET, 1);
+    // SX1280 held in reset until GPSDO is ready (released after gpsdo_is_ready()).
+    gpio_init(PIN_RESET); gpio_set_dir(PIN_RESET, GPIO_OUT); gpio_put(PIN_RESET, 0);
     gpio_init(PIN_BUSY);  gpio_set_dir(PIN_BUSY, GPIO_IN);
 
     // --- Encoder + button GPIO init (input with pull-up, active LOW) ---
@@ -2195,6 +2206,37 @@ int main(void) {
     gpio_set_function(PIN_MOSI, GPIO_FUNC_SPI);
     gpio_set_function(PIN_SCK,  GPIO_FUNC_SPI);
 
+    // ---- GPSDO: SI5351 52 MHz (I2C0, GP0/GP1) + NEO-7M GPS (UART1, GP4/GP5) ----
+    // SX1280 NRESET is held LOW above. Released only after GPSDO is ready.
+    gpsdo_init();
+    {
+        uint32_t last_status_ms  = 0u;
+        uint8_t  si_warn_printed = 0u;
+        while (!gpsdo_is_ready()) {
+            gpsdo_task();
+            tud_task();
+            cdc_task();   // allow 'gpsdo' command while waiting
+            uint32_t now_ms = to_ms_since_boot(get_absolute_time());
+            if (tud_cdc_connected()) {
+                if (!si_warn_printed && !gpsdo_si5351_ok()) {
+                    si_warn_printed = 1u;
+                    cdc_write_str("GPSDO: WARNING — SI5351 not found (GP0/GP1).\r\n"
+                                  "GPSDO: SX1280 will NOT start until SI5351 is connected.\r\n");
+                }
+                if ((now_ms - last_status_ms) >= 2000u) {
+                    last_status_ms = now_ms;
+                    char gbuf[128];
+                    gpsdo_format_status(gbuf, sizeof(gbuf));
+                    tud_cdc_write(gbuf, strlen(gbuf));
+                    tud_cdc_write_flush();
+                }
+            }
+        }
+        if (tud_cdc_connected()) {
+            cdc_write_str("GPSDO: READY — 52 MHz locked, GPS time valid. Starting SX1280.\r\n");
+        }
+    }
+
     // --- OLED I2C init ---
     i2c_init(OLED_I2C, OLED_I2C_BAUD);
     gpio_set_function(PIN_OLED_SDA, GPIO_FUNC_I2C);
@@ -2207,7 +2249,7 @@ int main(void) {
     ssd1306_draw_string(0, 2, "Booting...");
     ssd1306_display(OLED_I2C);
 
-    // Hardware reset SX1280
+    // Release SX1280 from reset (was held LOW during GPSDO init) and initialise
     printf("[SX1280] Resetting...\n");
     gpio_put(PIN_RESET, 0); sleep_ms(2);
     gpio_put(PIN_RESET, 1); sleep_ms(10);
@@ -2394,6 +2436,14 @@ int main(void) {
             greeted = 1;
             cdc_write_str("\r\nSX1280_SDR control ready. Type 'help'.\r\n");
             cfg_print();
+        }
+
+        // GPSDO: service GPS UART and send periodic status (every 10 s).
+        gpsdo_task();
+        if (gpsdo_status_due()) {
+            char gbuf[128];
+            gpsdo_format_status(gbuf, sizeof(gbuf));
+            cdc_write_str(gbuf);
         }
 #endif
 

@@ -43,14 +43,16 @@ set(TINYUSB_FAMILY_DIR ${TINYUSB_DIR}/hw/bsp/rp2040)
 add_executable(SX1280SDR
     main.c
     ssd1306.c
+    gpsdo.c
     usb_descriptors.c
 )
 
 pico_set_program_name(SX1280SDR "SX1280SDR")
 pico_set_program_version(SX1280SDR "0.1")
 
-# UART/USB stdio (dla audio zwykle USB stdio wyłączone)
-pico_enable_stdio_uart(SX1280SDR 1)
+# UART0 stdio disabled — GP0/GP1 are used by GPSDO I2C0 (SI5351).
+# All control is via USB CDC (TinyUSB).
+pico_enable_stdio_uart(SX1280SDR 0)
 pico_enable_stdio_usb(SX1280SDR 0)
 
 # Pico SDK libs
@@ -62,6 +64,7 @@ target_link_libraries(SX1280SDR
         hardware_clocks
         hardware_i2c
         hardware_dma
+        hardware_uart
         pico_multicore
         hardware_pio
         hardware_pwm
