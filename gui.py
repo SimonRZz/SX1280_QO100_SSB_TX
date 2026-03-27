@@ -1009,23 +1009,26 @@ class SX1280ControlApp(ttk.Frame):
         ttk.Label(df, textvariable=self.gpsdo_loc_var, anchor="w",
                   font=("Consolas", 11)).grid(row=1, column=1, sticky="w")
 
-        ttk.Label(df, text="Satelliten verwendet:").grid(row=2, column=0, sticky="w", padx=(0, 8))
+        ttk.Label(df, text="Satellites used:").grid(row=2, column=0, sticky="w", padx=(0, 8))
         ttk.Label(df, textvariable=self.gpsdo_sats_var, anchor="w").grid(row=2, column=1, sticky="w")
 
-        ttk.Label(df, text="Satelliten sichtbar:").grid(row=3, column=0, sticky="w", padx=(0, 8))
+        ttk.Label(df, text="Satellites visible:").grid(row=3, column=0, sticky="w", padx=(0, 8))
         ttk.Label(df, textvariable=self.gpsdo_vis_var, anchor="w").grid(row=3, column=1, sticky="w")
 
-        ttk.Label(df, text="Höhe:").grid(row=4, column=0, sticky="w", padx=(0, 8))
+        ttk.Label(df, text="Altitude:").grid(row=4, column=0, sticky="w", padx=(0, 8))
         ttk.Label(df, textvariable=self.gpsdo_alt_var, anchor="w").grid(row=4, column=1, sticky="w")
 
         ttk.Label(df, text="CLK1 (52 MHz):").grid(row=5, column=0, sticky="w", padx=(0, 8))
         ttk.Label(df, textvariable=self.gpsdo_clk1_var, anchor="w").grid(row=5, column=1, sticky="w")
 
-        # Manual poll button
+        # Manual refresh button (sends 'gpsdo' command for an immediate status update,
+        # without waiting for the next 10 s periodic print)
         bf = ttk.Frame(tab)
         bf.grid(row=2, column=0, sticky="w", pady=(4, 0))
-        ttk.Button(bf, text="Poll GPSDO",
+        ttk.Button(bf, text="Refresh now",
                    command=lambda: self._send_cmd_safe("gpsdo")).pack(side="left")
+        ttk.Label(bf, text="  (requests immediate status update)",
+                  foreground="gray").pack(side="left")
 
     def _build_console_tab(self):
         tab = ttk.Frame(self.notebook, padding=10)
@@ -1377,27 +1380,27 @@ class SX1280ControlApp(ttk.Frame):
 
         # GPS signal / time-discipline label
         if clk1 == "fail":
-            self.gpsdo_sig_var.set("SI5351 nicht gefunden")
+            self.gpsdo_sig_var.set("SI5351 not found")
             self.gpsdo_sig_label.config(foreground="#cc0000")
         elif clk1 in ("lol", "los"):
-            self.gpsdo_sig_var.set(f"CLK1 Fehler: {clk1.upper()}")
+            self.gpsdo_sig_var.set(f"CLK1 error: {clk1.upper()}")
             self.gpsdo_sig_label.config(foreground="#cc0000")
         elif sig == "stable":
-            self.gpsdo_sig_var.set("GPS Signal stabil")
+            self.gpsdo_sig_var.set("GPS signal stable")
             self.gpsdo_sig_label.config(foreground="#007700")
         elif sig == "stale":
-            self.gpsdo_sig_var.set("GPS Signal kurz weg")
+            self.gpsdo_sig_var.set("GPS signal lost (stale)")
             self.gpsdo_sig_label.config(foreground="#cc4400")
         else:
-            self.gpsdo_sig_var.set("Warte auf Satelliten...")
+            self.gpsdo_sig_var.set("Waiting for satellite...")
             self.gpsdo_sig_label.config(foreground="#cc4400")
 
         # GPS position fix label
         if fix == "locked":
-            self.gpsdo_fix_var.set("Position gesperrt")
+            self.gpsdo_fix_var.set("Position locked")
             self.gpsdo_fix_label.config(foreground="#007700")
         else:
-            self.gpsdo_fix_var.set("Keine Position")
+            self.gpsdo_fix_var.set("No position fix")
             self.gpsdo_fix_label.config(foreground="#888888")
 
         self.gpsdo_sats_var.set(sats)
