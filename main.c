@@ -1712,9 +1712,9 @@ int main(void) {
                 }
             }
         }
-        // GPSDO ready: SI5351 52 MHz confirmed locked.
+        // GPSDO ready: SI5351 locked + GPS UTC received.
         if (tud_cdc_connected()) {
-            cdc_write_str("GPSDO: READY — SI5351 52 MHz locked. Starting SX1280.\r\n");
+            cdc_write_str("GPSDO: READY — 52 MHz locked, GPS time valid. Starting SX1280.\r\n");
         }
     }
 

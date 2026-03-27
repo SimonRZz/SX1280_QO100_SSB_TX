@@ -593,12 +593,14 @@ void gpsdo_task(void)
     const bool si_locked = s_clk1Ok &&
                            !(s_si5351_status & SI_STATUS_LOS_XTAL) &&
                            !(s_si5351_status & SI_STATUS_LOL_A);
-    // One satellite is enough for a valid time signal.
-    // The GPS TP 24 MHz runs regardless of fix — SI5351 lock alone is sufficient
-    // for a stable 52 MHz reference.  Start SX1280 as soon as PLL is confirmed.
-    if (!s_gpsdoReady && si_locked) {
+    // READY when SI5351 is locked AND GPS has provided at least one UTC timestamp.
+    // UTC appearing means the GPS module has disciplined its oscillator to at least
+    // one satellite — the TIMEPULSE 24 MHz is now frequency-accurate.
+    // Without UTC the GPS runs on its free-running TCXO (±2.5 ppm = ±6 kHz at 2.4 GHz).
+    const bool utc_valid = (s_utc[0] != '-');
+    if (!s_gpsdoReady && si_locked && utc_valid) {
         s_gpsdoReady = true;
-        printf("[GPSDO] READY — SI5351 52 MHz locked, starting SX1280\n");
+        printf("[GPSDO] READY — SI5351 locked + GPS UTC received, starting SX1280\n");
     }
 }
 
@@ -614,7 +616,8 @@ bool gpsdo_si5351_ok(void)
 
 int gpsdo_format_status(char *buf, size_t size)
 {
-    const bool     locked   = s_clk1Ok && (s_satsUsed >= 1);
+    // lock=1: SI5351 running + GPS UTC received (= 24 MHz disciplined)
+    const bool     locked   = s_clk1Ok && (s_utc[0] != '-');
     const uint32_t now      = gpsdo_ms();
     const bool     ggaFresh = (s_lastGgaMs != 0u) &&
                               ((now - s_lastGgaMs) <= GPSDO_GGA_STALE_MS);
