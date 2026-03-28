@@ -2207,6 +2207,18 @@ int main(void) {
     gpio_set_function(PIN_MOSI, GPIO_FUNC_SPI);
     gpio_set_function(PIN_SCK,  GPIO_FUNC_SPI);
 
+    // --- OLED I2C init (early — before GPSDO wait so display is always on) ---
+    i2c_init(OLED_I2C, OLED_I2C_BAUD);
+    gpio_set_function(PIN_OLED_SDA, GPIO_FUNC_I2C);
+    gpio_set_function(PIN_OLED_SCL, GPIO_FUNC_I2C);
+    gpio_pull_up(PIN_OLED_SDA);
+    gpio_pull_up(PIN_OLED_SCL);
+    ssd1306_init(OLED_I2C);
+    ssd1306_clear();
+    ssd1306_draw_string(0, 0, "SX1280 SSB TX");
+    ssd1306_draw_string(0, 2, "Waiting GPSDO..");
+    ssd1306_display(OLED_I2C);
+
     // ---- GPSDO: SI5351 52 MHz (I2C0, GP0/GP1) + NEO-7M GPS (UART1, GP4/GP5) ----
     // SX1280 NRESET is held LOW above. Released only after GPSDO is ready.
     gpsdo_init();
@@ -2237,18 +2249,6 @@ int main(void) {
             cdc_write_str("GPSDO: READY — 52 MHz locked, GPS time valid. Starting SX1280.\r\n");
         }
     }
-
-    // --- OLED I2C init ---
-    i2c_init(OLED_I2C, OLED_I2C_BAUD);
-    gpio_set_function(PIN_OLED_SDA, GPIO_FUNC_I2C);
-    gpio_set_function(PIN_OLED_SCL, GPIO_FUNC_I2C);
-    gpio_pull_up(PIN_OLED_SDA);
-    gpio_pull_up(PIN_OLED_SCL);
-    ssd1306_init(OLED_I2C);
-    ssd1306_clear();
-    ssd1306_draw_string(0, 0, "SX1280 SSB TX");
-    ssd1306_draw_string(0, 2, "Booting...");
-    ssd1306_display(OLED_I2C);
 
     // Release SX1280 from reset (was held LOW during GPSDO init) and initialise
     printf("[SX1280] Resetting...\n");
