@@ -109,7 +109,7 @@ static const uint32_t PIN_TCXO_EN = 22;
 
 // ---------------- OLED I2C pins ----------------
 #define OLED_I2C       i2c1
-#define OLED_I2C_BAUD  400000
+#define OLED_I2C_BAUD  100000  // 100 kHz — reliable with Pico internal pull-ups (~50 kΩ)
 static const uint32_t PIN_OLED_SDA = 6;
 static const uint32_t PIN_OLED_SCL = 7;
 
@@ -2208,6 +2208,7 @@ int main(void) {
     gpio_set_function(PIN_SCK,  GPIO_FUNC_SPI);
 
     // --- OLED I2C init (early — before GPSDO wait so display is always on) ---
+    sleep_ms(20);  // Allow display VCC to stabilise before sending I2C init sequence
     i2c_init(OLED_I2C, OLED_I2C_BAUD);
     gpio_set_function(PIN_OLED_SDA, GPIO_FUNC_I2C);
     gpio_set_function(PIN_OLED_SCL, GPIO_FUNC_I2C);
