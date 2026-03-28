@@ -78,7 +78,7 @@ MORSE_CODE[' '] = ' '  # word space
 
 READABLE_PINS = ['CTS', 'DSR', 'RI', 'CD']
 
-QO100_LO_HZ = 8_089_497_200  # Measured QO-100 transponder LO offset, nominal 8089.5 MHz
+QO100_LO_HZ = 8_089_500_200  # Measured QO-100 transponder LO offset, nominal 8089.5 MHz
 
 
 @dataclass
