@@ -429,15 +429,18 @@ class Keyer:
                 self._sym_buf += '.'
                 self._was_dit = True
                 if self.cb_key_off: self.cb_key_off()
+                # Capture same-paddle level at element end for hold-to-repeat.
+                # This mirrors the WB4VVF/uSDX sticky-latch approach: latch is
+                # cleared at element START (_send_dit clears _pend_dit), then
+                # re-latched here if the paddle is still held.
+                if dit: self._pend_dit = True
                 if self.mode == self.IAMBIC_A:
+                    # A: clear memory for any paddle released at element end
                     if not dit: self._pend_dit = False
                     if not dah: self._pend_dah = False
                 self._state = 'IEL'; self._t0 = now
             elif self.mode == self.IAMBIC_B and dah:
-                # Iambic B squeeze latch: set pending flag as long as opposite
-                # paddle is held during the element – not just on rising edge.
-                # Ensures the next dah isn't missed if the paddle is released
-                # just before IEL runs its level check.
+                # Iambic B squeeze latch: opposite paddle held during element
                 self._pend_dah = True
             return True
 
@@ -446,6 +449,8 @@ class Keyer:
                 self._sym_buf += '-'
                 self._was_dit = False
                 if self.cb_key_off: self.cb_key_off()
+                # Capture same-paddle level at element end for hold-to-repeat
+                if dah: self._pend_dah = True
                 if self.mode == self.IAMBIC_A:
                     if not dit: self._pend_dit = False
                     if not dah: self._pend_dah = False
@@ -506,10 +511,12 @@ class Keyer:
         return False
 
     def _send_dit(self, now):
+        self._pend_dit = False   # clear latch at element start (WB4VVF style)
         self._state = 'DIT'; self._t0 = now
         if self.cb_key_on: self.cb_key_on()
 
     def _send_dah(self, now):
+        self._pend_dah = False   # clear latch at element start (WB4VVF style)
         self._state = 'DAH'; self._t0 = now
         if self.cb_key_on: self.cb_key_on()
 
