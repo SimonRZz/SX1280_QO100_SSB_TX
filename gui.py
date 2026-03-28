@@ -681,8 +681,6 @@ class SX1280ControlApp(ttk.Frame):
                 except: pass
         self.keyer.cb_key_on  = _on_key_on
         self.keyer.cb_key_off = _on_key_off
-        self.keyer.cb_char    = self._cw_on_char
-        self.keyer.cb_word_sp = self._cw_on_word_space
 
         self._create_variables()
         self._build_ui()
@@ -1037,10 +1035,12 @@ class SX1280ControlApp(ttk.Frame):
 
         # === CW Text senden ===
         tf = ttk.LabelFrame(tab, text="Text als CW senden", padding=8)
-        tf.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        tf.grid(row=3, column=1, sticky="nsew", pady=(0, 8))
         tf.columnconfigure(0, weight=1)
-        self.cw_text_entry = ttk.Entry(tf, textvariable=self.cw_text_var)
-        self.cw_text_entry.grid(row=0, column=0, sticky="ew", padx=(0, 5))
+        tf.rowconfigure(0, weight=1)
+        self.cw_text_entry = ttk.Entry(tf, textvariable=self.cw_text_var,
+                                       font=("TkDefaultFont", 13))
+        self.cw_text_entry.grid(row=0, column=0, sticky="ew", padx=(0, 5), ipady=6)
         self.cw_text_entry.bind("<Return>", lambda _: self._start_cw_text())
         tbf2 = ttk.Frame(tf)
         tbf2.grid(row=0, column=1)
@@ -1063,19 +1063,6 @@ class SX1280ControlApp(ttk.Frame):
                                     command=self._cw_toggle_tx)
         self.cw_tx_btn.pack(fill='x', pady=(4, 0))
 
-        df = ttk.LabelFrame(tab, text="Dekodierter Text", padding=8)
-        df.grid(row=3, column=1, sticky="nsew", pady=(0, 8))
-        df.rowconfigure(0, weight=1)
-        df.columnconfigure(0, weight=1)
-        self.cw_dec_text = tk.Text(df, font=("Consolas", 14, "bold"),
-                                    bg="#f0f8e8", fg="#006600",
-                                    wrap="word", height=6, state="disabled")
-        sb = ttk.Scrollbar(df, command=self.cw_dec_text.yview)
-        self.cw_dec_text.config(yscrollcommand=sb.set)
-        self.cw_dec_text.grid(row=0, column=0, sticky="nsew")
-        sb.grid(row=0, column=1, sticky="ns")
-        ttk.Button(df, text="Leeren",
-                   command=self._cw_clear_dec).grid(row=1, column=0, sticky="w", pady=3)
         ttk.Label(tab, text="ESC = Abbruch  |  Pin → Taste → GND  |  Active Low",
                   foreground="gray").grid(row=4, column=0, columnspan=2, pady=2)
 
@@ -1255,24 +1242,6 @@ class SX1280ControlApp(ttk.Frame):
         sym = self.keyer.get_sym_buf()
         self.cw_sym_lbl.config(text=sym)
         self.master.after(50, self._cw_gui_update)
-
-    def _cw_on_char(self, ch):
-        self.master.after(0, self._cw_append_dec, ch)
-
-    def _cw_on_word_space(self):
-        self.master.after(0, self._cw_append_dec, ' ')
-
-    def _cw_append_dec(self, ch):
-        self.cw_dec_text.config(state='normal')
-        self.cw_dec_text.insert('end', ch)
-        self.cw_dec_text.see('end')
-        self.cw_dec_text.config(state='disabled')
-
-    def _cw_clear_dec(self):
-        self.cw_dec_text.config(state='normal')
-        self.cw_dec_text.delete('1.0', 'end')
-        self.cw_dec_text.config(state='disabled')
-        self.cw_sym_lbl.config(text='')
 
     def _cw_on_esc(self, _=None):
         self._abort_cw_text()
