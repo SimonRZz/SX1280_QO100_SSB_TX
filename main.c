@@ -117,7 +117,8 @@ static const uint32_t PIN_OLED_SCL = 7;
 static const uint32_t PIN_ENC_A   = 2;   // Encoder phase A
 static const uint32_t PIN_ENC_B   = 3;   // Encoder phase B
 static const uint32_t PIN_ENC_OK  = 4;   // Encoder push button
-static const uint32_t PIN_PTT_KEY = 5;   // PTT / CW key
+static const uint32_t PIN_KEY_DIT = 9;   // CW dit paddle (active LOW, internal pull-up)
+static const uint32_t PIN_KEY_DAH = 10;  // CW dah paddle (active LOW, internal pull-up)
 
 // ---------------- SPI config ----------------
 #define SX_SPI spi0
@@ -152,7 +153,7 @@ static volatile int8_t g_tx_power_max_dbm = PWR_MAX_DBM;  // Runtime TX power li
 static volatile uint8_t g_tx_enabled = 1;  // TX enable flag (for GUI TX button)
 static volatile uint8_t g_tx_mode = 0;     // 0 = USB (SSB), 1 = CW
 static volatile uint8_t g_tune_active = 0; // 1 = TUNE carrier active
-static volatile uint8_t g_ptt_key = 0;     // 1 = PTT/KEY pressed (live)
+static volatile uint8_t g_ptt_key = 0;     // 1 = dit or dah paddle pressed (live)
 static volatile uint8_t g_soft_ptt_key = 0; // Software PTT/KEY via CDC "key 0|1" (GUI CW keyer)
 
 // --- Encoder UI state ---
@@ -1906,14 +1907,13 @@ static void button_poll(void) {
         }
     }
 
-    // --- PTT/KEY button ---
-    uint8_t ptt_raw = gpio_get(PIN_PTT_KEY) ? 0 : 1;  // Active LOW
+    // --- CW dit/dah paddles (GP9 / GP10, active LOW) ---
+    uint8_t ptt_raw = (!gpio_get(PIN_KEY_DIT)) | (!gpio_get(PIN_KEY_DAH));
 
     if (ptt_raw != ptt_last_state && (now_ms - ptt_debounce_ms) >= DEBOUNCE_MS) {
         ptt_debounce_ms = now_ms;
         ptt_last_state = ptt_raw;
         g_ptt_key = ptt_raw;
-        // CW keying is handled by Core1 directly via g_ptt_key — no action here
     }
 }
 
@@ -2197,7 +2197,8 @@ int main(void) {
     gpio_init(PIN_ENC_A);   gpio_set_dir(PIN_ENC_A, GPIO_IN);   gpio_pull_up(PIN_ENC_A);
     gpio_init(PIN_ENC_B);   gpio_set_dir(PIN_ENC_B, GPIO_IN);   gpio_pull_up(PIN_ENC_B);
     gpio_init(PIN_ENC_OK);  gpio_set_dir(PIN_ENC_OK, GPIO_IN);  gpio_pull_up(PIN_ENC_OK);
-    gpio_init(PIN_PTT_KEY); gpio_set_dir(PIN_PTT_KEY, GPIO_IN); gpio_pull_up(PIN_PTT_KEY);
+    gpio_init(PIN_KEY_DIT); gpio_set_dir(PIN_KEY_DIT, GPIO_IN); gpio_pull_up(PIN_KEY_DIT);
+    gpio_init(PIN_KEY_DAH); gpio_set_dir(PIN_KEY_DAH, GPIO_IN); gpio_pull_up(PIN_KEY_DAH);
     // Initialize encoder last state
     enc_last_ab = ((gpio_get(PIN_ENC_A) ? 0 : 1) << 1) | (gpio_get(PIN_ENC_B) ? 0 : 1);
 
