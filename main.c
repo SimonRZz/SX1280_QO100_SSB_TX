@@ -116,9 +116,9 @@ static const uint32_t PIN_OLED_SCL = 7;
 // ---------------- Encoder + buttons ----------------
 static const uint32_t PIN_ENC_A   = 2;   // Encoder phase A
 static const uint32_t PIN_ENC_B   = 3;   // Encoder phase B
-static const uint32_t PIN_ENC_OK  = 4;   // Encoder push button
+static const uint32_t PIN_ENC_OK  = 10;  // Encoder push button (GP4 occupied by GPSDO UART1 TX)
 static const uint32_t PIN_KEY_DIT = 9;   // CW dit paddle (active LOW, internal pull-up)
-static const uint32_t PIN_KEY_DAH = 10;  // CW dah paddle (active LOW, internal pull-up)
+static const uint32_t PIN_KEY_DAH = 11;  // CW dah paddle (active LOW, internal pull-up; GP10 used by ENC_OK)
 
 // ---------------- SPI config ----------------
 #define SX_SPI spi0
@@ -1907,7 +1907,7 @@ static void button_poll(void) {
         }
     }
 
-    // --- CW dit/dah paddles (GP9 / GP10, active LOW) ---
+    // --- CW dit/dah paddles (GP9 / GP11, active LOW) ---
     uint8_t ptt_raw = (!gpio_get(PIN_KEY_DIT)) | (!gpio_get(PIN_KEY_DAH));
 
     if (ptt_raw != ptt_last_state && (now_ms - ptt_debounce_ms) >= DEBOUNCE_MS) {
