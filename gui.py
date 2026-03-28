@@ -457,8 +457,8 @@ class Keyer:
 
         elif self._state == 'IEL':
             if el >= self.iel_ms:
-                have_dit = self._pend_dit or dit
-                have_dah = self._pend_dah or dah
+                have_dit = self._pend_dit
+                have_dah = self._pend_dah
                 if have_dit and have_dah:
                     # Squeeze: alternate based on what was last sent
                     if self._was_dit:
