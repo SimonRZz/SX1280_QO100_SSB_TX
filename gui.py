@@ -78,6 +78,8 @@ MORSE_CODE[' '] = ' '  # word space
 
 READABLE_PINS = ['CTS', 'DSR', 'RI', 'CD']
 
+QO100_LO_HZ = 8_089_497_200  # Measured QO-100 transponder LO offset, nominal 8089.5 MHz
+
 
 @dataclass
 class TxConfig:
@@ -1506,7 +1508,7 @@ class SX1280ControlApp(ttk.Frame):
         try:    hz = float(self.freq_khz_var.get()) * 1000
         except: hz = self.config.freq_hz
         self.freq_mhz_label.config(text=f"{hz/1_000_000:.4f} MHz ↑")
-        self.downlink_label.config(text=f"{(hz+8089_500_000)/1_000_000:.4f} MHz ↓")
+        self.downlink_label.config(text=f"{(hz+QO100_LO_HZ)/1_000_000:.4f} MHz ↓")
 
     def _on_global_scroll(self, event):
         if not self.scroll_tune_enabled_var.get(): return
