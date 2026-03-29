@@ -329,6 +329,10 @@ class Keyer:
     IAMBIC_A = 1
     IAMBIC_B = 2
 
+    # Contact-bounce filter: input must be stable for this many ticks (2 ms each)
+    # before a state change is accepted.  3 ticks = 6 ms covers typical paddle bounce.
+    _DEBOUNCE_TICKS = 3
+
     def __init__(self):
         self.mode       = self.IAMBIC_A
         self.wpm        = 18
@@ -340,9 +344,12 @@ class Keyer:
         self._pend_dit  = False
         self._pend_dah  = False
         self._was_dit   = False
-        # FIX A: edge-detection state to prevent double registration
-        self._prev_dit  = False
-        self._prev_dah  = False
+        # Debounced paddle state (what _iambic sees)
+        self._dit_stable = False
+        self._dah_stable = False
+        # How many consecutive ticks the raw input has differed from stable state
+        self._dit_db_cnt = 0
+        self._dah_db_cnt = 0
         self.cb_key_on  = None
         self.cb_key_off = None
         self.cb_char    = None
@@ -371,17 +378,32 @@ class Keyer:
         try:
             with self._lock:
                 now = time.monotonic() * 1000.0
-                # FIX A: rising-edge detection – set pending only on key-press transition,
-                # not on every tick while the key is held (prevents double registration)
-                if dit_in and not self._prev_dit:
-                    self._pend_dit = True
-                if dah_in and not self._prev_dah:
-                    self._pend_dah = True
-                self._prev_dit = dit_in
-                self._prev_dah = dah_in
+
+                # --- debounce dit ---
+                if dit_in != self._dit_stable:
+                    self._dit_db_cnt += 1
+                    if self._dit_db_cnt >= self._DEBOUNCE_TICKS:
+                        self._dit_stable = dit_in
+                        self._dit_db_cnt = 0
+                        if dit_in:          # rising edge on debounced signal
+                            self._pend_dit = True
+                else:
+                    self._dit_db_cnt = 0
+
+                # --- debounce dah ---
+                if dah_in != self._dah_stable:
+                    self._dah_db_cnt += 1
+                    if self._dah_db_cnt >= self._DEBOUNCE_TICKS:
+                        self._dah_stable = dah_in
+                        self._dah_db_cnt = 0
+                        if dah_in:          # rising edge on debounced signal
+                            self._pend_dah = True
+                else:
+                    self._dah_db_cnt = 0
+
                 if self.mode == self.STRAIGHT:
-                    return self._straight(dit_in, now)
-                return self._iambic(dit_in, dah_in, now)
+                    return self._straight(self._dit_stable, now)
+                return self._iambic(self._dit_stable, self._dah_stable, now)
         except:
             return False
 
@@ -534,8 +556,8 @@ class Keyer:
                 self._state = 'IDLE'
                 self._sym_buf = ''
                 self._pend_dit = self._pend_dah = False
-                # FIX A: also reset edge-detection state on keyer reset
-                self._prev_dit = self._prev_dah = False
+                self._dit_stable = self._dah_stable = False
+                self._dit_db_cnt = self._dah_db_cnt = 0
                 if self.cb_key_off: self.cb_key_off()
         except:
             pass
