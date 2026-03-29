@@ -511,12 +511,14 @@ class Keyer:
         return False
 
     def _send_dit(self, now):
-        self._pend_dit = False   # clear latch at element start (WB4VVF style)
+        self._pend_dit = False   # clear BOTH latches at element start
+        self._pend_dah = False   # mirrors uSDX KEYED_PREP: keyerControl &= ~(DIT_L|DAH_L)
         self._state = 'DIT'; self._t0 = now
         if self.cb_key_on: self.cb_key_on()
 
     def _send_dah(self, now):
-        self._pend_dah = False   # clear latch at element start (WB4VVF style)
+        self._pend_dit = False   # clear BOTH latches at element start
+        self._pend_dah = False   # mirrors uSDX KEYED_PREP: keyerControl &= ~(DIT_L|DAH_L)
         self._state = 'DAH'; self._t0 = now
         if self.cb_key_on: self.cb_key_on()
 
