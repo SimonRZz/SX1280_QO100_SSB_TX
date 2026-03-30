@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 SX1280 QO-100 SSB TX Control GUI
-Original: SP8ESA  |  CW Keyer Tab: erweitert
+Original: SP8ESA  |  CW Keyer Tab: erweitert  |  v2.0.0 Status Sync
 pip install pyserial pyaudio numpy
 """
 
@@ -72,14 +72,20 @@ MORSE_TABLE = {
     '.-..-.':'"', '.--.-.':'@',
 }
 
+# Inverse table: char → morse code string (for text-to-CW sending)
+MORSE_CODE = {v: k for k, v in MORSE_TABLE.items()}
+MORSE_CODE[' '] = ' '  # word space
+
 READABLE_PINS = ['CTS', 'DSR', 'RI', 'CD']
+
+QO100_LO_HZ = 8_089_500_100  # Measured QO-100 transponder LO offset, nominal 8089.5 MHz
 
 
 @dataclass
 class TxConfig:
     freq_hz: float = 2_400_400_000.0
     ppm: float = 0.0
-    tx_power_dbm: int = 13
+    tx_power_dbm: int = 4
     tx_enabled: bool = True
     enable_bp: bool = True
     enable_eq: bool = True
@@ -190,12 +196,15 @@ class AudioEngine:
         except Exception as e:
             print(f"Audio init: {e}")
 
+    _CHUNK    = 256          # samples per buffer (≈5.8 ms @ 44100 Hz)
+    _RAMP_MS  = 8            # attack/release ramp length in milliseconds
+
     def _open_stream(self):
         try:
             return self.pa.open(
                 format=pyaudio.paInt16, channels=1,
                 rate=self.sample_rate, output=True,
-                frames_per_buffer=512)
+                frames_per_buffer=self._CHUNK)
         except Exception:
             # pa selbst neu initialisieren
             try: self.pa.terminate()
@@ -205,7 +214,7 @@ class AudioEngine:
                 return self.pa.open(
                     format=pyaudio.paInt16, channels=1,
                     rate=self.sample_rate, output=True,
-                    frames_per_buffer=512)
+                    frames_per_buffer=self._CHUNK)
             except Exception:
                 return None
 
@@ -220,18 +229,24 @@ class AudioEngine:
                 time.sleep(0.5)
 
     def _stream_loop(self, stream):
-        chunk = 512
-        current_vol = 0.0
-        phase = 0
+        chunk        = self._CHUNK
+        ramp_samples = max(1, int(self.sample_rate * self._RAMP_MS / 1000))
+        max_step     = chunk / ramp_samples   # max volume change per chunk
+        current_vol  = 0.0
+        phase        = 0
         try:
             while self._running:
                 with self._lock:
                     target = self.volume if self._playing else 0.0
                     freq   = self.tone_freq
-                # FIX C: coefficient 0.5 (was 0.12) – tail ≈46 ms instead of ≈200 ms
-                current_vol += (target - current_vol) * 0.5
-                t = (np.arange(chunk) + phase) / self.sample_rate
-                s = (np.sin(2 * np.pi * freq * t) * current_vol * 32767).astype(np.int16)
+                # Linear ramp: spread the volume change evenly across the chunk
+                # so there are no amplitude steps at chunk boundaries → no clicks.
+                delta   = max(min(target - current_vol, max_step), -max_step)
+                env     = np.linspace(current_vol, current_vol + delta,
+                                      chunk, endpoint=False, dtype=np.float32)
+                current_vol += delta
+                t = (np.arange(chunk, dtype=np.float32) + phase) / self.sample_rate
+                s = (np.sin(2 * np.pi * freq * t) * env * 32767).astype(np.int16)
                 phase = (phase + chunk) % self.sample_rate
                 try:
                     stream.write(s.tobytes(), exception_on_underflow=False)
@@ -314,9 +329,14 @@ class Keyer:
     IAMBIC_A = 1
     IAMBIC_B = 2
 
+    # Contact-bounce filter: input must be stable for this many ticks (2 ms each)
+    # before a state change is accepted.  3 ticks = 6 ms covers typical paddle bounce.
+    _DEBOUNCE_TICKS = 3
+
     def __init__(self):
         self.mode       = self.IAMBIC_A
-        self.wpm        = 20
+        self.wpm        = 18
+        self.weight     = 3.0
         self._update_timing()
         self._state     = 'IDLE'
         self._t0        = 0.0
@@ -324,9 +344,12 @@ class Keyer:
         self._pend_dit  = False
         self._pend_dah  = False
         self._was_dit   = False
-        # FIX A: edge-detection state to prevent double registration
-        self._prev_dit  = False
-        self._prev_dah  = False
+        # Debounced paddle state (what _iambic sees)
+        self._dit_stable = False
+        self._dah_stable = False
+        # How many consecutive ticks the raw input has differed from stable state
+        self._dit_db_cnt = 0
+        self._dah_db_cnt = 0
         self.cb_key_on  = None
         self.cb_key_off = None
         self.cb_char    = None
@@ -335,13 +358,17 @@ class Keyer:
 
     def _update_timing(self):
         self.dit_ms = 1200.0 / self.wpm
-        self.dah_ms = self.dit_ms * 3.0
+        self.dah_ms = self.dit_ms * self.weight
         self.iel_ms = self.dit_ms
         self.ich_ms = self.dit_ms * 3.0
         self.iwd_ms = self.dit_ms * 7.0
 
     def set_wpm(self, w):
         self.wpm = max(5, min(60, int(w)))
+        self._update_timing()
+
+    def set_weight(self, w):
+        self.weight = max(2.0, min(5.0, float(w)))
         self._update_timing()
 
     def set_mode(self, m):
@@ -351,17 +378,32 @@ class Keyer:
         try:
             with self._lock:
                 now = time.monotonic() * 1000.0
-                # FIX A: rising-edge detection – set pending only on key-press transition,
-                # not on every tick while the key is held (prevents double registration)
-                if dit_in and not self._prev_dit:
-                    self._pend_dit = True
-                if dah_in and not self._prev_dah:
-                    self._pend_dah = True
-                self._prev_dit = dit_in
-                self._prev_dah = dah_in
+
+                # --- debounce dit ---
+                if dit_in != self._dit_stable:
+                    self._dit_db_cnt += 1
+                    if self._dit_db_cnt >= self._DEBOUNCE_TICKS:
+                        self._dit_stable = dit_in
+                        self._dit_db_cnt = 0
+                        if dit_in:          # rising edge on debounced signal
+                            self._pend_dit = True
+                else:
+                    self._dit_db_cnt = 0
+
+                # --- debounce dah ---
+                if dah_in != self._dah_stable:
+                    self._dah_db_cnt += 1
+                    if self._dah_db_cnt >= self._DEBOUNCE_TICKS:
+                        self._dah_stable = dah_in
+                        self._dah_db_cnt = 0
+                        if dah_in:          # rising edge on debounced signal
+                            self._pend_dah = True
+                else:
+                    self._dah_db_cnt = 0
+
                 if self.mode == self.STRAIGHT:
-                    return self._straight(dit_in, now)
-                return self._iambic(dit_in, dah_in, now)
+                    return self._straight(self._dit_stable, now)
+                return self._iambic(self._dit_stable, self._dah_stable, now)
         except:
             return False
 
@@ -409,10 +451,19 @@ class Keyer:
                 self._sym_buf += '.'
                 self._was_dit = True
                 if self.cb_key_off: self.cb_key_off()
+                # Capture same-paddle level at element end for hold-to-repeat.
+                # This mirrors the WB4VVF/uSDX sticky-latch approach: latch is
+                # cleared at element START (_send_dit clears _pend_dit), then
+                # re-latched here if the paddle is still held.
+                if dit: self._pend_dit = True
                 if self.mode == self.IAMBIC_A:
+                    # A: clear memory for any paddle released at element end
                     if not dit: self._pend_dit = False
                     if not dah: self._pend_dah = False
                 self._state = 'IEL'; self._t0 = now
+            elif self.mode == self.IAMBIC_B and dah:
+                # Iambic B squeeze latch: opposite paddle held during element
+                self._pend_dah = True
             return True
 
         elif self._state == 'DAH':
@@ -420,18 +471,30 @@ class Keyer:
                 self._sym_buf += '-'
                 self._was_dit = False
                 if self.cb_key_off: self.cb_key_off()
+                # Capture same-paddle level at element end for hold-to-repeat
+                if dah: self._pend_dah = True
                 if self.mode == self.IAMBIC_A:
                     if not dit: self._pend_dit = False
                     if not dah: self._pend_dah = False
                 self._state = 'IEL'; self._t0 = now
+            elif self.mode == self.IAMBIC_B and dit:
+                # Iambic B squeeze latch (symmetric for dit side)
+                self._pend_dit = True
             return True
 
         elif self._state == 'IEL':
             if el >= self.iel_ms:
-                # IEL still checks current key state directly for squeeze-keying auto-repeat
-                if self._pend_dah or dah:
+                have_dit = self._pend_dit
+                have_dah = self._pend_dah
+                if have_dit and have_dah:
+                    # Squeeze: alternate based on what was last sent
+                    if self._was_dit:
+                        self._send_dah(now); self._pend_dah = False
+                    else:
+                        self._send_dit(now); self._pend_dit = False
+                elif have_dah:
                     self._send_dah(now); self._pend_dah = False
-                elif self._pend_dit or dit:
+                elif have_dit:
                     self._send_dit(now); self._pend_dit = False
                 else:
                     self._state = 'ICH'; self._t0 = now
@@ -470,10 +533,14 @@ class Keyer:
         return False
 
     def _send_dit(self, now):
+        self._pend_dit = False   # clear BOTH latches at element start
+        self._pend_dah = False   # mirrors uSDX KEYED_PREP: keyerControl &= ~(DIT_L|DAH_L)
         self._state = 'DIT'; self._t0 = now
         if self.cb_key_on: self.cb_key_on()
 
     def _send_dah(self, now):
+        self._pend_dit = False   # clear BOTH latches at element start
+        self._pend_dah = False   # mirrors uSDX KEYED_PREP: keyerControl &= ~(DIT_L|DAH_L)
         self._state = 'DAH'; self._t0 = now
         if self.cb_key_on: self.cb_key_on()
 
@@ -489,8 +556,8 @@ class Keyer:
                 self._state = 'IDLE'
                 self._sym_buf = ''
                 self._pend_dit = self._pend_dah = False
-                # FIX A: also reset edge-detection state on keyer reset
-                self._prev_dit = self._prev_dah = False
+                self._dit_stable = self._dah_stable = False
+                self._dit_db_cnt = self._dah_db_cnt = 0
                 if self.cb_key_off: self.cb_key_off()
         except:
             pass
@@ -547,6 +614,8 @@ class LabeledScale(ttk.Frame):
         self.value_label.grid(row=0, column=2, sticky="e")
         self._update_value_label()
         self.scale.bind("<ButtonRelease-1>", self._on_release)
+        # Auto-update label on programmatic .set() (e.g. from !S status push)
+        var.trace_add("write", lambda *_: self._update_value_label())
 
     def _on_scale(self, _val):
         self._update_value_label()
@@ -564,6 +633,43 @@ class LabeledScale(ttk.Frame):
         self.value_label.config(text=text)
 
 
+class ScrollableFrame(ttk.Frame):
+    """Frame with vertical scrollbar – used for the RF & DSP tab."""
+    def __init__(self, parent, **kwargs):
+        super().__init__(parent, **kwargs)
+        self.canvas = tk.Canvas(self, highlightthickness=0, borderwidth=0)
+        self.scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        self.inner = ttk.Frame(self.canvas)
+        self.inner.bind("<Configure>",   self._on_inner_cfg)
+        self.canvas.bind("<Configure>",  self._on_canvas_cfg)
+        self._win = self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
+        self.canvas.configure(yscrollcommand=self.scrollbar.set)
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.scrollbar.pack(side="right", fill="y")
+        self.canvas.bind("<Enter>", lambda _: self._bind_wheel())
+        self.canvas.bind("<Leave>", lambda _: self._unbind_wheel())
+
+    def _on_inner_cfg(self, _e):
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+
+    def _on_canvas_cfg(self, e):
+        self.canvas.itemconfig(self._win, width=e.width)
+
+    def _bind_wheel(self):
+        self.canvas.bind_all("<Button-4>",   self._scroll)
+        self.canvas.bind_all("<Button-5>",   self._scroll)
+        self.canvas.bind_all("<MouseWheel>", self._scroll)
+
+    def _unbind_wheel(self):
+        for ev in ("<Button-4>", "<Button-5>", "<MouseWheel>"):
+            self.canvas.unbind_all(ev)
+
+    def _scroll(self, e):
+        if   e.num == 4: self.canvas.yview_scroll(-3, "units")
+        elif e.num == 5: self.canvas.yview_scroll( 3, "units")
+        elif hasattr(e, 'delta'): self.canvas.yview_scroll(-1*(e.delta//120), "units")
+
+
 class SX1280ControlApp(ttk.Frame):
     FREQ_MIN_HZ = 2_400_000_000
     FREQ_MAX_HZ = 2_400_500_000
@@ -577,11 +683,16 @@ class SX1280ControlApp(ttk.Frame):
         self.debounced_send = Debouncer(master, 150, self._send_cmd_safe)
         self.freq_debouncer = Debouncer(master, 200, self._send_freq)
 
+        self._status_updating = False  # guard against feedback loops during !S sync
+        self._heartbeat_id   = None    # after() id for periodic status requests
+
         self.audio       = AudioEngine()
         self.keyer       = Keyer()
         self.key_reader  = None
-        self._cw_running = False
-        self._cw_thread  = None
+        self._cw_running      = False
+        self._cw_thread       = None
+        self._cw_text_thread  = None
+        self._cw_stop_evt     = threading.Event()
         # FIX B: shared key state written only by _cw_loop (background thread),
         # read only by _cw_gui_update (GUI thread) – eliminates serial port race.
         self._cw_key_state = (False, False)
@@ -601,8 +712,6 @@ class SX1280ControlApp(ttk.Frame):
                 except: pass
         self.keyer.cb_key_on  = _on_key_on
         self.keyer.cb_key_off = _on_key_off
-        self.keyer.cb_char    = self._cw_on_char
-        self.keyer.cb_word_sp = self._cw_on_word_space
 
         self._create_variables()
         self._build_ui()
@@ -620,8 +729,10 @@ class SX1280ControlApp(ttk.Frame):
     def _create_variables(self):
         self.port_var    = tk.StringVar()
         self.status_var  = tk.StringVar(value="⚫ Disconnected")
-        self.freq_mhz_var = tk.DoubleVar(value=self.config.freq_hz / 1_000_000)
-        self.freq_hz_var  = tk.StringVar(value=str(self.config.freq_hz))
+        self.mode_var    = tk.StringVar(value="usb")
+        self.tune_var    = tk.BooleanVar(value=False)
+        self.freq_mhz_var  = tk.DoubleVar(value=self.config.freq_hz / 1_000_000)
+        self.freq_khz_var  = tk.StringVar(value=f"{self.config.freq_hz / 1000:.1f}")
         self.ppm_var      = tk.DoubleVar(value=0.0)
         self.txpwr_var    = tk.IntVar(value=self.config.tx_power_dbm)
         self.tx_enabled_var          = tk.BooleanVar(value=True)
@@ -647,14 +758,25 @@ class SX1280ControlApp(ttk.Frame):
         self.amp_min_a_var   = tk.StringVar(value=f"{self.config.amp_min_a:.9f}")
         self.cw_port_var        = tk.StringVar()
         self.cw_baud_var        = tk.StringVar(value='9600')
-        self.cw_mode_var        = tk.StringVar(value='Iambic A')
+        self.cw_mode_var        = tk.StringVar(value='Iambic B')
         self.cw_dit_var         = tk.StringVar(value='CTS')
-        self.cw_dah_var         = tk.StringVar(value='DSR')
-        self.cw_active_low_var  = tk.BooleanVar(value=True)
-        self.cw_wpm_var         = tk.DoubleVar(value=20)
+        self.cw_dah_var         = tk.StringVar(value='CD')
+        self.cw_active_low_var  = tk.BooleanVar(value=False)
+        self.cw_wpm_var         = tk.DoubleVar(value=18)
         self.cw_tone_var        = tk.DoubleVar(value=700)
         self.cw_vol_var         = tk.DoubleVar(value=70)
-        self.cw_conn_status_var = tk.StringVar(value='● GETRENNT')
+        self.cw_conn_status_var = tk.StringVar(value='● DISCONNECTED')
+        self.cw_text_var        = tk.StringVar(value='CQ CQ DE SX1280')
+        self.cw_weight_var      = tk.DoubleVar(value=3.0)
+        # GPSDO state
+        self.gpsdo_sig_var  = tk.StringVar(value="--")
+        self.gpsdo_fix_var  = tk.StringVar(value="--")
+        self.gpsdo_sats_var = tk.StringVar(value="--")
+        self.gpsdo_vis_var  = tk.StringVar(value="--")
+        self.gpsdo_clk1_var = tk.StringVar(value="--")
+        self.gpsdo_utc_var  = tk.StringVar(value="--:--:--")
+        self.gpsdo_loc_var  = tk.StringVar(value="------")
+        self.gpsdo_alt_var  = tk.StringVar(value="--")
 
     def _build_ui(self):
         self.master.title("SX1280 QO-100 SSB TX Control")
@@ -668,6 +790,7 @@ class SX1280ControlApp(ttk.Frame):
         self._build_dsp_tab()
         self._build_tx_tab()
         self._build_cw_tab()
+        self._build_gpsdo_tab()
         self._build_console_tab()
 
     def _build_connection_bar(self):
@@ -690,18 +813,31 @@ class SX1280ControlApp(ttk.Frame):
         ttk.Label(f, textvariable=self.status_var).grid(row=0, column=3, padx=(10, 0))
 
     def _build_dsp_tab(self):
-        tab = ttk.Frame(self.notebook, padding=10)
-        self.notebook.add(tab, text="RF & DSP")
+        sc = ScrollableFrame(self.notebook)
+        self.notebook.add(sc, text="RF & DSP")
+        tab = sc.inner
         tab.columnconfigure(0, weight=1)
 
         rf = ttk.LabelFrame(tab, text="RF / Frequency", padding=10)
         rf.grid(row=0, column=0, sticky="ew", pady=(0, 10))
         rf.columnconfigure(1, weight=1)
-        for ev in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
-            rf.bind(ev, self._on_freq_scroll)
 
         tbf = ttk.Frame(rf)
         tbf.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 10))
+        # Mode (USB/CW) radio buttons
+        ttk.Label(tbf, text="Mode:").pack(side="left", padx=(0, 4))
+        ttk.Radiobutton(tbf, text="USB (SSB)", variable=self.mode_var,
+                        value="usb", command=self._on_mode_change).pack(side="left", padx=3)
+        ttk.Radiobutton(tbf, text="CW", variable=self.mode_var,
+                        value="cw",  command=self._on_mode_change).pack(side="left", padx=3)
+        ttk.Separator(tbf, orient="vertical").pack(side="left", fill="y", padx=12, pady=2)
+        # TUNE carrier button
+        self.tune_button = tk.Button(tbf, text="TUNE OFF", width=11,
+                                      font=("TkDefaultFont", 10, "bold"),
+                                      command=self._toggle_tune, relief="raised", bd=3,
+                                      bg="#cccccc", fg="black")
+        self.tune_button.pack(side="left", padx=5)
+        ttk.Separator(tbf, orient="vertical").pack(side="left", fill="y", padx=12, pady=2)
         self.tx_button = tk.Button(tbf, text="TX OFF", width=12,
                                     font=("TkDefaultFont", 11, "bold"),
                                     command=self._toggle_tx, relief="raised", bd=3)
@@ -720,20 +856,16 @@ class SX1280ControlApp(ttk.Frame):
         self.freq_scale.grid(row=0, column=0, sticky="ew")
         fef = ttk.Frame(rf)
         fef.grid(row=1, column=2)
-        self.freq_entry = ttk.Entry(fef, textvariable=self.freq_hz_var, width=14)
+        self.freq_entry = ttk.Entry(fef, textvariable=self.freq_khz_var, width=14)
         self.freq_entry.pack(side="left")
         self.freq_entry.bind("<Return>", lambda e: self._send_freq_from_entry())
-        for ev in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
-            self.freq_entry.bind(ev, self._on_freq_scroll)
-        ttk.Label(fef, text=" Hz").pack(side="left")
+        ttk.Label(fef, text=" kHz").pack(side="left")
 
         fdf = ttk.Frame(rf)
         fdf.grid(row=2, column=1, columnspan=2, sticky="w", padx=5)
         self.freq_mhz_label = ttk.Label(fdf, text="2400.4000 MHz ↑",
                                          font=("TkDefaultFont", 12, "bold"))
         self.freq_mhz_label.pack(side="left")
-        for ev in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
-            self.freq_mhz_label.bind(ev, self._on_freq_scroll)
         ttk.Label(fdf, text="   →   ").pack(side="left")
         self.downlink_label = ttk.Label(fdf, text="10489.9000 MHz ↓",
                                          font=("TkDefaultFont", 12, "bold"), foreground="blue")
@@ -875,19 +1007,19 @@ class SX1280ControlApp(ttk.Frame):
             self.cw_port_var.set(all_ports[0])
         self.cw_port_combo.grid(row=0, column=1, padx=4)
         ttk.Button(pf, text="↻", width=3, command=self._cw_refresh_ports).grid(row=0, column=2)
-        ttk.Label(pf, text="Baudrate:").grid(row=1, column=0, sticky="w", pady=3)
+        ttk.Label(pf, text="Baud rate:").grid(row=1, column=0, sticky="w", pady=3)
         self.cw_baud_combo = ttk.Combobox(pf, textvariable=self.cw_baud_var, width=18,
                                            values=['1200','2400','4800','9600','19200','38400','115200'])
         self.cw_baud_combo.grid(row=1, column=1, padx=4)
 
-        mf = ttk.LabelFrame(tab, text="Modus & Pins", padding=10)
+        mf = ttk.LabelFrame(tab, text="Mode & Pins", padding=10)
         mf.grid(row=1, column=0, sticky="ew", padx=(0, 5), pady=(0, 8))
-        ttk.Label(mf, text="Modus:").grid(row=0, column=0, sticky="w")
+        ttk.Label(mf, text="Mode:").grid(row=0, column=0, sticky="w")
         self.cw_mode_combo = ttk.Combobox(mf, textvariable=self.cw_mode_var, width=14,
                                            values=['Straight', 'Iambic A', 'Iambic B'])
         self.cw_mode_combo.grid(row=0, column=1, columnspan=2, padx=4, pady=2)
         self.cw_mode_combo.bind('<<ComboboxSelected>>', self._cw_mode_changed)
-        ttk.Label(mf, text="Dit / Taste:").grid(row=1, column=0, sticky="w")
+        ttk.Label(mf, text="Dit / Key:").grid(row=1, column=0, sticky="w")
         self.cw_dit_combo = ttk.Combobox(mf, textvariable=self.cw_dit_var,
                                           width=7, values=READABLE_PINS)
         self.cw_dit_combo.grid(row=1, column=1, padx=4, pady=2)
@@ -896,14 +1028,14 @@ class SX1280ControlApp(ttk.Frame):
         self._cw_dah_cb = ttk.Combobox(mf, textvariable=self.cw_dah_var,
                                         width=7, values=READABLE_PINS)
         self._cw_dah_cb.grid(row=2, column=1, padx=4, pady=2)
-        self.cw_active_low_cb = ttk.Checkbutton(mf, text="Active Low (Taste→GND)",
+        self.cw_active_low_cb = ttk.Checkbutton(mf, text="Active Low (key→GND)",
                                                   variable=self.cw_active_low_var)
         self.cw_active_low_cb.grid(row=3, column=0, columnspan=3, sticky="w", pady=2)
 
-        self.cw_conn_btn = ttk.Button(tab, text="▶  VERBINDEN", command=self._cw_toggle)
+        self.cw_conn_btn = ttk.Button(tab, text="▶  CONNECT", command=self._cw_toggle)
         self.cw_conn_btn.grid(row=2, column=0, sticky="ew", padx=(0, 5), pady=(0, 8))
 
-        cpf = ttk.LabelFrame(tab, text="CW Parameter", padding=10)
+        cpf = ttk.LabelFrame(tab, text="CW Parameters", padding=10)
         cpf.grid(row=0, column=1, rowspan=3, sticky="nsew", pady=(0, 8))
         cpf.columnconfigure(0, weight=1)
 
@@ -911,7 +1043,7 @@ class SX1280ControlApp(ttk.Frame):
             r = ttk.Frame(cpf)
             r.pack(fill='x', pady=2)
             ttk.Label(r, text=label, width=16, anchor='w').pack(side='left')
-            lbl = ttk.Label(r, text=fmt(from_), width=10, anchor='e')
+            lbl = ttk.Label(r, text=fmt(var.get()), width=10, anchor='e')
             lbl.pack(side='right')
             def _cb(v):
                 lbl.config(text=fmt(float(v)))
@@ -919,23 +1051,39 @@ class SX1280ControlApp(ttk.Frame):
             ttk.Scale(cpf, from_=from_, to=to, orient='horizontal',
                       variable=var, command=_cb).pack(fill='x')
 
-        cw_slider("Geschw. (WPM)", self.cw_wpm_var,   5,   60,
+        cw_slider("Speed (WPM)",   self.cw_wpm_var,    5,   60,
                   lambda v: f"{int(v)} WPM", lambda v: self.keyer.set_wpm(v))
-        cw_slider("Sidetone (Hz)", self.cw_tone_var, 400, 1000,
+        cw_slider("Weight (Dah)",  self.cw_weight_var, 2.0, 5.0,
+                  lambda v: f"{v:.2f}×", lambda v: self.keyer.set_weight(v))
+        cw_slider("Sidetone (Hz)", self.cw_tone_var,  400, 1000,
                   lambda v: f"{int(v)} Hz",  lambda v: self.audio.set_freq(v))
-        cw_slider("Lautstaerke",   self.cw_vol_var,    0,  100,
+        cw_slider("Volume",        self.cw_vol_var,    0,  100,
                   lambda v: f"{int(v)} %",   lambda v: self.audio.set_vol(v / 100))
 
         if not HAS_AUDIO:
-            ttk.Label(cpf, text="pyaudio fehlt\npip install pyaudio numpy",
+            ttk.Label(cpf, text="pyaudio missing\npip install pyaudio numpy",
                       foreground="red").pack(pady=5)
+
+        # === Send Text as CW ===
+        tf = ttk.LabelFrame(tab, text="Send Text as CW", padding=8)
+        tf.grid(row=3, column=1, sticky="nsew", pady=(0, 8))
+        tf.columnconfigure(0, weight=1)
+        self.cw_text_entry = ttk.Entry(tf, textvariable=self.cw_text_var,
+                                       font=("TkDefaultFont", 13))
+        self.cw_text_entry.grid(row=0, column=0, sticky="ew", ipady=6)
+        self.cw_text_entry.bind("<Return>", lambda _: self._start_cw_text())
+        tbf2 = ttk.Frame(tf)
+        tbf2.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+        self.cw_text_btn = ttk.Button(tbf2, text="▶ Send", command=self._start_cw_text, width=10)
+        self.cw_text_btn.pack(side="left", padx=(0, 4))
+        ttk.Button(tbf2, text="⛔ Stop", command=self._abort_cw_text, width=8).pack(side="left")
 
         sf = ttk.LabelFrame(tab, text="Status", padding=8)
         sf.grid(row=3, column=0, sticky="nsew", padx=(0, 5), pady=(0, 8))
         self.cw_conn_lbl = ttk.Label(sf, textvariable=self.cw_conn_status_var,
                                       font=("TkDefaultFont", 11, "bold"), foreground="red")
         self.cw_conn_lbl.pack()
-        self.cw_key_lbl = ttk.Label(sf, text="TASTE: OFFEN",
+        self.cw_key_lbl = ttk.Label(sf, text="KEY: OPEN",
                                      font=("Consolas", 10), foreground="gray")
         self.cw_key_lbl.pack(pady=2)
         self.cw_sym_lbl = ttk.Label(sf, text="",
@@ -945,21 +1093,66 @@ class SX1280ControlApp(ttk.Frame):
                                     command=self._cw_toggle_tx)
         self.cw_tx_btn.pack(fill='x', pady=(4, 0))
 
-        df = ttk.LabelFrame(tab, text="Dekodierter Text", padding=8)
-        df.grid(row=3, column=1, sticky="nsew", pady=(0, 8))
-        df.rowconfigure(0, weight=1)
-        df.columnconfigure(0, weight=1)
-        self.cw_dec_text = tk.Text(df, font=("Consolas", 14, "bold"),
-                                    bg="#f0f8e8", fg="#006600",
-                                    wrap="word", height=6, state="disabled")
-        sb = ttk.Scrollbar(df, command=self.cw_dec_text.yview)
-        self.cw_dec_text.config(yscrollcommand=sb.set)
-        self.cw_dec_text.grid(row=0, column=0, sticky="nsew")
-        sb.grid(row=0, column=1, sticky="ns")
-        ttk.Button(df, text="Leeren",
-                   command=self._cw_clear_dec).grid(row=1, column=0, sticky="w", pady=3)
-        ttk.Label(tab, text="ESC = Abbruch  |  Pin → Taste → GND  |  Active Low",
+        ttk.Label(tab, text="ESC = Abort  |  Pin → Key → GND  |  Active Low",
                   foreground="gray").grid(row=4, column=0, columnspan=2, pady=2)
+
+    def _build_gpsdo_tab(self):
+        tab = ttk.Frame(self.notebook, padding=10)
+        self.notebook.add(tab, text="GPSDO")
+        tab.columnconfigure(0, weight=1)
+
+        # Two big status indicators
+        sf = ttk.LabelFrame(tab, text="Status", padding=10)
+        sf.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        sf.columnconfigure(0, weight=1)
+        sf.columnconfigure(1, weight=1)
+
+        ttk.Label(sf, text="GPS Signal:", anchor="w").grid(
+            row=0, column=0, sticky="w", padx=(0, 4))
+        self.gpsdo_sig_label = ttk.Label(
+            sf, textvariable=self.gpsdo_sig_var,
+            font=("TkDefaultFont", 11, "bold"), anchor="w")
+        self.gpsdo_sig_label.grid(row=0, column=1, sticky="w", pady=2)
+
+        ttk.Label(sf, text="GPS Position:", anchor="w").grid(
+            row=1, column=0, sticky="w", padx=(0, 4))
+        self.gpsdo_fix_label = ttk.Label(
+            sf, textvariable=self.gpsdo_fix_var,
+            font=("TkDefaultFont", 11, "bold"), anchor="w")
+        self.gpsdo_fix_label.grid(row=1, column=1, sticky="w", pady=2)
+
+        # GPS detail fields
+        df = ttk.LabelFrame(tab, text="GPS", padding=10)
+        df.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        df.columnconfigure(1, weight=1)
+
+        ttk.Label(df, text="UTC time:").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ttk.Label(df, textvariable=self.gpsdo_utc_var, anchor="w",
+                  font=("Consolas", 11)).grid(row=0, column=1, sticky="w")
+
+        ttk.Label(df, text="Locator:").grid(row=1, column=0, sticky="w", padx=(0, 8))
+        ttk.Label(df, textvariable=self.gpsdo_loc_var, anchor="w",
+                  font=("Consolas", 11)).grid(row=1, column=1, sticky="w")
+
+        ttk.Label(df, text="Satellites used:").grid(row=2, column=0, sticky="w", padx=(0, 8))
+        ttk.Label(df, textvariable=self.gpsdo_sats_var, anchor="w").grid(row=2, column=1, sticky="w")
+
+        ttk.Label(df, text="Satellites visible:").grid(row=3, column=0, sticky="w", padx=(0, 8))
+        ttk.Label(df, textvariable=self.gpsdo_vis_var, anchor="w").grid(row=3, column=1, sticky="w")
+
+        ttk.Label(df, text="Altitude:").grid(row=4, column=0, sticky="w", padx=(0, 8))
+        ttk.Label(df, textvariable=self.gpsdo_alt_var, anchor="w").grid(row=4, column=1, sticky="w")
+
+        ttk.Label(df, text="CLK1 (52 MHz):").grid(row=5, column=0, sticky="w", padx=(0, 8))
+        ttk.Label(df, textvariable=self.gpsdo_clk1_var, anchor="w").grid(row=5, column=1, sticky="w")
+
+        # Manual refresh button
+        bf = ttk.Frame(tab)
+        bf.grid(row=2, column=0, sticky="w", pady=(4, 0))
+        ttk.Button(bf, text="Refresh now",
+                   command=lambda: self._send_cmd_safe("gpsdo")).pack(side="left")
+        ttk.Label(bf, text="  (requests immediate status update)",
+                  foreground="gray").pack(side="left")
 
     def _build_console_tab(self):
         tab = ttk.Frame(self.notebook, padding=10)
@@ -1036,8 +1229,8 @@ class SX1280ControlApp(ttk.Frame):
         self._cw_running = True
         self._cw_thread  = threading.Thread(target=self._cw_loop, daemon=True)
         self._cw_thread.start()
-        self.cw_conn_btn.config(text="TRENNEN")
-        self.cw_conn_status_var.set("● VERBUNDEN")
+        self.cw_conn_btn.config(text="DISCONNECT")
+        self.cw_conn_status_var.set("● CONNECTED")
         self.cw_conn_lbl.config(foreground="green")
         self._cw_set_widgets_state('disabled')
 
@@ -1049,10 +1242,10 @@ class SX1280ControlApp(ttk.Frame):
             self.key_reader = None
         # FIX B: reset shared key state so GUI shows "OFFEN" immediately
         self._cw_key_state = (False, False)
-        self.cw_conn_btn.config(text="▶  VERBINDEN")
-        self.cw_conn_status_var.set("● GETRENNT")
+        self.cw_conn_btn.config(text="▶  CONNECT")
+        self.cw_conn_status_var.set("● DISCONNECTED")
         self.cw_conn_lbl.config(foreground="red")
-        self.cw_key_lbl.config(text="TASTE: OFFEN", foreground="gray")
+        self.cw_key_lbl.config(text="KEY: OPEN", foreground="gray")
         self._cw_set_widgets_state('normal')
 
     def _cw_loop(self):
@@ -1074,33 +1267,158 @@ class SX1280ControlApp(ttk.Frame):
             dit, dah = self._cw_key_state
             down = dit or dah
             self.cw_key_lbl.config(
-                text="TASTE: GEDRUECKT" if down else "TASTE: OFFEN",
+                text="KEY: PRESSED" if down else "KEY: OPEN",
                 foreground="green" if down else "gray")
         sym = self.keyer.get_sym_buf()
         self.cw_sym_lbl.config(text=sym)
         self.master.after(50, self._cw_gui_update)
 
-    def _cw_on_char(self, ch):
-        self.master.after(0, self._cw_append_dec, ch)
-
-    def _cw_on_word_space(self):
-        self.master.after(0, self._cw_append_dec, ' ')
-
-    def _cw_append_dec(self, ch):
-        self.cw_dec_text.config(state='normal')
-        self.cw_dec_text.insert('end', ch)
-        self.cw_dec_text.see('end')
-        self.cw_dec_text.config(state='disabled')
-
-    def _cw_clear_dec(self):
-        self.cw_dec_text.config(state='normal')
-        self.cw_dec_text.delete('1.0', 'end')
-        self.cw_dec_text.config(state='disabled')
-        self.cw_sym_lbl.config(text='')
-
     def _cw_on_esc(self, _=None):
+        self._abort_cw_text()
         if self._cw_running:
             self._cw_stop()
+
+    def _start_cw_text(self):
+        text = self.cw_text_var.get().strip().upper()
+        if not text:
+            return
+        unsupported = sorted({c for c in text if c != ' ' and c not in MORSE_CODE})
+        if unsupported:
+            messagebox.showerror("CW Text", f"Unsupported characters: {' '.join(unsupported)}")
+            return
+        if self._cw_text_thread and self._cw_text_thread.is_alive():
+            messagebox.showinfo("CW Text", "CW text is already being sent.")
+            return
+        if not self.worker.is_connected():
+            messagebox.showwarning("Not connected", "Please connect to the SX1280 first!")
+            return
+        self._cw_stop_evt.clear()
+        wpm = max(5, min(60, int(self.cw_wpm_var.get())))
+        self._cw_text_thread = threading.Thread(
+            target=self._cw_text_worker, args=(text, wpm), daemon=True)
+        self._cw_text_thread.start()
+
+    def _abort_cw_text(self):
+        self._cw_stop_evt.set()
+        try: self._send_cmd_safe("stop")
+        except: pass
+
+    def _cw_text_worker(self, text, wpm):
+        unit_s = 1.2 / float(wpm)
+        weight = self.cw_weight_var.get()
+
+        def sleep_ok(dur):
+            end = time.monotonic() + dur
+            while time.monotonic() < end:
+                if self._cw_stop_evt.is_set():
+                    return False
+                time.sleep(min(0.02, end - time.monotonic()))
+            return True
+
+        self.master.after(0, lambda: self.cw_text_btn.config(state='disabled'))
+        try:
+            for ch in text:
+                if self._cw_stop_evt.is_set():
+                    break
+                if ch == ' ':
+                    self.master.after(0, lambda: self.cw_sym_lbl.config(text='_'))
+                    if not sleep_ok(unit_s * 7): break
+                    continue
+                code = MORSE_CODE[ch]
+                for j, sym in enumerate(code):
+                    if self._cw_stop_evt.is_set(): break
+                    self.master.after(0, lambda s=sym: self.cw_sym_lbl.config(text=s))
+                    try: self.worker.send_line("cw")
+                    except: break
+                    dur = unit_s if sym == '.' else unit_s * weight
+                    if not sleep_ok(dur): break
+                    try: self.worker.send_line("stop")
+                    except: break
+                    if j < len(code) - 1 and not sleep_ok(unit_s): break
+                if self._cw_stop_evt.is_set(): break
+                # inter-character gap (3 units total, 1 already done)
+                if not sleep_ok(unit_s * 2): break
+        finally:
+            try: self.worker.send_line("stop")
+            except: pass
+            self.master.after(0, lambda: self.cw_sym_lbl.config(text=''))
+            self.master.after(0, lambda: self.cw_text_btn.config(state='normal'))
+
+    def _handle_status_push(self, line):
+        """Parse firmware !S status push and sync GUI widgets.
+
+        Format: '!S mode=0 tune=0 tx=1 pwr=13 ppm=0.0000 freq=2400400000.0'
+        Sent by firmware on state change or heartbeat.
+        """
+        try:
+            parts = line.strip().split()
+            kv = {}
+            for p in parts[1:]:
+                if "=" in p:
+                    k, v = p.split("=", 1)
+                    kv[k] = v
+
+            self._status_updating = True
+
+            if "mode" in kv:
+                new_mode = "cw" if kv["mode"] == "1" else "usb"
+                if self.mode_var.get() != new_mode:
+                    self.mode_var.set(new_mode)
+
+            if "tune" in kv:
+                new_tune = kv["tune"] == "1"
+                if self.tune_var.get() != new_tune:
+                    self.tune_var.set(new_tune)
+                    self._update_tune_button()
+
+            if "tx" in kv:
+                new_tx = kv["tx"] == "1"
+                if self.tx_enabled_var.get() != new_tx:
+                    self.tx_enabled_var.set(new_tx)
+                    self._update_tx_button()
+
+            if "pwr" in kv:
+                new_pwr = int(kv["pwr"])
+                if self.txpwr_var.get() != new_pwr:
+                    self.txpwr_var.set(new_pwr)
+
+            if "ppm" in kv:
+                new_ppm = float(kv["ppm"])
+                if abs(self.ppm_var.get() - new_ppm) > 0.0001:
+                    self.ppm_var.set(new_ppm)
+                    self.ppm_label.config(text=f"{new_ppm:.3f} ppm")
+
+            if "freq" in kv:
+                new_freq = float(kv["freq"])
+                if abs(self.config.freq_hz - new_freq) > 0.5:
+                    self.config.freq_hz = new_freq
+                    self.freq_mhz_var.set(new_freq / 1_000_000)
+                    self.freq_khz_var.set(f"{new_freq / 1000:.1f}")
+                    self._update_freq_display()
+
+            self._status_updating = False
+        except Exception as e:
+            self._status_updating = False
+            self._log(f"[STATUS PARSE ERROR] {e}: {line!r}", "error")
+
+    def _on_mode_change(self):
+        if self._status_updating:
+            return
+        self._send_cmd_safe(f"mode {self.mode_var.get()}")
+
+    def _toggle_tune(self):
+        new_state = not self.tune_var.get()
+        self.tune_var.set(new_state)
+        self._update_tune_button()
+        self._send_cmd_safe(f"tune {'1' if new_state else '0'}")
+
+    def _update_tune_button(self):
+        if self.tune_var.get():
+            self.tune_button.config(text="TUNE ON",  bg="#ff8800", fg="white",
+                                     activebackground="#ffaa00", activeforeground="white")
+        else:
+            self.tune_button.config(text="TUNE OFF", bg="#cccccc", fg="black",
+                                     activebackground="#dddddd", activeforeground="black")
 
     # ORIGINAL
     def _refresh_ports(self):
@@ -1125,14 +1443,30 @@ class SX1280ControlApp(ttk.Frame):
             self.status_var.set(f"🟢 Connected: {port}")
             self._log(f"Connected to {port}", "info")
             self.master.after(500, lambda: self._send_cmd_safe("get"))
+            self.master.after(800, lambda: self._send_cmd_safe("status"))
+            self._start_heartbeat()
         except Exception as e:
             messagebox.showerror("Connection failed", str(e))
             self.status_var.set("🔴 Connection failed")
 
     def _disconnect(self):
+        if self._heartbeat_id is not None:
+            self.master.after_cancel(self._heartbeat_id)
+            self._heartbeat_id = None
         self.worker.disconnect()
         self.status_var.set("⚫ Disconnected")
         self._log("Disconnected", "info")
+
+    def _start_heartbeat(self):
+        """Request !S status every 2 s so GUI stays in sync with hardware encoder."""
+        if not self.worker.is_connected():
+            self._heartbeat_id = None
+            return
+        try:
+            self.worker.send_line("status")
+        except Exception:
+            pass
+        self._heartbeat_id = self.master.after(2000, self._start_heartbeat)
 
     def _send_cmd_safe(self, cmd):
         try:
@@ -1162,16 +1496,18 @@ class SX1280ControlApp(ttk.Frame):
                                    activebackground="#dddddd", activeforeground="black")
 
     def _on_ppm_slider(self, _val):
+        if self._status_updating:
+            return
         ppm = self.ppm_var.get()
         self.ppm_label.config(text=f"{ppm:.3f} ppm")
         self._update_freq_display()
         self._send_cmd_safe(f"ppm {ppm:.4f}")
 
     def _update_freq_display(self):
-        try:    hz = float(self.freq_hz_var.get())
+        try:    hz = float(self.freq_khz_var.get()) * 1000
         except: hz = self.config.freq_hz
         self.freq_mhz_label.config(text=f"{hz/1_000_000:.4f} MHz ↑")
-        self.downlink_label.config(text=f"{(hz+8089_500_000)/1_000_000:.4f} MHz ↓")
+        self.downlink_label.config(text=f"{(hz+QO100_LO_HZ)/1_000_000:.4f} MHz ↓")
 
     def _on_global_scroll(self, event):
         if not self.scroll_tune_enabled_var.get(): return
@@ -1186,19 +1522,21 @@ class SX1280ControlApp(ttk.Frame):
         elif event.num == 5: delta = -50
         elif hasattr(event, 'delta'): delta = 50 if event.delta > 0 else -50
         else: return
-        try:    hz = float(self.freq_hz_var.get())
+        try:    hz = float(self.freq_khz_var.get()) * 1000
         except: hz = self.config.freq_hz
         new_hz = max(self.FREQ_MIN_HZ, min(self.FREQ_MAX_HZ, hz + delta))
-        self.freq_hz_var.set(f"{new_hz:.0f}")
+        self.freq_khz_var.set(f"{new_hz / 1000:.1f}")
         self.freq_mhz_var.set(new_hz / 1_000_000)
         self._update_freq_display()
         self._send_cmd_safe(f"freq {new_hz:.1f}")
         return "break"
 
     def _on_freq_slider(self, _val):
+        if self._status_updating:
+            return
         hz = max(self.FREQ_MIN_HZ, min(self.FREQ_MAX_HZ,
-                 int(round(self.freq_mhz_var.get() * 1_000_000))))
-        self.freq_hz_var.set(str(hz))
+                 int(round(self.freq_mhz_var.get() * 1_000_000 / 100)) * 100))
+        self.freq_khz_var.set(f"{hz / 1000:.1f}")
         self._update_freq_display()
         self._send_cmd_safe(f"freq {hz}")
 
@@ -1207,14 +1545,15 @@ class SX1280ControlApp(ttk.Frame):
 
     def _send_freq_from_entry(self):
         try:
-            hz = float(self.freq_hz_var.get().replace(",", "."))
+            khz = float(self.freq_khz_var.get().replace(",", "."))
+            hz = round(khz * 1000 / 100) * 100  # snap to 0.1 kHz
             hz = max(self.FREQ_MIN_HZ, min(self.FREQ_MAX_HZ, hz))
-            self.freq_hz_var.set(f"{hz:.0f}")
+            self.freq_khz_var.set(f"{hz / 1000:.1f}")
             self.freq_mhz_var.set(hz / 1_000_000)
             self._update_freq_display()
             self._send_cmd_safe(f"freq {hz:.1f}")
         except ValueError:
-            messagebox.showerror("Invalid frequency", "Frequency must be a number in Hz")
+            messagebox.showerror("Invalid frequency", "Frequency must be a number in kHz")
 
     def _start_cw(self): self._send_cmd_safe("cw")
     def _stop_cw(self):
@@ -1223,19 +1562,20 @@ class SX1280ControlApp(ttk.Frame):
 
     def _cw_toggle_tx(self):
         if not self.worker.is_connected():
-            messagebox.showwarning("Nicht verbunden",
-                                   "Bitte zuerst mit dem SX1280 verbinden!")
+            messagebox.showwarning("Not connected",
+                                   "Please connect to the SX1280 first!")
             return
         self._cw_tx_active = not self._cw_tx_active
         if self._cw_tx_active:
             # Enter CW keyer mode (no carrier until first key press)
             try:
-                self.worker.send_line("cwkey")
-                self.worker.send_line("hang 1000")
+                self.worker.send_line("mode cw")  # switch firmware to CW mode
             except Exception: pass
             self.cw_tx_btn.config(text="🔴  TX ON")
         else:
-            try: self.worker.send_line("stop")
+            try:
+                self.worker.send_line("stop")      # stop any active carrier
+                self.worker.send_line("mode usb")  # return to SSB mode
             except Exception: pass
             self.cw_tx_btn.config(text="⬛  TX OFF")
 
@@ -1246,7 +1586,12 @@ class SX1280ControlApp(ttk.Frame):
             self.manual_cmd_var.set("")
 
     def _send_all(self):
-        hz = max(self.FREQ_MIN_HZ, min(self.FREQ_MAX_HZ, int(float(self.freq_hz_var.get()))))
+        self._send_cmd_safe(f"mode {self.mode_var.get()}")
+        try:
+            hz = round(float(self.freq_khz_var.get()) * 1000 / 100) * 100
+            hz = max(self.FREQ_MIN_HZ, min(self.FREQ_MAX_HZ, hz))
+        except ValueError:
+            hz = int(self.config.freq_hz)
         self._send_cmd_safe(f"freq {hz}")
         try:
             ppm = float(str(self.ppm_var.get()).replace(",", "."))
@@ -1289,23 +1634,83 @@ class SX1280ControlApp(ttk.Frame):
         self.info_text.delete("1.0", "end")
         self.info_text.config(state="disabled")
 
+    def _parse_gpsdo_line(self, line):
+        """Parse a GPSDO status line and update the GPSDO tab."""
+        import re
+        m = re.search(
+            r'sig=(\S+)\s+fix=(\S+)\s+sats=(\d+)\s+vis=(\d+)\s+clk1=(\S+)'
+            r'(?:\s+utc=(\S+))?'
+            r'(?:\s+loc=(\S+))?'
+            r'(?:\s+alt=(-?\d+)m)?',
+            line)
+        if not m:
+            return
+        sig  = m.group(1)
+        fix  = m.group(2)
+        sats = m.group(3)
+        vis  = m.group(4)
+        clk1 = m.group(5)
+        utc  = m.group(6) or "--:--:--"
+        loc  = m.group(7) or "------"
+        alt  = (m.group(8) + " m") if m.group(8) else "--"
+
+        if clk1 == "fail":
+            self.gpsdo_sig_var.set("SI5351 not found")
+            self.gpsdo_sig_label.config(foreground="#cc0000")
+        elif clk1 in ("lol", "los"):
+            self.gpsdo_sig_var.set(f"CLK1 error: {clk1.upper()}")
+            self.gpsdo_sig_label.config(foreground="#cc0000")
+        elif sig == "stable":
+            self.gpsdo_sig_var.set("GPS signal stable")
+            self.gpsdo_sig_label.config(foreground="#007700")
+        elif sig == "stale":
+            self.gpsdo_sig_var.set("GPS signal lost (stale)")
+            self.gpsdo_sig_label.config(foreground="#cc4400")
+        else:
+            self.gpsdo_sig_var.set("Waiting for satellite...")
+            self.gpsdo_sig_label.config(foreground="#cc4400")
+
+        if fix == "locked":
+            self.gpsdo_fix_var.set("Position locked")
+            self.gpsdo_fix_label.config(foreground="#007700")
+        else:
+            self.gpsdo_fix_var.set("No position fix")
+            self.gpsdo_fix_label.config(foreground="#888888")
+
+        self.gpsdo_sats_var.set(sats)
+        self.gpsdo_vis_var.set(vis)
+        self.gpsdo_clk1_var.set(clk1)
+        self.gpsdo_utc_var.set(utc)
+        self.gpsdo_loc_var.set(loc)
+        self.gpsdo_alt_var.set(alt)
+
     def _poll_rx(self):
+        processed = 0
+        latest_status = None
         try:
-            while True:
+            while processed < 20:
                 line = self.rx_queue.get_nowait()
-                self._log(line, "recv")
-                # Sync GUI when firmware reports CW stopped.
-                # _cw_test_stop_pending is set by _stop_cw() (test carrier stop)
-                # so that "TX stopped" from there does NOT reset the keyer TX button.
-                if "TX stopped" in line:
-                    if self._cw_test_stop_pending:
-                        self._cw_test_stop_pending = False  # consume; keyer TX unchanged
-                    elif self._cw_tx_active:
-                        self._cw_tx_active = False
-                        self.cw_tx_btn.config(text="⬛  TX OFF")
+                processed += 1
+                if line.startswith("!S "):
+                    latest_status = line  # keep only the newest status push
+                else:
+                    self._log(line, "recv")
+                    # Sync CW keyer TX button when firmware reports tune/CW stopped.
+                    # _cw_test_stop_pending suppresses this for test-carrier stops.
+                    if "OK tune=OFF" in line or "TX stopped" in line:
+                        if self._cw_test_stop_pending:
+                            self._cw_test_stop_pending = False
+                        elif self._cw_tx_active:
+                            self._cw_tx_active = False
+                            self.cw_tx_btn.config(text="⬛  TX OFF")
+                    if line.startswith("GPSDO:"):
+                        self._parse_gpsdo_line(line)
         except queue.Empty:
             pass
-        self.master.after(50, self._poll_rx)
+        if latest_status is not None:
+            self._handle_status_push(latest_status)
+        delay = 10 if processed >= 20 else 50
+        self.master.after(delay, self._poll_rx)
 
 
 def main():
@@ -1321,7 +1726,7 @@ def main():
     def on_close():
         app._cw_stop()
         app.audio.close()
-        app.worker.disconnect()
+        app._disconnect()
         root.destroy()
 
     root.protocol("WM_DELETE_WINDOW", on_close)

@@ -12,11 +12,18 @@
 #include "hardware/spi.h"
 #include "hardware/gpio.h"
 #include "hardware/clocks.h"
+#include "hardware/i2c.h"
 
 // TinyUSB
 #include "bsp/board_api.h"
 #include "tusb.h"
 #include "usb_descriptors.h"
+
+// OLED display
+#include "ssd1306.h"
+
+// GPSDO (SI5351 52 MHz clock gen + NEO-7M GPS)
+#include "gpsdo.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -79,12 +86,9 @@
 // ===============================================
 
 // ================== MODULE VARIANT ==================
-// Compile-time DEFAULT for the TCXO.  The TCXO can always be toggled at
-// runtime with the CDC command 'tcxo 0|1' or the GUI button – no recompile
-// required.  GPIO22 (PIN_TCXO_EN) is always initialised regardless of this.
-//   1 = boot with TCXO on  (LoRa1280F27-TCXO module, STDBY_XOSC)
-//   0 = boot with TCXO off (external 52 MHz clock on XTA, STDBY_RC)
-#define USE_TCXO_MODULE     1
+// Set to 1 if using LoRa1280F27-TCXO module
+// Set to 0 if using SX1280 V1.0 (no PA) with SI5351 52 MHz on XTA
+#define USE_TCXO_MODULE     0
 // ====================================================
 
 // ---------------- Pin mapping ----------------
@@ -95,11 +99,26 @@ static const uint32_t PIN_NSS   = 17;
 
 static const uint32_t PIN_RX_EN = 14;
 static const uint32_t PIN_TX_EN = 15;
-static const uint32_t PIN_PA_EN = 13;  // External PA enable (active HIGH, GPIO13)
 
 static const uint32_t PIN_RESET = 20;
 static const uint32_t PIN_BUSY  = 21;
-static const uint32_t PIN_TCXO_EN = 22; // DIO3/TCXO_EN on LoRa1280F27-TCXO module
+
+#if USE_TCXO_MODULE
+static const uint32_t PIN_TCXO_EN = 22;
+#endif
+
+// ---------------- OLED I2C pins ----------------
+#define OLED_I2C       i2c1
+#define OLED_I2C_BAUD  100000  // 100 kHz — reliable with Pico internal pull-ups (~50 kΩ)
+static const uint32_t PIN_OLED_SDA = 6;
+static const uint32_t PIN_OLED_SCL = 7;
+
+// ---------------- Encoder + buttons ----------------
+static const uint32_t PIN_ENC_A   = 2;   // Encoder phase A
+static const uint32_t PIN_ENC_B   = 3;   // Encoder phase B
+static const uint32_t PIN_ENC_OK  = 10;  // Encoder push button (GP4 occupied by GPSDO UART1 TX)
+static const uint32_t PIN_KEY_DIT = 9;   // CW dit paddle (active LOW, internal pull-up)
+static const uint32_t PIN_KEY_DAH = 11;  // CW dah paddle (active LOW, internal pull-up; GP10 used by ENC_OK)
 
 // ---------------- SPI config ----------------
 #define SX_SPI spi0
@@ -107,6 +126,7 @@ static const uint32_t SX_SPI_BAUD = 18000000;
 
 // ---------------- SX1280 opcodes ----------------
 #define OPCODE_SET_STANDBY         0x80
+#define OPCODE_SET_FS              0xC1   // Lock PLL without starting TX
 #define OPCODE_SET_PACKET_TYPE     0x8A
 #define OPCODE_SET_RF_FREQUENCY    0x86
 #define OPCODE_SET_TX_PARAMS       0x8E
@@ -128,22 +148,37 @@ static const uint32_t SX_SPI_BAUD = 18000000;
 // Frequency stored as double for sub-Hz precision; automatically split into PLL steps + fine DSP offset
 static volatile double g_target_freq_hz = (double)BASE_FREQ_HZ;
 static volatile float g_ppm_correction = 0.0f;
-static volatile uint8_t g_cw_test_mode      = 0;  // 1 = CW test active (blocks normal Core1 operation)
-static volatile uint8_t g_cw_test_requested = 0;  // set by CDC handler, consumed by main loop
-static volatile uint8_t g_cw_with_carrier   = 0;  // 1 = start carrier immediately (cw), 0 = keyer-only (cwkey)
-static volatile uint8_t g_stop_cw_requested = 0;  // set by CDC handler, consumed by main loop
-// TCXO always enabled – hardcoded to USE_TCXO_MODULE (must be 1).
-// GPIO22 is driven HIGH unconditionally at startup.
-static volatile uint8_t  g_tcxo_enabled     = USE_TCXO_MODULE;
-
-static volatile uint32_t g_cw_hang_ms       = 1000; // Hang time: carrier stays on this long after key-up
-// These are Core0-only (main loop + CDC handler), no need for volatile:
-static uint8_t  g_cw_hang_pending  = 0;   // 1 = hang timer running
-static uint32_t g_cw_hang_dl_us    = 0;   // Hang-expiry timestamp (us)
-static uint8_t  g_cw_tx_running    = 0;   // 1 = SX1280 currently in TX_CW mode
+static volatile uint8_t g_cw_test_mode = 0;  // 1 = CW test active (blocks normal Core1 operation)
 static volatile int8_t g_tx_power_max_dbm = PWR_MAX_DBM;  // Runtime TX power limit
-static volatile uint8_t g_tx_enabled  = 1;  // TX enable flag (for GUI TX button)
-static volatile uint8_t g_pa_enabled  = 1;  // RF output enable: 0=RF muted (TX_EN low), 1=normal TX
+static volatile uint8_t g_tx_enabled = 1;  // TX enable flag (for GUI TX button)
+static volatile uint8_t g_tx_mode = 0;     // 0 = USB (SSB), 1 = CW
+static volatile uint8_t g_tune_active = 0; // 1 = TUNE carrier active
+static volatile uint8_t g_ptt_key = 0;     // 1 = dit or dah paddle pressed (live)
+static volatile uint8_t g_soft_ptt_key = 0; // Software PTT/KEY via CDC "key 0|1" (GUI CW keyer)
+
+// --- Encoder UI state ---
+typedef enum {
+    UI_PARAM_MODE = 0,   // USB / CW        (col 0, row 0)
+    UI_PARAM_TUNE,       // TUNE on/off      (col 0, row 1)
+    UI_PARAM_MENU,       // MENU placeholder  (col 0, row 2)
+    UI_PARAM_TX,         // TX on/off        (col 1, row 0)
+    UI_PARAM_PPM,        // PPM correction   (col 1, row 1)
+    UI_PARAM_PWR,        // TX power dBm     (col 1, row 2)
+    UI_PARAM_COUNT       // sentinel (= 6)
+} ui_param_t;
+
+typedef enum {
+    UI_STATE_IDLE = 0,   // Default: encoder adjusts frequency
+    UI_STATE_BROWSE,     // Click opened menu: frame around item, rotate moves cursor
+    UI_STATE_EDITING     // Click confirmed item: inverted, rotate adjusts value
+} ui_state_t;
+
+static volatile ui_state_t g_ui_state = UI_STATE_IDLE;
+static volatile ui_param_t g_ui_cursor = UI_PARAM_MODE;    // browse cursor position
+static volatile ui_param_t g_ui_editing = UI_PARAM_MODE;   // which param is being edited
+static volatile uint32_t   g_ui_last_activity_ms = 0;      // for auto-timeout
+
+#define UI_TIMEOUT_MS   5000    // Return to IDLE after 5s inactivity
 
 // --- Hilbert ---
 #define HILBERT_TAPS        247
@@ -155,7 +190,7 @@ static const float PLL_STEP_HZ =
 #define F_OFF_LIMIT_HZ      3500.0f
 #define SILENCE_SECONDS     2u
 
-#define GATE_A_REF          0.10f   // Noise gate default: hard gate, safely above EQ-boosted USB noise floor
+#define GATE_A_REF          0.01f   // Noise gate threshold - higher with compressor
 #define GATE_SHAPE          1
 
 #define IQ_GAIN_CORR        1.00f
@@ -457,12 +492,7 @@ static inline void cs_select(void)   { gpio_put(PIN_NSS, 0); }
 static inline void cs_deselect(void) { gpio_put(PIN_NSS, 1); }
 
 static inline void sx_wait_busy(void) {
-    // 200 ms safety timeout – prevents infinite spin if BUSY is stuck HIGH.
-    uint32_t t0 = time_us_32();
-    while (gpio_get(PIN_BUSY)) {
-        if ((uint32_t)(time_us_32() - t0) > 200000u) break;
-        tight_loop_contents();
-    }
+    while (gpio_get(PIN_BUSY)) { tight_loop_contents(); }
 }
 
 // Forward declarations for CDC functions
@@ -488,11 +518,6 @@ static inline void sx_set_standby_rc(void) {
 static inline void sx_set_standby_xosc(void) {
     uint8_t cfg = 0x01;  // STDBY_XOSC - required for TCXO module
     sx_write_cmd(OPCODE_SET_STANDBY, &cfg, 1);
-}
-
-// TCXO always enabled – always use STDBY_XOSC
-static inline void sx_set_standby_auto(void) {
-    sx_set_standby_xosc();
 }
 
 static inline void sx_set_packet_type_gfsk(void) {
@@ -580,10 +605,9 @@ static void sx_print_diag(void) {
     cdc_printf("BUSY pin: %d\r\n", gpio_get(PIN_BUSY));
     cdc_printf("TX_EN pin: %d\r\n", gpio_get(PIN_TX_EN));
     cdc_printf("RX_EN pin: %d\r\n", gpio_get(PIN_RX_EN));
-    cdc_printf("PA_EN pin: %d  TX_EN pin: %d  (g_pa_enabled=%d  hang_pending=%d)\r\n",
-               gpio_get(PIN_PA_EN), gpio_get(PIN_TX_EN), g_pa_enabled, g_cw_hang_pending);
-    cdc_printf("TCXO_EN pin: %d (runtime g_tcxo_enabled=%d, build USE_TCXO_MODULE=%d)\r\n",
-               gpio_get(PIN_TCXO_EN), g_tcxo_enabled, USE_TCXO_MODULE);
+#if USE_TCXO_MODULE
+    cdc_printf("TCXO_EN pin: %d\r\n", gpio_get(PIN_TCXO_EN));
+#endif
     cdc_printf("Base freq: %lu Hz\r\n", (unsigned long)BASE_FREQ_HZ);
     cdc_printf("TX power max: %d dBm\r\n", g_tx_power_max_dbm);
     
@@ -608,120 +632,233 @@ static void sx_print_diag(void) {
 #endif
 }
 
+// Apply current freq + power to SX1280 while in CW/TUNE mode.
+// Uses fractional-step dithering for sub-PLL-step precision (same as SSB).
+// Call repeatedly from carrier_poll() — each call advances the dither accumulator.
+static float g_cw_freq_acc = 0.0f;  // Fractional step accumulator for CW dithering
 
-// Enter CW mode.
-// with_carrier=1: emit continuous carrier immediately (cw command – test mode).
-// with_carrier=0: stay in STDBY_XOSC, wait for first key press  (cwkey command – keyer TX ON).
-// Always called from the main loop (never inside cdc_task/tud_task).
-static void sx_start_cw_mode(uint8_t with_carrier) {
-#if CFG_TUD_CDC
-    cdc_printf("\r\n*** %s ***\r\n", with_carrier ? "Starting CW test (carrier)" : "Starting CW keyer mode");
+static void tune_apply_settings(void) {
+    uint32_t base = get_base_steps();
+    float fine_hz = get_fine_tune_hz();
 
-    // Signal Core1 to stop SPI operations.
-    g_cw_test_mode = 1;
-    __compiler_memory_barrier();
-    // Wait 60 ms for Core1 to finish its current block (max 32 ms) and see the flag,
-    // while keeping TinyUSB alive so host writes never time out.
-    for (int _i = 0; _i < 60; _i++) { tud_task(); sleep_ms(1); }
+    // Dither: accumulate fractional PLL step, toggle +1 when it overflows
+    float want_frac = fine_hz / PLL_STEP_HZ;
+    int32_t Nf = (int32_t)floorf(want_frac);
+    float ffrac = want_frac - (float)Nf;
 
-    // TCXO is always on (GPIO22 HIGH since boot); re-assert for safety.
-    gpio_put(PIN_TCXO_EN, 1);
-    for (int _i = 0; _i < 5; _i++) { tud_task(); sleep_ms(1); } // stabilise ≥3ms
-    cdc_printf("TCXO on (GPIO%lu=1)\r\n", (unsigned long)PIN_TCXO_EN);
-
-    // Set standby mode – TCXO always enabled so always STDBY_XOSC
-    sx_set_standby_auto(); tud_task();
-    {
-        uint8_t st = sx_get_status();
-        uint8_t mode = (st >> 5) & 0x07;
-        cdc_printf("Mode: STDBY_XOSC → chip mode=%d [0x%02X] %s\r\n",
-                   mode, st,
-                   (mode == 3) ? "OK" : "*** MISMATCH - XOSC failed? ***");
-        if (mode != 3) {
-            cdc_printf("  TCXO/XOSC not running! TX will fail.\r\n"
-                       "  Check: TCXOEN pin2→GPIO%lu, TCXO supply, 52MHz on XTA.\r\n",
-                       (unsigned long)PIN_TCXO_EN);
-        }
+    g_cw_freq_acc += ffrac;
+    int32_t chosen = Nf;
+    if (g_cw_freq_acc >= 1.0f) {
+        chosen = Nf + 1;
+        g_cw_freq_acc -= 1.0f;
     }
 
-    // Packet type
-    sx_set_packet_type_gfsk(); tud_task();
-    cdc_printf("Packet: GFSK\r\n");
-
-    // Frequency - use current center freq
-    uint32_t steps = get_base_steps();
-    sx_set_rf_frequency_steps(steps); tud_task();
-    cdc_printf("Freq: %.1f Hz (steps=%lu)\r\n", g_target_freq_hz, (unsigned long)steps);
-
-    // Max power
-    sx_set_tx_params_dbm(g_tx_power_max_dbm); tud_task();
-    cdc_printf("Power: %d dBm\r\n", g_tx_power_max_dbm);
-
-    gpio_put(PIN_RX_EN, 0);
-    gpio_put(PIN_PA_EN, 0);
-    g_cw_hang_pending = 0;
-    g_cw_tx_running   = 0;
-
-    if (with_carrier) {
-        // Start continuous carrier: useful for frequency/power verification on a
-        // spectrum analyser (TX_EN=1, PA_EN=0 → SX1280 output only, no driver PA).
-        // The keyer uses g_cw_tx_running to decide how to handle 'key 1':
-        //   carrier running → PA_EN=1 only (no SPI, no carrier interruption)
-        //   carrier stopped → full restart: STDBY_XOSC → TX_CW → TX_EN=1 → PA_EN=1
-        sx_start_tx_continuous_wave(); tud_task();
-        gpio_put(PIN_TX_EN, 1);
-
-        for (int _i = 0; _i < 5; _i++) { tud_task(); sleep_ms(1); }
-        uint8_t status = sx_get_status(); tud_task();
-        cdc_printf("Status after 5ms: 0x%02X (mode=%d)\r\n", status, (status >> 5) & 0x07);
-        if (((status >> 5) & 0x07) == 6) {
-            cdc_printf("OK – TX active, carrier on (TX_EN=1, PA_EN=0).\r\n");
-            g_cw_tx_running = 1;
-        } else {
-            cdc_printf("*** WARNING: TX not active! Check TCXO/XOSC. ***\r\n");
-            cdc_printf("  BUSY pin: %d\r\n", gpio_get(PIN_BUSY));
-        }
-    } else {
-        // No carrier – stay in STDBY_XOSC.  First 'key 1' takes the slow path
-        // (STDBY_XOSC → TX_CW → TX_EN=1 → PA_EN=1, ~500 µs).
-        gpio_put(PIN_TX_EN, 0);
-        uint8_t status = sx_get_status(); tud_task();
-        cdc_printf("Status: 0x%02X (mode=%d) – ready for keying.\r\n",
-                   status, (status >> 5) & 0x07);
-    }
-#endif
+    sx_set_rf_frequency_steps((uint32_t)((int32_t)base + chosen));
+    sx_set_tx_params_dbm(g_tx_power_max_dbm);
 }
 
-// Stop CW transmission
-// Called from the main loop (never inside cdc_task/tud_task), so
-// tud_task() calls here are safe – no re-entrancy.
-static void sx_stop_cw(void) {
-#if CFG_TUD_CDC
-    g_cw_hang_pending = 0;           // Cancel hang timer before touching GPIOs
-    g_cw_tx_running   = 0;           // Carrier will be stopped below
-    gpio_put(PIN_PA_EN, 0);          // PA off first (before RF goes quiet)
-    sx_set_standby_auto(); tud_task();
-    // Restore TX_EN to the correct level for SSB mode.
-    // Core1 has tx_en_activated=true and will never re-assert TX_EN itself,
-    // so we must restore it here.  The keyer may have left TX_EN=0 (hang fired).
-    gpio_put(PIN_TX_EN, g_pa_enabled ? 1 : 0);
-    cdc_printf("TX stopped, back to standby (STDBY_XOSC)\r\n");
-
-    // Flush stale audio blocks that accumulated while Core1 was paused.
-    // Core1 is still sleeping (g_cw_test_mode=1), so no race condition here.
-    // Without this, Core1 would immediately process old blocks with tx_on=1
-    // (microphone noise), causing a brief wide-band SSB burst after CW stop.
-    __compiler_memory_barrier();
-    for (uint32_t i = 0; i < NUM_BLOCKS; i++) {
-        g_block_ready[i] = 0;
+// Pump USB while waiting (keep USB alive during short delays)
+static void usb_aware_delay_ms(uint32_t ms) {
+    uint32_t start = to_ms_since_boot(get_absolute_time());
+    while ((to_ms_since_boot(get_absolute_time()) - start) < ms) {
+        tud_task();
     }
-    // Reset consumer pointer to match producer so no gap/wrap confusion.
-    g_cons_block = g_prod_block;
-    __compiler_memory_barrier();
+}
+
+// Start CW/TUNE carrier (Core0 only).
+// PRECONDITION: g_cw_test_mode must already be 1 and Core1 must be idle.
+static void sx_start_carrier(void) {
+    // Ensure TCXO is on (pump USB while waiting)
+#if USE_TCXO_MODULE
+    gpio_put(PIN_TCXO_EN, 1);
+    usb_aware_delay_ms(5);
+#endif
+
+    // Full clean init: standby -> packet type -> freq -> power -> CW
+#if USE_TCXO_MODULE
+    sx_set_standby_xosc();
+#else
+    sx_set_standby_rc();
+#endif
+
+    sx_set_packet_type_gfsk();
+
+    uint32_t steps = get_base_steps();
+    sx_set_rf_frequency_steps(steps);
+    sx_set_tx_params_dbm(g_tx_power_max_dbm);
+
+    gpio_put(PIN_TX_EN, 1);
+    gpio_put(PIN_RX_EN, 0);
+
+    sx_start_tx_continuous_wave();
+    usb_aware_delay_ms(2);
+
+    // Safety: re-apply frequency AFTER CW start
+    sx_set_rf_frequency_steps(steps);
+}
+
+// Stop CW carrier and restore for SSB (Core0 only)
+static void sx_stop_carrier(void) {
+#if USE_TCXO_MODULE
+    sx_set_standby_xosc();
+#else
+    sx_set_standby_rc();
+#endif
+
+    // Re-initialize radio for normal SSB operation
+    sx_set_packet_type_gfsk();
+    sx_set_rf_frequency_steps(get_base_steps());
+    sx_set_tx_params_dbm((int32_t)g_tx_power_max_dbm);
+
+    gpio_put(PIN_TX_EN, 1);
+    gpio_put(PIN_RX_EN, 0);
 
     // Resume normal Core1 operation
     g_cw_test_mode = 0;
+    __compiler_memory_barrier();
+}
+
+#define CW_ARM_WAIT_MS  35  // Time to wait for Core1 to finish SPI (> 1 block = 32ms)
+
+// Start CW/TUNE transmission (legacy wrapper with CDC logging)
+// This is a blocking call (used by CDC "cw" command and TUNE encoder action).
+// It idles Core1, waits (USB-aware), then starts carrier.
+static void sx_test_cw(void) {
+#if CFG_TUD_CDC
+    cdc_printf("\r\n*** Starting CW/TUNE ***\r\n");
 #endif
+    // Idle Core1 and wait (USB-aware, not blocking)
+    if (!g_cw_test_mode) {
+        g_cw_test_mode = 1;
+        __compiler_memory_barrier();
+        usb_aware_delay_ms(CW_ARM_WAIT_MS);
+    }
+    sx_start_carrier();
+#if CFG_TUD_CDC
+    uint8_t status = sx_get_status();
+    cdc_printf("TUNE: freq=%.1f Hz, steps=%lu, pwr=%d dBm, status=0x%02X\r\n",
+               get_corrected_freq_hz(), (unsigned long)get_base_steps(),
+               g_tx_power_max_dbm, status);
+#endif
+}
+
+// Stop CW transmission and restore normal SSB mode (legacy wrapper)
+static void sx_stop_cw(void) {
+    sx_stop_carrier();
+#if CFG_TUD_CDC
+    cdc_printf("TX stopped, radio re-initialized for SSB\r\n");
+#endif
+}
+
+// ==========================================================
+// Unified carrier state machine (runs on Core0 in polling loop)
+//
+// Inputs:  g_tx_mode (0=USB, 1=CW), g_tune_active, g_ptt_key
+// Outputs: g_cw_test_mode, SPI carrier on/off
+//
+// Logic:
+//   need_idle  = (g_tx_mode==1) || g_tune_active     → Core1 must idle
+//   need_carrier = g_tune_active || (g_tx_mode==1 && g_ptt_key)  → CW on
+//
+// States:
+//   IDLE    → need_idle? set g_cw_test_mode=1, go ARMING
+//   ARMING  → wait 35ms for Core1, go ARMED
+//   ARMED   → need_carrier? sx_start_carrier → CARRIER_ON
+//   CARRIER_ON → !need_carrier? standby → ARMED
+//   any     → !need_idle? stop carrier if on, clear g_cw_test_mode → IDLE
+// ==========================================================
+typedef enum {
+    CR_ST_IDLE = 0,     // Normal SSB mode — Core1 owns SPI
+    CR_ST_ARMING,       // g_cw_test_mode=1 set, waiting for Core1 to idle
+    CR_ST_ARMED,        // Core1 is idle, no carrier (standby)
+    CR_ST_CARRIER_ON    // CW carrier active
+} carrier_state_t;
+
+static carrier_state_t g_cr_state = CR_ST_IDLE;
+static uint32_t        g_cr_arm_start_ms = 0;
+
+static void carrier_poll(void) {
+    bool mode_cw     = (g_tx_mode == 1);
+    bool tune        = (bool)g_tune_active;
+    bool key         = (bool)(g_ptt_key | g_soft_ptt_key);
+
+    bool need_idle    = mode_cw || tune;
+    bool need_carrier = tune || (mode_cw && key);
+
+    uint32_t now = to_ms_since_boot(get_absolute_time());
+
+    switch (g_cr_state) {
+
+    case CR_ST_IDLE:
+        if (need_idle) {
+            g_cw_test_mode = 1;
+            __compiler_memory_barrier();
+            g_cr_arm_start_ms = now;
+            g_cr_state = CR_ST_ARMING;
+        }
+        break;
+
+    case CR_ST_ARMING:
+        if (!need_idle) {
+            // No longer need idle — cancel
+            g_cw_test_mode = 0;
+            __compiler_memory_barrier();
+            g_cr_state = CR_ST_IDLE;
+            break;
+        }
+        if ((now - g_cr_arm_start_ms) >= CW_ARM_WAIT_MS) {
+            // Core1 is now idle — force radio to known standby state
+            // (Core1 may have left it in TX from SSB)
+#if USE_TCXO_MODULE
+            sx_set_standby_xosc();
+#else
+            sx_set_standby_rc();
+#endif
+            g_cr_state = CR_ST_ARMED;
+        }
+        break;
+
+    case CR_ST_ARMED:
+        if (!need_idle) {
+            // Return to SSB — restore Core1
+            g_cw_test_mode = 0;
+            __compiler_memory_barrier();
+            g_cr_state = CR_ST_IDLE;
+            break;
+        }
+        if (need_carrier) {
+            g_cw_freq_acc = 0.0f;  // Reset dither accumulator
+            sx_start_carrier();
+            g_cr_state = CR_ST_CARRIER_ON;
+        }
+        break;
+
+    case CR_ST_CARRIER_ON:
+        if (!need_idle) {
+            // Leaving CW/TUNE entirely — full stop + restore SSB
+            sx_stop_carrier();   // clears g_cw_test_mode
+            g_cr_state = CR_ST_IDLE;
+            break;
+        }
+        if (!need_carrier) {
+            // Carrier off but stay armed (e.g. CW key released, or TUNE off but still CW mode)
+#if USE_TCXO_MODULE
+            sx_set_standby_xosc();
+#else
+            sx_set_standby_rc();
+#endif
+            g_cr_state = CR_ST_ARMED;
+        } else {
+            // Carrier on — dither freq at ~8 kHz (125 µs), same rate as SSB
+            static uint64_t next_dither_us = 0;
+            uint64_t now_us = time_us_64();
+            if (now_us >= next_dither_us) {
+                tune_apply_settings();
+                next_dither_us = now_us + 125;  // 125 µs = 8 kHz
+            }
+        }
+        break;
+    }
 }
 
 // ==========================================================
@@ -885,8 +1022,6 @@ typedef struct {
 
     float amp_gain;
     float amp_min_a;
-
-    float gate_a_ref;   // Noise gate threshold (0.0 = no gate; typ. 0.02–0.10)
 } audio_cfg_t;
 
 static volatile audio_cfg_t g_cfg = {
@@ -911,10 +1046,8 @@ static volatile audio_cfg_t g_cfg = {
     .comp_knee_db    = COMP_KNEE_DB,
     .comp_out_limit  = COMP_OUTPUT_LIMIT,
 
-    .amp_gain    = AMP_GAIN,
-    .amp_min_a   = AMP_MIN_A,
-
-    .gate_a_ref  = GATE_A_REF,
+    .amp_gain  = AMP_GAIN,
+    .amp_min_a = AMP_MIN_A,
 };
 static volatile uint8_t g_cfg_dirty = 1;
 
@@ -953,9 +1086,6 @@ static void cfg_sanitize(audio_cfg_t *c, float fs) {
 
     if (c->amp_gain < 0.01f) c->amp_gain = 0.01f;
     if (c->amp_min_a < 1e-9f) c->amp_min_a = 1e-9f;
-
-    if (c->gate_a_ref < 0.0f)  c->gate_a_ref = 0.0f;
-    if (c->gate_a_ref > 0.5f)  c->gate_a_ref = 0.5f;
 
     // Clamp bp_stages to valid range
     if (c->bp_stages < 1) c->bp_stages = 1;
@@ -1052,6 +1182,15 @@ static bool parse_f(const char *s, float *out) {
     return true;
 }
 
+// Format large Hz value as "XXXXXXXXXX.X" into caller's buffer.
+// Needed because newlib-nano's printf uses scientific notation for big doubles.
+static void fmt_freq(char *buf, size_t len, double hz) {
+    uint64_t i = (uint64_t)hz;
+    uint32_t f = (uint32_t)((hz - (double)i) * 10.0 + 0.5);
+    if (f >= 10) { i++; f = 0; }
+    snprintf(buf, len, "%llu.%u", (unsigned long long)i, (unsigned)f);
+}
+
 static void cfg_print(void) {
     audio_cfg_t c;
     __compiler_memory_barrier();
@@ -1061,27 +1200,31 @@ static void cfg_print(void) {
     double corrected = get_corrected_freq_hz();
     float fine = get_fine_tune_hz();
 
+    char freq_str[24], corr_str[24];
+    fmt_freq(freq_str, sizeof(freq_str), g_target_freq_hz);
+    fmt_freq(corr_str, sizeof(corr_str), corrected);
+
     cdc_printf(
         "CFG:\r\n"
-        "  freq=%.1f Hz (target)  ppm=%.3f  tx=%s  txpwr=%d dBm  pa=%s\r\n"
-        "  corrected=%.1f Hz  base_steps=%lu  fine=%.1f Hz (auto)\r\n"
+        "  freq=%s Hz (target)  ppm=%.3f  tx=%s  txpwr=%d dBm\r\n"
+        "  mode=%s  tune=%s\r\n"
+        "  corrected=%s Hz  base_steps=%lu  fine=%.1f Hz (auto)\r\n",
+        freq_str, g_ppm_correction, g_tx_enabled ? "ON" : "OFF", g_tx_power_max_dbm,
+        g_tx_mode ? "CW" : "USB", g_tune_active ? "ON" : "OFF",
+        corr_str, (unsigned long)get_base_steps(), fine);
+    cdc_printf(
         "  enable bp=%u eq=%u comp=%u\r\n"
         "  bp_lo=%.1f bp_hi=%.1f bp_stages=%u (%u dB/oct)\r\n"
         "  eq_low_hz=%.1f eq_low_db=%.1f\r\n"
         "  eq_high_hz=%.1f eq_high_db=%.1f\r\n"
         "  comp_thr=%.1f ratio=%.2f att=%.2fms rel=%.2fms makeup=%.1f knee=%.1f outlim=%.3f\r\n"
-        "  amp_gain=%.3f amp_min_a=%.9f\r\n"
-        "  gate_ref=%.4f\r\n",
-        g_target_freq_hz, g_ppm_correction, g_tx_enabled ? "ON" : "OFF", g_tx_power_max_dbm,
-        g_pa_enabled ? "ON" : "OFF",
-        corrected, (unsigned long)get_base_steps(), fine,
+        "  amp_gain=%.3f amp_min_a=%.9f\r\n",
         c.enable_bandpass, c.enable_eq, c.enable_comp,
         c.bp_lo_hz, c.bp_hi_hz, c.bp_stages, c.bp_stages * 12,
         c.eq_low_hz, c.eq_low_db,
         c.eq_high_hz, c.eq_high_db,
         c.comp_thr_db, c.comp_ratio, c.comp_attack_ms, c.comp_release_ms, c.comp_makeup_db, c.comp_knee_db, c.comp_out_limit,
-        c.amp_gain, c.amp_min_a,
-        c.gate_a_ref
+        c.amp_gain, c.amp_min_a
     );
 }
 
@@ -1092,14 +1235,16 @@ static void cmd_help(void) {
         "  get\r\n"
         "  diag          - show SX1280 status\r\n"
         "  tx 0|1        - enable/disable TX (SSB modulation)\r\n"
-        "  cw            - start CW mode (SX1280 in CW, TX_EN=1, PA follows 'key')\r\n"
-        "  stop          - stop CW mode, return to SSB\r\n"
-        "  key 0|1       - key down/up (GPIO only, no SPI; use while in CW mode)\r\n"
-        "  hang <ms>     - set hang time 0..10000 ms (PA stays on this long after key-up)\r\n"
+        "  mode usb|cw   - set modulation mode\r\n"
+        "  tune 0|1      - toggle TUNE carrier\r\n"
+        "  cw            - start CW test transmission (carrier)\r\n"
+        "  stop          - stop CW/tune transmission\r\n"
+        "  key 0|1       - software PTT/KEY for GUI CW keyer\r\n"
+        "  cwkey          - enter CW keyer mode (GUI use)\r\n"
+        "  hang <ms>      - hang time (compatibility, no-op in v2)\r\n"
         "  freq <Hz>     - set frequency with sub-Hz precision (e.g. freq 2400100050.5)\r\n"
         "  ppm <value>   - set PPM correction (e.g. ppm -0.5)\r\n"
         "  txpwr <-18..13> - set max TX power in dBm\r\n"
-        "  pa 0|1         - enable/disable external PA (GPIO13, default OFF)\r\n"
         "  enable <bp|eq|comp> <0|1|on|off>\r\n"
         "  set bp_lo <Hz>\r\n"
         "  set bp_hi <Hz>\r\n"
@@ -1117,7 +1262,6 @@ static void cmd_help(void) {
         "  set comp_outlim <0..1>\r\n"
         "  set amp_gain <float>\r\n"
         "  set amp_min_a <float>\r\n"
-        "  set gate_ref <float>  - noise gate threshold (0=off, typ 0.02-0.10)\r\n"
         "\r\n"
         "Frequency is automatically split into PLL steps + fine DSP offset.\r\n"
     );
@@ -1130,6 +1274,71 @@ static void cfg_commit(const audio_cfg_t *c) {
     __compiler_memory_barrier();
 }
 
+// Periodic status push to CDC for GUI synchronization.
+// Sends a compact line that the GUI can parse to update its widgets.
+// Only sends when something changed, at most every 250 ms.
+#if CFG_TUD_CDC
+static void cdc_status_push_ex(bool force) {
+    static uint32_t last_push_ms = 0;
+    static uint8_t  last_mode = 0xFF;
+    static uint8_t  last_tune = 0xFF;
+    static uint8_t  last_tx   = 0xFF;
+    static int8_t   last_pwr  = 127;
+    static float    last_ppm  = 9999.0f;
+    static double   last_freq = 0.0;
+
+    if (!tud_cdc_connected()) return;
+
+    uint8_t  cur_mode = g_tx_mode;
+    uint8_t  cur_tune = g_tune_active;
+    uint8_t  cur_tx   = g_tx_enabled;
+    int8_t   cur_pwr  = g_tx_power_max_dbm;
+    float    cur_ppm  = g_ppm_correction;
+    double   cur_freq = (double)g_target_freq_hz;
+
+    if (!force) {
+        // Check if anything changed
+        bool changed = (cur_mode != last_mode) || (cur_tune != last_tune) ||
+                       (cur_tx != last_tx) || (cur_pwr != last_pwr) ||
+                       (cur_ppm != last_ppm) || (cur_freq != last_freq);
+
+        if (!changed) return;
+
+        uint32_t now = to_ms_since_boot(get_absolute_time());
+        if ((now - last_push_ms) < 100) return;
+    }
+
+    // Format freq with fmt_freq to avoid newlib-nano scientific notation
+    char freq_str[24];
+    fmt_freq(freq_str, sizeof(freq_str), cur_freq);
+
+    // PPM: format as fixed-point (4 decimals) to avoid float formatting issues
+    int ppm_neg = (cur_ppm < 0.0f);
+    float ppm_abs = ppm_neg ? -cur_ppm : cur_ppm;
+    uint32_t ppm_int = (uint32_t)ppm_abs;
+    uint32_t ppm_frac = (uint32_t)((ppm_abs - (float)ppm_int) * 10000.0f + 0.5f);
+    if (ppm_frac >= 10000) { ppm_int++; ppm_frac = 0; }
+
+    char status_buf[128];
+    snprintf(status_buf, sizeof(status_buf),
+             "!S mode=%u tune=%u tx=%u pwr=%d ppm=%s%lu.%04lu freq=%s\r\n",
+             cur_mode, cur_tune, cur_tx, cur_pwr,
+             ppm_neg ? "-" : "", (unsigned long)ppm_int, (unsigned long)ppm_frac,
+             freq_str);
+    cdc_write_str(status_buf);
+
+    last_mode = cur_mode;
+    last_tune = cur_tune;
+    last_tx   = cur_tx;
+    last_pwr  = cur_pwr;
+    last_ppm  = cur_ppm;
+    last_freq = cur_freq;
+    last_push_ms = to_ms_since_boot(get_absolute_time());
+}
+
+static inline void cdc_status_push(void) { cdc_status_push_ex(false); }
+#endif
+
 static void cdc_handle_line(char *line) {
     char *argv[6] = {0};
     int argc = 0;
@@ -1141,64 +1350,60 @@ static void cdc_handle_line(char *line) {
 
     if (streqi(argv[0], "help")) { cmd_help(); return; }
     if (streqi(argv[0], "get"))  { cfg_print(); return; }
+    if (streqi(argv[0], "status")) { cdc_status_push_ex(true); return; }
     if (streqi(argv[0], "diag")) { sx_print_diag(); return; }
-    if (streqi(argv[0], "cw"))    { g_cw_with_carrier = 1; g_cw_test_requested = 1; cdc_write_str("CW: starting (carrier)...\r\n"); return; }
-    if (streqi(argv[0], "cwkey")) { g_cw_with_carrier = 0; g_cw_test_requested = 1; cdc_write_str("CW: keyer mode starting...\r\n"); return; }
-    if (streqi(argv[0], "stop"))  { g_stop_cw_requested  = 1; cdc_write_str("CW: stopping...\r\n"); return; }
+    if (streqi(argv[0], "gpsdo")) {
+        char gbuf[128];
+        gpsdo_format_status(gbuf, sizeof(gbuf));
+        cdc_write_str(gbuf);
+        return;
+    }
+    if (streqi(argv[0], "cw"))   { g_tune_active = 1; cdc_printf("OK tune=ON (carrier_poll handles SPI)\r\n"); return; }
+    if (streqi(argv[0], "stop")) { g_tune_active = 0; g_soft_ptt_key = 0; cdc_printf("OK tune=OFF\r\n"); return; }
 
-
-    // CW key command: key 0|1
-    // Uses g_cw_tx_running to avoid interrupting an already-running carrier:
-    //   key 1, carrier running  → PA_EN=1 only (no SPI, no dropout)
-    //   key 1, carrier stopped  → STDBY_RC→XOSC→TX_CW→TX_EN=1→PA_EN=1 (~1.5 ms)
-    //   key 0 → TX_EN=0 + PA_EN=0 + STDBY_RC + hang timer
-    //   hang timer → stay silent (STDBY_RC); next key-down takes slow path
+    // Software PTT/KEY for GUI CW keyer: key 0|1
     if (streqi(argv[0], "key") && argc >= 2) {
-        if (!g_cw_test_mode) { cdc_write_str("ERR: key requires CW mode (send 'cw' first)\r\n"); return; }
-        uint8_t v;
-        if (!parse_bool(argv[1], &v)) { cdc_write_str("ERR: key 0|1\r\n"); return; }
-        if (v) {
-            // Key down – two paths depending on whether the SX1280 is already
-            // transmitting (test carrier from 'cw' command or a previous key 1).
-            g_cw_hang_pending = 0;
-            if (g_cw_tx_running) {
-                // Fast path: carrier is already running (TX_CW, TX_EN=1).
-                // Just enable the driver PA – zero SPI, zero carrier interruption.
-                // The external PA VOX was already triggered by the test carrier,
-                // so no attack-time is wasted on the first element.
-                gpio_put(PIN_PA_EN, 1);
-            } else {
-                // Slow path: chip is in STDBY_RC (key 0 / hang timer fired).
-                // sx_set_standby_auto() wakes XOSC (~1 ms), then PLL locks (~500 µs).
-                // Total ~1.5 ms to TX_EN=1 – fine at any normal CW speed.
-                sx_set_standby_auto();           // STDBY_RC → STDBY_XOSC
-                sx_start_tx_continuous_wave();   // PLL lock; BUSY low when stable
-                gpio_put(PIN_TX_EN, 1);
-                gpio_put(PIN_PA_EN, 1);
-                g_cw_tx_running = 1;
-            }
+        g_soft_ptt_key = (argv[1][0] == '1') ? 1 : 0;
+        cdc_printf("OK key=%u\r\n", (unsigned)g_soft_ptt_key);
+        return;
+    }
+    // cwkey: enter CW mode and arm keyer (alias for mode cw, used by GUI keyer)
+    if (streqi(argv[0], "cwkey")) {
+        g_tx_mode = 1;
+        g_soft_ptt_key = 0;
+        cdc_printf("OK cwkey mode=CW\r\n");
+        return;
+    }
+    // hang <ms>: accepted for GUI compatibility (hang managed by carrier state machine)
+    if (streqi(argv[0], "hang") && argc >= 2) {
+        cdc_printf("OK hang accepted\r\n");
+        return;
+    }
+
+    // Mode: mode usb|cw
+    if (streqi(argv[0], "mode") && argc >= 2) {
+        if (streqi(argv[1], "usb") || streqi(argv[1], "ssb")) {
+            g_tx_mode = 0;
+            cdc_printf("OK mode=USB\r\n");
+        } else if (streqi(argv[1], "cw")) {
+            g_tx_mode = 1;
+            cdc_printf("OK mode=CW\r\n");
         } else {
-            // Key up: close RF switch, kill driver PA, then enter STDBY_RC.
-            // STDBY_RC turns the TCXO completely off – zero leakage so the
-            // external PA VOX hold timer runs down cleanly after each key-up.
-            gpio_put(PIN_TX_EN, 0);
-            gpio_put(PIN_PA_EN, 0);
-            sx_set_standby_rc();             // XOSC off – zero leakage
-            g_cw_tx_running   = 0;
-            g_cw_hang_pending = 1;
-            g_cw_hang_dl_us   = time_us_32() + g_cw_hang_ms * 1000u;
+            cdc_write_str("ERR: mode usb|cw\r\n");
         }
         return;
     }
 
-    // CW hang time: hang <ms>  (0..10000)
-    if (streqi(argv[0], "hang") && argc >= 2) {
-        float h;
-        if (!parse_f(argv[1], &h) || h < 0.0f || h > 10000.0f) {
-            cdc_write_str("ERR: hang 0..10000 (ms)\r\n"); return;
+    // Tune carrier: tune 0|1
+    if (streqi(argv[0], "tune") && argc >= 2) {
+        uint8_t v;
+        if (!parse_bool(argv[1], &v)) {
+            cdc_write_str("ERR: tune 0|1|on|off\r\n");
+            return;
         }
-        g_cw_hang_ms = (uint32_t)h;
-        cdc_printf("OK hang=%lu ms\r\n", (unsigned long)g_cw_hang_ms);
+        g_tune_active = v;
+        // carrier_poll() will handle SPI transitions
+        cdc_printf("OK tune=%s\r\n", g_tune_active ? "ON" : "OFF");
         return;
     }
 
@@ -1223,78 +1428,48 @@ static void cdc_handle_line(char *line) {
             return;
         }
         g_target_freq_hz = f;
-        if (g_cw_test_mode) {
-            sx_set_standby_auto();          // chip must be in STDBY_XOSC before SetTxCW
-            sx_set_rf_frequency_steps(get_base_steps());
-            sx_start_tx_continuous_wave();
-        }
         double corrected = get_corrected_freq_hz();
         float fine = get_fine_tune_hz();
-        cdc_printf("OK freq=%.1f Hz (corrected=%.1f, steps=%lu, fine=%.1f Hz)\r\n",
+        cdc_printf("OK freq=%.1f Hz (corrected=%.1f, steps=%lu, fine=%.1f Hz)\r\n", 
                    g_target_freq_hz, corrected,
                    (unsigned long)get_base_steps(), fine);
+        if (g_tune_active) tune_apply_settings();
         return;
     }
 
     // PPM correction command: ppm <value>
     if (streqi(argv[0], "ppm") && argc >= 2) {
         float ppm;
-        if (!parse_f(argv[1], &ppm)) {
-            cdc_write_str("ERR: bad PPM value\r\n");
-            return;
+        if (!parse_f(argv[1], &ppm)) { 
+            cdc_write_str("ERR: bad PPM value\r\n"); 
+            return; 
         }
         if (ppm < -100.0f || ppm > 100.0f) {
             cdc_write_str("ERR: ppm must be -100 to +100\r\n");
             return;
         }
         g_ppm_correction = ppm;
-        if (g_cw_test_mode) {
-            sx_set_standby_auto();          // chip must be in STDBY_XOSC before SetTxCW
-            sx_set_rf_frequency_steps(get_base_steps());
-            sx_start_tx_continuous_wave();
-        }
         double corrected = get_corrected_freq_hz();
         float fine = get_fine_tune_hz();
-        cdc_printf("OK ppm=%.3f (corrected=%.1f Hz, steps=%lu, fine=%.1f Hz)\r\n",
+        cdc_printf("OK ppm=%.3f (corrected=%.1f Hz, steps=%lu, fine=%.1f Hz)\r\n", 
                    g_ppm_correction, corrected,
                    (unsigned long)get_base_steps(), fine);
-        return;
-    }
-
-    // External PA enable/disable: pa 0|1
-    if (streqi(argv[0], "pa") && argc >= 2) {
-        uint8_t v;
-        if (!parse_bool(argv[1], &v)) {
-            cdc_write_str("ERR: pa 0|1|on|off\r\n");
-            return;
-        }
-        g_pa_enabled = v;
-        if (!v) {
-            gpio_put(PIN_TX_EN, 0);   // Mute RF: disconnect RF switch from antenna path
-            gpio_put(PIN_PA_EN, 0);   // External PA pin (unconnected, kept consistent)
-        } else {
-            gpio_put(PIN_TX_EN, 1);   // Restore RF switch (safe in standby: SX1280 output is off)
-        }
-        cdc_printf("OK pa=%s\r\n", g_pa_enabled ? "ON" : "OFF");
+        if (g_tune_active) tune_apply_settings();
         return;
     }
 
     // TX power command: txpwr <-18..13>
     if (streqi(argv[0], "txpwr") && argc >= 2) {
         float pwr;
-        if (!parse_f(argv[1], &pwr)) {
-            cdc_write_str("ERR: bad txpwr value\r\n");
-            return;
+        if (!parse_f(argv[1], &pwr)) { 
+            cdc_write_str("ERR: bad txpwr value\r\n"); 
+            return; 
         }
         if (pwr < (float)PWR_MIN_DBM) pwr = (float)PWR_MIN_DBM;
         if (pwr > (float)PWR_MAX_DBM) pwr = (float)PWR_MAX_DBM;
         g_tx_power_max_dbm = (int8_t)pwr;
-        if (g_cw_test_mode) {
-            sx_set_standby_auto();          // chip must be in STDBY_XOSC before SetTxCW
-            sx_set_tx_params_dbm(g_tx_power_max_dbm);
-            sx_start_tx_continuous_wave();
-        }
         cdc_printf("OK txpwr=%d dBm\r\n", g_tx_power_max_dbm);
+        if (g_tune_active) tune_apply_settings();
         return;
     }
 
@@ -1337,7 +1512,6 @@ static void cdc_handle_line(char *line) {
         else if (streqi(argv[1], "comp_outlim")) c.comp_out_limit = f;
         else if (streqi(argv[1], "amp_gain"))    c.amp_gain = f;
         else if (streqi(argv[1], "amp_min_a"))   c.amp_min_a = f;
-        else if (streqi(argv[1], "gate_ref"))    c.gate_a_ref = f;
         else { cdc_write_str("ERR: unknown key\r\n"); return; }
 
         cfg_commit(&c);
@@ -1371,6 +1545,376 @@ static void cdc_task(void) {
         }
     }
 #endif
+}
+
+// ==========================================================
+// OLED display — simple text, DMA transfer
+// ==========================================================
+#define QO100_DOWNLINK_OFFSET_HZ  8089500000.0
+
+// Helper: right-justify a 1x string ending at x_right edge
+static void draw_string_right(int x_right, int page, const char *str) {
+    int len = 0;
+    const char *p = str;
+    while (*p++) len++;
+    int x = x_right - len * 6;
+    ssd1306_draw_string(x, page, str);
+}
+
+// Draw a 2x-height arrow-up glyph into framebuf at (x, page..page+1)
+static void draw_arrow_up_2x(int x, int page) {
+    static const uint8_t src[] = {0x04, 0x02, 0x7F, 0x02, 0x04};
+    uint8_t *fb = ssd1306_get_framebuf();
+    for (int c = 0; c < 5; c++) {
+        uint16_t expanded = 0;
+        for (int b = 0; b < 7; b++)
+            if (src[c] & (1 << b)) expanded |= (3u << (b * 2));
+        uint8_t lo = (uint8_t)(expanded & 0xFF);
+        uint8_t hi = (uint8_t)((expanded >> 8) & 0xFF);
+        for (int dx = 0; dx < 2; dx++) {
+            int px = x + c * 2 + dx;
+            if (px >= 0 && px < SSD1306_WIDTH) {
+                fb[page * SSD1306_WIDTH + px] = lo;
+                fb[(page + 1) * SSD1306_WIDTH + px] = hi;
+            }
+        }
+    }
+}
+
+// Draw a 2x-height arrow-down glyph into framebuf at (x, page..page+1)
+static void draw_arrow_down_2x(int x, int page) {
+    static const uint8_t src[] = {0x10, 0x20, 0x7F, 0x20, 0x10};
+    uint8_t *fb = ssd1306_get_framebuf();
+    for (int c = 0; c < 5; c++) {
+        uint16_t expanded = 0;
+        for (int b = 0; b < 7; b++)
+            if (src[c] & (1 << b)) expanded |= (3u << (b * 2));
+        uint8_t lo = (uint8_t)(expanded & 0xFF);
+        uint8_t hi = (uint8_t)((expanded >> 8) & 0xFF);
+        for (int dx = 0; dx < 2; dx++) {
+            int px = x + c * 2 + dx;
+            if (px >= 0 && px < SSD1306_WIDTH) {
+                fb[page * SSD1306_WIDTH + px] = lo;
+                fb[(page + 1) * SSD1306_WIDTH + px] = hi;
+            }
+        }
+    }
+}
+
+// Draw radio-on icon at pixel (x, y): dot + 2 arcs, 7px tall, ~9px wide
+static void draw_radio_on_xy(int x, int y) {
+    // Dot 2x2 at center height (y+2, y+3)
+    ssd1306_set_pixel(x,   y+2, true); ssd1306_set_pixel(x,   y+3, true);
+    ssd1306_set_pixel(x+1, y+2, true); ssd1306_set_pixel(x+1, y+3, true);
+    // Arc 1
+    ssd1306_set_pixel(x+3, y+1, true);
+    ssd1306_set_pixel(x+3, y+2, true); ssd1306_set_pixel(x+3, y+3, true);
+    ssd1306_set_pixel(x+3, y+4, true);
+    // Arc 2
+    ssd1306_set_pixel(x+5, y+0, true);
+    ssd1306_set_pixel(x+5, y+1, true);
+    ssd1306_set_pixel(x+5, y+2, true); ssd1306_set_pixel(x+5, y+3, true);
+    ssd1306_set_pixel(x+5, y+4, true);
+    ssd1306_set_pixel(x+5, y+5, true);
+}
+
+// Draw radio-off icon at pixel (x, y): just a dot, 7px tall, 2px wide
+static void draw_radio_off_xy(int x, int y) {
+    ssd1306_set_pixel(x,   y+2, true); ssd1306_set_pixel(x,   y+3, true);
+    ssd1306_set_pixel(x+1, y+2, true); ssd1306_set_pixel(x+1, y+3, true);
+}
+
+// Prepare framebuffer content (fast, no I2C)
+static void oled_prepare_frame(void) {
+    double freq = g_target_freq_hz;
+    double downlink = freq + QO100_DOWNLINK_OFFSET_HZ;
+
+    ssd1306_clear();
+
+    // --- Row 0 (pages 0-1): ↑ arrow + right-justified uplink freq ---
+    draw_arrow_up_2x(0, 0);
+    {
+        char buf[20];
+        uint32_t khz_total = (uint32_t)(freq / 1000.0);
+        uint32_t frac = (uint32_t)((freq - (double)khz_total * 1000.0) / 100.0 + 0.5);
+        if (frac >= 10) { frac -= 10; khz_total++; }
+        snprintf(buf, sizeof(buf), "%lu.%lu", (unsigned long)khz_total, (unsigned long)frac);
+        // Right-justify 2x text: each char = 12px
+        int len = 0; { const char *p = buf; while (*p++) len++; }
+        int x_start = 128 - len * 12;
+        ssd1306_draw_string_2x(x_start, 0, buf);
+    }
+
+    // --- Row 1 (pages 2-3): ↓ arrow + right-justified downlink freq ---
+    draw_arrow_down_2x(0, 2);
+    {
+        char buf[20];
+        uint32_t khz_total = (uint32_t)(downlink / 1000.0);
+        uint32_t frac = (uint32_t)((downlink - (double)khz_total * 1000.0) / 100.0 + 0.5);
+        if (frac >= 10) { frac -= 10; khz_total++; }
+        snprintf(buf, sizeof(buf), "%lu.%lu", (unsigned long)khz_total, (unsigned long)frac);
+        int len = 0; { const char *p = buf; while (*p++) len++; }
+        int x_start = 128 - len * 12;
+        ssd1306_draw_string_2x(x_start, 2, buf);
+    }
+
+    // --- Separator line at y=32 ---
+    ssd1306_hline(0, 127, 32);
+
+    // --- Bottom half: 2 columns × 3 rows, all navigable ---
+    // Vertical divider at x=63
+    ssd1306_vline(63, 33, 63);
+
+    // Column positions and widths
+    const int COL0_X = 2;    // left column text start
+    const int COL0_W = 60;   // left column field width for inverted rendering
+    const int COL0_R = 61;   // left column right edge for frame
+    const int COL1_X = 66;   // right column text start
+    const int COL1_W = 60;   // right column field width
+    const int COL1_R = 126;  // right column right edge for frame
+    // Row Y positions (stride 10: 7px text + 3px gap)
+    const int ROW0_Y = 34;
+    const int ROW1_Y = 44;
+    const int ROW2_Y = 54;
+
+    // Helper macro: draw a navigable item in either column
+    #define DRAW_ITEM(col_x, col_w, col_l, col_r, y_pos, text, param_id) do { \
+        if (g_ui_state == UI_STATE_EDITING && g_ui_editing == (param_id)) { \
+            /* EDITING: inverted (white bg, black text) */ \
+            ssd1306_draw_string_bold_y_inv((col_x), (y_pos), (text), (col_w)); \
+        } else if (g_ui_state == UI_STATE_BROWSE && g_ui_cursor == (param_id)) { \
+            /* BROWSE: frame around this item */ \
+            ssd1306_draw_string_bold_y((col_x), (y_pos), (text)); \
+            ssd1306_hline((col_l), (col_r), (y_pos)-1); \
+            ssd1306_hline((col_l), (col_r), (y_pos)+8); \
+            ssd1306_vline((col_l), (y_pos)-1, (y_pos)+8); \
+            ssd1306_vline((col_r), (y_pos)-1, (y_pos)+8); \
+        } else { \
+            /* IDLE or non-selected: normal text */ \
+            ssd1306_draw_string_bold_y((col_x), (y_pos), (text)); \
+        } \
+    } while(0)
+
+    // Shorthand for left/right columns
+    #define DRAW_L(y, text, pid) DRAW_ITEM(COL0_X, COL0_W, 0,  COL0_R, y, text, pid)
+    #define DRAW_R(y, text, pid) DRAW_ITEM(COL1_X, COL1_W, 64, COL1_R, y, text, pid)
+
+    // --- Column 0 (left) ---
+    // Row 0: Mode (USB / CW)
+    DRAW_L(ROW0_Y, g_tx_mode ? "CW" : "USB", UI_PARAM_MODE);
+
+    // Row 1: TUNE
+    DRAW_L(ROW1_Y, g_tune_active ? "TUNE *" : "TUNE", UI_PARAM_TUNE);
+
+    // Row 2: MENU (placeholder)
+    DRAW_L(ROW2_Y, "MENU", UI_PARAM_MENU);
+
+    // --- Column 1 (right) ---
+    // Row 0: TX ON/OFF + radio icon
+    {
+        const char *tx_label;
+        if (g_tx_mode == 1 && g_ptt_key) {
+            tx_label = "KEY";
+        } else {
+            tx_label = g_tx_enabled ? "TX ON" : "TX OFF";
+        }
+        DRAW_R(ROW0_Y, tx_label, UI_PARAM_TX);
+    }
+
+    // Row 1: PPM
+    {
+        char ppm_buf[12];
+        snprintf(ppm_buf, sizeof(ppm_buf), "%+.2f", (double)g_ppm_correction);
+        DRAW_R(ROW1_Y, ppm_buf, UI_PARAM_PPM);
+    }
+
+    // Row 2: Power
+    {
+        char pwr_buf[12];
+        snprintf(pwr_buf, sizeof(pwr_buf), "%+ddBm", g_tx_power_max_dbm);
+        DRAW_R(ROW2_Y, pwr_buf, UI_PARAM_PWR);
+    }
+
+    #undef DRAW_ITEM
+    #undef DRAW_L
+    #undef DRAW_R
+}
+
+// ==========================================================
+// Encoder + Button polling (Core0, called from idle loop)
+// ==========================================================
+
+// Encoder state machine (Gray code quadrature)
+static uint8_t enc_last_ab = 0;
+static int8_t  enc_accum = 0;
+
+// Button debounce state
+static uint8_t  ok_was_pressed = 0;
+static uint32_t ok_debounce_ms = 0;
+static uint32_t ptt_debounce_ms = 0;
+static uint8_t  ptt_last_state = 0;
+
+#define DEBOUNCE_MS         5
+
+// Frequency step for encoder (Hz)
+#define ENC_FREQ_STEP_HZ   100.0
+
+static inline void ui_touch(void) {
+    g_ui_last_activity_ms = to_ms_since_boot(get_absolute_time());
+}
+
+static void encoder_poll(void) {
+    // Read encoder pins (active LOW with pull-up)
+    uint8_t a = gpio_get(PIN_ENC_A) ? 0 : 1;
+    uint8_t b = gpio_get(PIN_ENC_B) ? 0 : 1;
+    uint8_t ab = (a << 1) | b;
+
+    if (ab == enc_last_ab) return;
+
+    // Quadrature decode via state transition table
+    static const int8_t enc_table[16] = {
+         0, -1, +1,  0,
+        +1,  0,  0, -1,
+        -1,  0,  0, +1,
+         0, +1, -1,  0
+    };
+    int8_t dir = enc_table[(enc_last_ab << 2) | ab];
+    enc_last_ab = ab;
+
+    if (dir == 0) return;
+
+    // Accumulate — only act on full detent (4 edges per click)
+    enc_accum += dir;
+    int step = 0;
+    if (enc_accum >= 4) {
+        step = +1;
+        enc_accum = 0;
+    } else if (enc_accum <= -4) {
+        step = -1;
+        enc_accum = 0;
+    } else {
+        return;  // Not a full step yet
+    }
+
+    ui_touch();
+
+    switch (g_ui_state) {
+        case UI_STATE_IDLE:
+            // Default: encoder adjusts frequency
+            {
+                double f = g_target_freq_hz + step * ENC_FREQ_STEP_HZ;
+                if (f < 2400000000.0) f = 2400000000.0;
+                if (f > 2500000000.0) f = 2500000000.0;
+                g_target_freq_hz = f;
+                if (g_tune_active) tune_apply_settings();
+            }
+            break;
+
+        case UI_STATE_BROWSE:
+            // Move cursor between params
+            {
+                int c = (int)g_ui_cursor + step;
+                if (c < 0) c = UI_PARAM_COUNT - 1;
+                if (c >= (int)UI_PARAM_COUNT) c = 0;
+                g_ui_cursor = (ui_param_t)c;
+            }
+            break;
+
+        case UI_STATE_EDITING:
+            // Adjust value of selected param
+            switch (g_ui_editing) {
+                case UI_PARAM_MODE:
+                    g_tx_mode = g_tx_mode ? 0 : 1;
+                    break;
+                case UI_PARAM_TUNE:
+                    if (step > 0 && !g_tune_active) {
+                        g_tune_active = 1;
+                        // carrier_poll() will arm Core1 idle + start carrier
+                    } else if (step < 0 && g_tune_active) {
+                        g_tune_active = 0;
+                        // carrier_poll() will stop carrier (or keep idle if CW mode)
+                    }
+                    break;
+                case UI_PARAM_MENU:
+                    // Placeholder — no action yet
+                    break;
+                case UI_PARAM_TX:
+                    g_tx_enabled = g_tx_enabled ? 0 : 1;
+                    break;
+                case UI_PARAM_PPM:
+                    {
+                        float ppm = g_ppm_correction + (float)step * 0.01f;
+                        if (ppm < -50.0f) ppm = -50.0f;
+                        if (ppm >  50.0f) ppm =  50.0f;
+                        g_ppm_correction = ppm;
+                        if (g_tune_active) tune_apply_settings();
+                    }
+                    break;
+                case UI_PARAM_PWR:
+                    {
+                        int8_t p = g_tx_power_max_dbm + (int8_t)step;
+                        if (p < PWR_MIN_DBM) p = PWR_MIN_DBM;
+                        if (p > PWR_MAX_DBM) p = PWR_MAX_DBM;
+                        g_tx_power_max_dbm = p;
+                        if (g_tune_active) tune_apply_settings();
+                    }
+                    break;
+                default: break;
+            }
+            break;
+    }
+}
+
+static void button_poll(void) {
+    uint32_t now_ms = to_ms_since_boot(get_absolute_time());
+
+    // --- Timeout: return to IDLE after 5s ---
+    if (g_ui_state != UI_STATE_IDLE) {
+        if ((now_ms - g_ui_last_activity_ms) >= UI_TIMEOUT_MS) {
+            g_ui_state = UI_STATE_IDLE;
+        }
+    }
+
+    // --- OK button (encoder push) ---
+    uint8_t ok_raw = gpio_get(PIN_ENC_OK) ? 0 : 1;  // Active LOW
+
+    if (ok_raw != ok_was_pressed && (now_ms - ok_debounce_ms) >= DEBOUNCE_MS) {
+        ok_debounce_ms = now_ms;
+        ok_was_pressed = ok_raw;
+
+        if (ok_raw) {
+            // Button just pressed
+            ui_touch();
+
+            switch (g_ui_state) {
+                case UI_STATE_IDLE:
+                    // Enter browse mode
+                    g_ui_state = UI_STATE_BROWSE;
+                    g_ui_cursor = UI_PARAM_MODE;  // start at first item
+                    break;
+
+                case UI_STATE_BROWSE:
+                    // Confirm selection — enter editing mode
+                    g_ui_editing = g_ui_cursor;
+                    g_ui_state = UI_STATE_EDITING;
+                    break;
+
+                case UI_STATE_EDITING:
+                    // Deselect — back to browse mode
+                    g_ui_state = UI_STATE_BROWSE;
+                    break;
+            }
+        }
+    }
+
+    // --- CW dit/dah paddles (GP9 / GP11, active LOW) ---
+    uint8_t ptt_raw = (!gpio_get(PIN_KEY_DIT)) | (!gpio_get(PIN_KEY_DAH));
+
+    if (ptt_raw != ptt_last_state && (now_ms - ptt_debounce_ms) >= DEBOUNCE_MS) {
+        ptt_debounce_ms = now_ms;
+        ptt_last_state = ptt_raw;
+        g_ptt_key = ptt_raw;
+    }
 }
 
 // ==========================================================
@@ -1425,13 +1969,15 @@ static inline float hilbert_process(float x, float *i_delayed) {
     return y;
 }
 
-static inline float duty_from_A(float A, float gate_ref) {
-    // Hard gate: below threshold → silence (duty=0 → tx_on never fires).
-    // This avoids rapid TX↔standby SPI switching that disturbs the PLL.
-    // Above threshold → full duty (tx_on=1); amplitude is handled via p_chosen.
+static inline float duty_from_A(float A) {
     if (A <= 0.0f) return 0.0f;
-    if (gate_ref > 0.0f && A < gate_ref) return 0.0f;
-    return 1.0f;
+    float r = A / GATE_A_REF;
+    if (r >= 1.0f) return 1.0f;
+#if GATE_SHAPE == 2
+    return r * r;
+#else
+    return r;
+#endif
 }
 
 // ==========================================================
@@ -1441,11 +1987,6 @@ static void core1_radio_apply_loop(void) {
     const uint32_t sample_period_us = 1000000u / WAV_SAMPLE_RATE;
     const uint32_t substeps = (DITHER_SUBSTEPS <= 1) ? 1u : (uint32_t)DITHER_SUBSTEPS;
     const uint32_t sub_period_us = (substeps == 1) ? sample_period_us : (sample_period_us / substeps);
-
-    // *** Wait for Core0 to signal start (after pre-buffering) ***
-    while (!g_core1_start) {
-        tight_loop_contents();
-    }
 
 #if UNDERRUN_LED_ENABLE
     const uint led_pin = PICO_DEFAULT_LED_PIN;
@@ -1464,9 +2005,28 @@ static void core1_radio_apply_loop(void) {
     bool tx_en_activated = false;  // Track if we've enabled the PA
 
     while (true) {
-        // If CW test mode is active, skip SPI operations
+        // === CW test / CW mode / TUNE: Core0 owns SPI, Core1 idles ===
         if (g_cw_test_mode) {
+            last_tx_on = false;
+            last_steps = 0x7FFFFFFF;
+            last_p_dbm = 9999;
+            // Drain all blocks so Core0 doesn't stall
+            for (;;) {
+                uint32_t b = g_cons_block;
+                if (!g_block_ready[b]) break;
+                __compiler_memory_barrier();
+                g_block_ready[b] = 0;
+                __compiler_memory_barrier();
+                g_cons_block = (b + 1u) % NUM_BLOCKS;
+            }
             sleep_ms(10);
+            continue;
+        }
+
+        // === SSB MODE: normal audio processing ===
+        // Wait for Core0 to pre-buffer before processing SSB audio
+        if (!g_core1_start) {
+            sleep_ms(1);
             continue;
         }
 
@@ -1491,11 +2051,11 @@ static void core1_radio_apply_loop(void) {
             continue;
         }
 
-        // Enable TX_EN on first valid block (USB is now stable), unless RF is muted.
+        // Enable TX_EN on first valid block (USB is now stable)
         if (!tx_en_activated) {
-            if (g_pa_enabled) gpio_put(PIN_TX_EN, 1);
+            gpio_put(PIN_TX_EN, 1);
             tx_en_activated = true;
-            sleep_ms(1);  // Short delay for RF switch to stabilize
+            sleep_ms(1);  // Short delay for PA to stabilize
         }
 
         sample_cmd_t *blk = g_blocks[b];
@@ -1508,15 +2068,12 @@ static void core1_radio_apply_loop(void) {
                 sample_cmd_t c = blk[i];
 
                 if ((bool)c.tx_on != last_tx_on) {
-                    if (c.tx_on) {
-                        // Enable external PA before starting the carrier (if user enabled it).
-                        gpio_put(PIN_PA_EN, (uint8_t)g_pa_enabled);
-                        sx_start_tx_continuous_wave();
-                    } else {
-                        // Silence RF first, then kill PA so no glitch reaches the antenna.
-                        gpio_put(PIN_PA_EN, 0);
-                        sx_set_standby_auto();
-                    }
+                    if (c.tx_on) sx_start_tx_continuous_wave();
+#if USE_TCXO_MODULE
+                    else         sx_set_standby_xosc();
+#else
+                    else         sx_set_standby_rc();
+#endif
                     last_tx_on = (bool)c.tx_on;
                 }
 
@@ -1620,38 +2177,94 @@ int main(void) {
     board_init_after_tusb();
 
     // ---- SX1280 GPIO/SPI init ----
-    // GPIO22 = TCXO_EN on LoRa1280F27-TCXO.  Always HIGH: TCXO is permanently enabled.
+    // CRITICAL FOR TCXO MODULE: Enable TCXO FIRST, before any SPI/reset!
+#if USE_TCXO_MODULE
     gpio_init(PIN_TCXO_EN);
     gpio_set_dir(PIN_TCXO_EN, GPIO_OUT);
-    gpio_put(PIN_TCXO_EN, 1);
-    sleep_ms(5);  // TCXO needs ≥3 ms to stabilise
-    printf("[SX1280] TCXO on  (GPIO%d=1)\n", (int)PIN_TCXO_EN);
+    gpio_put(PIN_TCXO_EN, 1);  // Enable TCXO FIRST!
+    sleep_ms(5);               // Wait for TCXO to stabilize (min 3ms)
+    printf("[SX1280] TCXO enabled (GPIO%d=HIGH)\n", PIN_TCXO_EN);
+#endif
 
     gpio_init(PIN_NSS);   gpio_set_dir(PIN_NSS, GPIO_OUT);   gpio_put(PIN_NSS, 1);
     gpio_init(PIN_RX_EN); gpio_set_dir(PIN_RX_EN, GPIO_OUT); gpio_put(PIN_RX_EN, 0);
     gpio_init(PIN_TX_EN); gpio_set_dir(PIN_TX_EN, GPIO_OUT); gpio_put(PIN_TX_EN, 0);  // Start with TX disabled!
-    gpio_init(PIN_PA_EN); gpio_set_dir(PIN_PA_EN, GPIO_OUT); gpio_put(PIN_PA_EN, 0);  // PA always off at boot
-    gpio_init(PIN_RESET); gpio_set_dir(PIN_RESET, GPIO_OUT); gpio_put(PIN_RESET, 1);
+    // SX1280 held in reset until GPSDO is ready (released after gpsdo_is_ready()).
+    gpio_init(PIN_RESET); gpio_set_dir(PIN_RESET, GPIO_OUT); gpio_put(PIN_RESET, 0);
     gpio_init(PIN_BUSY);  gpio_set_dir(PIN_BUSY, GPIO_IN);
+
+    // --- Encoder + button GPIO init (input with pull-up, active LOW) ---
+    gpio_init(PIN_ENC_A);   gpio_set_dir(PIN_ENC_A, GPIO_IN);   gpio_pull_up(PIN_ENC_A);
+    gpio_init(PIN_ENC_B);   gpio_set_dir(PIN_ENC_B, GPIO_IN);   gpio_pull_up(PIN_ENC_B);
+    gpio_init(PIN_ENC_OK);  gpio_set_dir(PIN_ENC_OK, GPIO_IN);  gpio_pull_up(PIN_ENC_OK);
+    gpio_init(PIN_KEY_DIT); gpio_set_dir(PIN_KEY_DIT, GPIO_IN); gpio_pull_up(PIN_KEY_DIT);
+    gpio_init(PIN_KEY_DAH); gpio_set_dir(PIN_KEY_DAH, GPIO_IN); gpio_pull_up(PIN_KEY_DAH);
+    // Initialize encoder last state
+    enc_last_ab = ((gpio_get(PIN_ENC_A) ? 0 : 1) << 1) | (gpio_get(PIN_ENC_B) ? 0 : 1);
 
     spi_init(SX_SPI, SX_SPI_BAUD);
     gpio_set_function(PIN_MISO, GPIO_FUNC_SPI);
     gpio_set_function(PIN_MOSI, GPIO_FUNC_SPI);
     gpio_set_function(PIN_SCK,  GPIO_FUNC_SPI);
 
-    // Hardware reset SX1280
+    // --- OLED I2C init (early — before GPSDO wait so display is always on) ---
+    sleep_ms(20);  // Allow display VCC to stabilise before sending I2C init sequence
+    i2c_init(OLED_I2C, OLED_I2C_BAUD);
+    gpio_set_function(PIN_OLED_SDA, GPIO_FUNC_I2C);
+    gpio_set_function(PIN_OLED_SCL, GPIO_FUNC_I2C);
+    gpio_pull_up(PIN_OLED_SDA);
+    gpio_pull_up(PIN_OLED_SCL);
+    ssd1306_init(OLED_I2C);
+    ssd1306_clear();
+    ssd1306_draw_string(0, 0, "SX1280 SSB TX");
+    ssd1306_draw_string(0, 2, "Waiting GPSDO..");
+    ssd1306_display(OLED_I2C);
+
+    // ---- GPSDO: SI5351 52 MHz (I2C0, GP0/GP1) + NEO-7M GPS (UART1, GP4/GP5) ----
+    // SX1280 NRESET is held LOW above. Released only after GPSDO is ready.
+    gpsdo_init();
+    {
+        uint32_t last_status_ms  = 0u;
+        uint8_t  si_warn_printed = 0u;
+        while (!gpsdo_is_ready()) {
+            gpsdo_task();
+            tud_task();
+            cdc_task();   // allow 'gpsdo' command while waiting
+            uint32_t now_ms = to_ms_since_boot(get_absolute_time());
+            if (tud_cdc_connected()) {
+                if (!si_warn_printed && !gpsdo_si5351_ok()) {
+                    si_warn_printed = 1u;
+                    cdc_write_str("GPSDO: WARNING — SI5351 not found (GP0/GP1).\r\n"
+                                  "GPSDO: SX1280 will NOT start until SI5351 is connected.\r\n");
+                }
+                if ((now_ms - last_status_ms) >= 2000u) {
+                    last_status_ms = now_ms;
+                    char gbuf[128];
+                    gpsdo_format_status(gbuf, sizeof(gbuf));
+                    tud_cdc_write(gbuf, strlen(gbuf));
+                    tud_cdc_write_flush();
+                }
+            }
+        }
+        if (tud_cdc_connected()) {
+            cdc_write_str("GPSDO: READY — 52 MHz locked, GPS time valid. Starting SX1280.\r\n");
+        }
+    }
+
+    // Release SX1280 from reset (was held LOW during GPSDO init) and initialise
     printf("[SX1280] Resetting...\n");
     gpio_put(PIN_RESET, 0); sleep_ms(2);
     gpio_put(PIN_RESET, 1); sleep_ms(10);
     printf("[SX1280] Reset complete, BUSY=%d\n", gpio_get(PIN_BUSY));
 
-    if (g_tcxo_enabled) {
-        sx_set_standby_xosc();
-        printf("[SX1280] STDBY_XOSC (TCXO active)\n");
-    } else {
-        sx_set_standby_rc();
-        printf("[SX1280] STDBY_RC (no TCXO)\n");
-    }
+#if USE_TCXO_MODULE
+    // For TCXO module, use STDBY_XOSC mode
+    sx_set_standby_xosc();
+    printf("[SX1280] Set STDBY_XOSC mode (for TCXO)\n");
+#else
+    sx_set_standby_rc();
+    printf("[SX1280] Set STDBY_RC mode\n");
+#endif
 
     sx_set_packet_type_gfsk();
 
@@ -1674,7 +2287,34 @@ int main(void) {
     while (true) { tud_task(); tight_loop_contents(); }
 #endif
 
-    hilbert_init();;
+    // *** Start Core1 early so it can idle and drain blocks immediately ***
+    multicore_launch_core1(core1_radio_apply_loop);
+
+    // Wait for USB — meanwhile handle encoder, buttons, OLED, CW keying
+    {
+        printf("[BOOT] Waiting for USB connection (encoder+CW active)...\n");
+        absolute_time_t oled_next = {0};
+
+        while (!tud_ready()) {
+            tud_task();
+            encoder_poll();
+            button_poll();
+            carrier_poll();
+
+            // OLED refresh during wait
+            if (!ssd1306_dma_busy() &&
+                absolute_time_diff_us(get_absolute_time(), oled_next) <= 0) {
+                oled_prepare_frame();
+                ssd1306_display_dma(OLED_I2C);
+                oled_next = make_timeout_time_ms(200);
+            }
+
+            sleep_ms(1);
+        }
+        printf("[BOOT] USB connected, starting normal SSB mode\n");
+    }
+
+    hilbert_init();
 
     const float Fs = (float)WAV_SAMPLE_RATE;
 
@@ -1728,9 +2368,6 @@ int main(void) {
     // greet once if CDC is connected later
     uint8_t greeted = 0;
 
-    // *** Start Core1 (it will wait for g_core1_start signal) ***
-    multicore_launch_core1(core1_radio_apply_loop);
-
     // *** Pre-fill some blocks before signaling Core1 to start ***
     const uint32_t prebuf_target = NUM_BLOCKS / 2;  // Fill half the buffer
     uint32_t prebuf_count = 0;
@@ -1738,52 +2375,77 @@ int main(void) {
     while (true) {
         uint32_t b = g_prod_block;
 
+        // === CW/TUNE active: Core1 just drains blocks, no DSP needed ===
+        // Run a tight poll loop instead of producing audio blocks.
+        // Without this, Core1 drains so fast that the wait loop below
+        // never executes, starving encoder/button/cw_keying polls.
+        if (g_cw_test_mode) {
+            usb_audio_pump();
+
+            {
+                static absolute_time_t oled_next_cw = {0};
+                if (!ssd1306_dma_busy() &&
+                    absolute_time_diff_us(get_absolute_time(), oled_next_cw) <= 0) {
+                    oled_prepare_frame();
+                    ssd1306_display_dma(OLED_I2C);
+                    oled_next_cw = make_timeout_time_ms(200);
+                }
+            }
+
+            encoder_poll();
+            button_poll();
+            carrier_poll();
+
+#if CFG_TUD_CDC
+            cdc_task();
+            cdc_status_push();
+#endif
+            tight_loop_contents();
+            continue;   // Skip block production entirely
+        }
+
         while (g_block_ready[b]) {
             usb_audio_pump();
-            // Check CW start/stop inside the inner loop too, so they work
-            // even while g_cw_test_mode=1 (Core1 paused, inner loop runs forever).
+
+            // --- OLED update via DMA (zero CPU during transfer) ---
+            // Render + kick DMA during idle time. DMA feeds I2C TX FIFO
+            // in background — CPU is completely free for USB/DSP.
+            {
+                static absolute_time_t oled_next = {0};
+
+                if (!ssd1306_dma_busy() &&
+                    absolute_time_diff_us(get_absolute_time(), oled_next) <= 0) {
+                    oled_prepare_frame();
+                    ssd1306_display_dma(OLED_I2C);
+                    oled_next = make_timeout_time_ms(200);  // ~5 fps
+                }
+            }
+
+            // Poll encoder + buttons + carrier state machine
+            encoder_poll();
+            button_poll();
+            carrier_poll();
+
 #if CFG_TUD_CDC
-            if (g_cw_test_requested) {
-                g_cw_test_requested = 0;
-                sx_start_cw_mode(g_cw_with_carrier);
-            }
-            if (g_stop_cw_requested) {
-                g_stop_cw_requested = 0;
-                sx_stop_cw();
-            }
-            // Hang timer: no keying for hang_ms → stay silent (STDBY_RC).
-            // TX_EN=0 and PA_EN=0 were already set by 'key 0'.
-            if (g_cw_hang_pending && ((int32_t)(time_us_32() - g_cw_hang_dl_us) >= 0)) {
-                g_cw_hang_pending = 0;
-                gpio_put(PIN_TX_EN, 0);
-                gpio_put(PIN_PA_EN, 0);
-                sx_set_standby_rc();   // XOSC off – no leakage, PA VOX drops
-                g_cw_tx_running = 0;
-            }
+            cdc_status_push();
 #endif
+
             tight_loop_contents();
         }
 
 #if CFG_TUD_CDC
-        // Also check outside the inner loop for the normal (non-CW-mode) path.
-        if (g_cw_test_requested) {
-            g_cw_test_requested = 0;
-            sx_start_cw_mode(g_cw_with_carrier);
-        }
-        if (g_stop_cw_requested) {
-            g_stop_cw_requested = 0;
-            sx_stop_cw();
-        }
-        if (g_cw_hang_pending && ((int32_t)(time_us_32() - g_cw_hang_dl_us) >= 0)) {
-            g_cw_hang_pending = 0;
-            gpio_put(PIN_TX_EN, 0);
-            gpio_put(PIN_PA_EN, 0);
-        }
-
         if (!greeted && tud_cdc_connected()) {
             greeted = 1;
             cdc_write_str("\r\nSX1280_SDR control ready. Type 'help'.\r\n");
             cfg_print();
+        }
+
+        // GPSDO: service GPS UART and send periodic status (every 10 s).
+        gpsdo_task();
+        if (gpsdo_status_due()) {
+            char gbuf[128];
+            gpsdo_format_status(gbuf, sizeof(gbuf));
+            cdc_write_str(gbuf);
         }
 #endif
 
@@ -1922,6 +2584,7 @@ int main(void) {
             }
 
             float A = sqrtf(I2 * I2 + Q2 * Q2);
+
             float theta = atan2f(Q2, I2);
 
             float dtheta = theta - theta_prev;
@@ -1943,7 +2606,7 @@ int main(void) {
 
             int32_t cur_steps = base_steps + f_chosen;
 
-            float duty = duty_from_A(A, cfg_local.gate_a_ref);
+            float duty = duty_from_A(A);
 
             int32_t p_chosen = PWR_MIN_DBM;
             uint8_t tx_on = 1;
