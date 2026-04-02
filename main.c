@@ -25,6 +25,9 @@
 // GPSDO (SI5351 52 MHz clock gen + NEO-7M GPS)
 #include "gpsdo.h"
 
+// WiFi / UDP cwdaemon / HTTP web UI / CW queue keyer
+#include "wifi_cw.h"
+
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -1984,6 +1987,7 @@ static inline float duty_from_A(float A) {
 // CORE1: timed radio apply loop
 // ==========================================================
 static void core1_radio_apply_loop(void) {
+    multicore_lockout_victim_init(); // required for flash_safe_execute() on Core0
     const uint32_t sample_period_us = 1000000u / WAV_SAMPLE_RATE;
     const uint32_t substeps = (DITHER_SUBSTEPS <= 1) ? 1u : (uint32_t)DITHER_SUBSTEPS;
     const uint32_t sub_period_us = (substeps == 1) ? sample_period_us : (sample_period_us / substeps);
@@ -2019,7 +2023,8 @@ static void core1_radio_apply_loop(void) {
                 __compiler_memory_barrier();
                 g_cons_block = (b + 1u) % NUM_BLOCKS;
             }
-            sleep_ms(10);
+            wifi_cw_core1_keyer_tick(); // service CW text queue (non-blocking)
+            sleep_ms(5);
             continue;
         }
 
@@ -2287,6 +2292,20 @@ int main(void) {
     while (true) { tud_task(); tight_loop_contents(); }
 #endif
 
+    // --- WiFi / UDP / HTTP / CW queue keyer ---
+    {
+        static queue_t cw_queue;
+        queue_init(&cw_queue, sizeof(char), WIFI_CW_QUEUE_DEPTH);
+        wifi_cw_init(&cw_queue,
+                     &g_soft_ptt_key,
+                     &g_tx_mode,
+                     &g_cw_test_mode,
+                     &g_tx_power_max_dbm,
+                     &g_target_freq_hz,
+                     &g_tx_enabled,
+                     &g_ppm_correction);
+    }
+
     // *** Start Core1 early so it can idle and drain blocks immediately ***
     multicore_launch_core1(core1_radio_apply_loop);
 
@@ -2300,6 +2319,7 @@ int main(void) {
             encoder_poll();
             button_poll();
             carrier_poll();
+            wifi_cw_task();
 
             // OLED refresh during wait
             if (!ssd1306_dma_busy() &&
@@ -2400,6 +2420,7 @@ int main(void) {
             cdc_task();
             cdc_status_push();
 #endif
+            wifi_cw_task();
             tight_loop_contents();
             continue;   // Skip block production entirely
         }
@@ -2448,6 +2469,7 @@ int main(void) {
             cdc_write_str(gbuf);
         }
 #endif
+        wifi_cw_task();
 
         // Apply pending cfg on block boundary
 #if AUDIO_ENABLE_BANDPASS || AUDIO_ENABLE_EQ || AUDIO_ENABLE_COMPRESSOR

@@ -23,7 +23,7 @@ if (EXISTS ${picoVscode})
     include(${picoVscode})
 endif()
 # ====================================================================================
-set(PICO_BOARD pico2 CACHE STRING "Board type")
+set(PICO_BOARD pico2_w CACHE STRING "Board type")  # pico2_w for CYW43439 WiFi
 
 # Pull in Raspberry Pi Pico SDK (must be before project)
 include(pico_sdk_import.cmake)
@@ -45,6 +45,7 @@ add_executable(SX1280SDR
     ssd1306.c
     gpsdo.c
     usb_descriptors.c
+    wifi_cw.c
 )
 
 pico_set_program_name(SX1280SDR "SX1280SDR")
@@ -59,17 +60,19 @@ pico_enable_stdio_usb(SX1280SDR 0)
 target_link_libraries(SX1280SDR
     pico_stdlib
     pico_unique_id
-            hardware_spi
-        hardware_gpio
-        hardware_clocks
-        hardware_i2c
-        hardware_dma
-        hardware_uart
-        pico_multicore
-        hardware_pio
-        hardware_pwm
-        m
-
+    hardware_spi
+    hardware_gpio
+    hardware_clocks
+    hardware_i2c
+    hardware_dma
+    hardware_uart
+    pico_multicore
+    hardware_pio
+    hardware_pwm
+    hardware_flash
+    hardware_watchdog
+    pico_cyw43_arch_lwip_threadsafe_background
+    m
 )
 
 
@@ -81,7 +84,8 @@ target_include_directories(SX1280SDR PRIVATE
     ${TINYUSB_DIR}/hw
     ${TINYUSB_FAMILY_DIR}
     ${PICO_SDK_PATH}/src/rp2_common/pico_unique_id/include
-    # TinyUSB rp2040 board-specific headers (selected board: raspberry_pi_pico2)
+    # TinyUSB rp2040 board-specific headers.
+    # pico2_w uses the same USB peripheral as pico2 so the same BSP applies.
     ${TINYUSB_FAMILY_DIR}/boards/raspberry_pi_pico2
 )
 

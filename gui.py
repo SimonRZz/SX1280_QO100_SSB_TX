@@ -768,6 +768,9 @@ class SX1280ControlApp(ttk.Frame):
         self.cw_conn_status_var = tk.StringVar(value='● DISCONNECTED')
         self.cw_text_var        = tk.StringVar(value='CQ CQ DE SX1280')
         self.cw_weight_var      = tk.DoubleVar(value=3.0)
+        # WiFi CW mode
+        self.cw_conn_mode_var   = tk.StringVar(value='Serial')
+        self.cw_wifi_ip_var     = tk.StringVar(value='192.168.4.1')
         # GPSDO state
         self.gpsdo_sig_var  = tk.StringVar(value="--")
         self.gpsdo_fix_var  = tk.StringVar(value="--")
@@ -994,10 +997,21 @@ class SX1280ControlApp(ttk.Frame):
         self.notebook.add(tab, text="⚡ CW Keyer")
         tab.columnconfigure(0, weight=1)
         tab.columnconfigure(1, weight=1)
-        tab.rowconfigure(3, weight=1)
+        tab.rowconfigure(4, weight=1)  # shifted +1 for connection-mode row
+
+        # === Connection mode (Serial / WiFi) — NEW ===
+        cmf = ttk.LabelFrame(tab, text="Connection", padding=6)
+        cmf.grid(row=0, column=0, sticky="ew", padx=(0, 5), pady=(0, 4))
+        ttk.Radiobutton(cmf, text="Serial (FTDI)", variable=self.cw_conn_mode_var,
+                        value='Serial', command=self._on_cw_mode_toggle).pack(side='left', padx=4)
+        ttk.Radiobutton(cmf, text="WiFi / UDP", variable=self.cw_conn_mode_var,
+                        value='WiFi',   command=self._on_cw_mode_toggle).pack(side='left', padx=4)
+        ttk.Label(cmf, text="Pico IP:").pack(side='left', padx=(10, 2))
+        self.cw_wifi_ip_entry = ttk.Entry(cmf, textvariable=self.cw_wifi_ip_var, width=16)
+        self.cw_wifi_ip_entry.pack(side='left')
 
         pf = ttk.LabelFrame(tab, text="FTDI Adapter", padding=10)
-        pf.grid(row=0, column=0, sticky="ew", padx=(0, 5), pady=(0, 8))
+        pf.grid(row=1, column=0, sticky="ew", padx=(0, 5), pady=(0, 8))  # was row=0
         pf.columnconfigure(1, weight=1)
         ttk.Label(pf, text="Port:").grid(row=0, column=0, sticky="w")
         all_ports = [p.device for p in serial.tools.list_ports.comports()] if HAS_SERIAL else []
@@ -1013,7 +1027,7 @@ class SX1280ControlApp(ttk.Frame):
         self.cw_baud_combo.grid(row=1, column=1, padx=4)
 
         mf = ttk.LabelFrame(tab, text="Mode & Pins", padding=10)
-        mf.grid(row=1, column=0, sticky="ew", padx=(0, 5), pady=(0, 8))
+        mf.grid(row=2, column=0, sticky="ew", padx=(0, 5), pady=(0, 8))  # was row=1
         ttk.Label(mf, text="Mode:").grid(row=0, column=0, sticky="w")
         self.cw_mode_combo = ttk.Combobox(mf, textvariable=self.cw_mode_var, width=14,
                                            values=['Straight', 'Iambic A', 'Iambic B'])
@@ -1033,10 +1047,10 @@ class SX1280ControlApp(ttk.Frame):
         self.cw_active_low_cb.grid(row=3, column=0, columnspan=3, sticky="w", pady=2)
 
         self.cw_conn_btn = ttk.Button(tab, text="▶  CONNECT", command=self._cw_toggle)
-        self.cw_conn_btn.grid(row=2, column=0, sticky="ew", padx=(0, 5), pady=(0, 8))
+        self.cw_conn_btn.grid(row=3, column=0, sticky="ew", padx=(0, 5), pady=(0, 8))  # was row=2
 
         cpf = ttk.LabelFrame(tab, text="CW Parameters", padding=10)
-        cpf.grid(row=0, column=1, rowspan=3, sticky="nsew", pady=(0, 8))
+        cpf.grid(row=0, column=1, rowspan=4, sticky="nsew", pady=(0, 8))  # was rowspan=3
         cpf.columnconfigure(0, weight=1)
 
         def cw_slider(label, var, from_, to, fmt, cb):
@@ -1066,7 +1080,7 @@ class SX1280ControlApp(ttk.Frame):
 
         # === Send Text as CW ===
         tf = ttk.LabelFrame(tab, text="Send Text as CW", padding=8)
-        tf.grid(row=3, column=1, sticky="nsew", pady=(0, 8))
+        tf.grid(row=4, column=1, sticky="nsew", pady=(0, 8))  # was row=3
         tf.columnconfigure(0, weight=1)
         self.cw_text_entry = ttk.Entry(tf, textvariable=self.cw_text_var,
                                        font=("TkDefaultFont", 13))
@@ -1079,7 +1093,7 @@ class SX1280ControlApp(ttk.Frame):
         ttk.Button(tbf2, text="⛔ Stop", command=self._abort_cw_text, width=8).pack(side="left")
 
         sf = ttk.LabelFrame(tab, text="Status", padding=8)
-        sf.grid(row=3, column=0, sticky="nsew", padx=(0, 5), pady=(0, 8))
+        sf.grid(row=4, column=0, sticky="nsew", padx=(0, 5), pady=(0, 8))  # was row=3
         self.cw_conn_lbl = ttk.Label(sf, textvariable=self.cw_conn_status_var,
                                       font=("TkDefaultFont", 11, "bold"), foreground="red")
         self.cw_conn_lbl.pack()
@@ -1094,7 +1108,7 @@ class SX1280ControlApp(ttk.Frame):
         self.cw_tx_btn.pack(fill='x', pady=(4, 0))
 
         ttk.Label(tab, text="ESC = Abort  |  Pin → Key → GND  |  Active Low",
-                  foreground="gray").grid(row=4, column=0, columnspan=2, pady=2)
+                  foreground="gray").grid(row=5, column=0, columnspan=2, pady=2)  # was row=4
 
     def _build_gpsdo_tab(self):
         tab = ttk.Frame(self.notebook, padding=10)
@@ -1273,6 +1287,42 @@ class SX1280ControlApp(ttk.Frame):
         self.cw_sym_lbl.config(text=sym)
         self.master.after(50, self._cw_gui_update)
 
+    # ------------------------------------------------------------------ #
+    # WiFi CW mode toggle                                                 #
+    # ------------------------------------------------------------------ #
+    def _on_cw_mode_toggle(self):
+        """Enable/disable Serial-specific widgets based on selected mode."""
+        wifi = (self.cw_conn_mode_var.get() == 'WiFi')
+        serial_state = 'disabled' if wifi else 'normal'
+        for w in (self.cw_port_combo, self.cw_baud_combo,
+                  self.cw_conn_btn):
+            w.config(state=serial_state)
+
+    def _cw_wifi_send(self, text):
+        """Send *text* as a single UDP packet to the cwdaemon server on the Pico."""
+        import socket
+        ip = self.cw_wifi_ip_var.get().strip()
+        if not ip:
+            messagebox.showerror("WiFi CW", "Bitte Pico-IP-Adresse eingeben.")
+            return
+        unsupported = sorted({c for c in text if c != ' ' and c not in MORSE_CODE})
+        if unsupported:
+            messagebox.showerror("CW Text",
+                                 f"Nicht unterstützte Zeichen: {' '.join(unsupported)}")
+            return
+        try:
+            # Send WPM first (\x1b2<wpm>), then the text
+            wpm_cmd = b'\x1b2' + str(int(self.cw_wpm_var.get())).encode()
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.settimeout(1.0)
+                s.sendto(wpm_cmd, (ip, 6789))
+                s.sendto(text.encode('ascii', errors='ignore'), (ip, 6789))
+            self._log(f"WiFi CW → {ip}:6789  [{text}]", "info")
+        except OSError as exc:
+            messagebox.showerror("WiFi CW Fehler", str(exc))
+
+    # ------------------------------------------------------------------ #
+
     def _cw_on_esc(self, _=None):
         self._abort_cw_text()
         if self._cw_running:
@@ -1282,6 +1332,11 @@ class SX1280ControlApp(ttk.Frame):
         text = self.cw_text_var.get().strip().upper()
         if not text:
             return
+        # --- WiFi mode: delegate entirely to UDP ---
+        if self.cw_conn_mode_var.get() == 'WiFi':
+            self._cw_wifi_send(text)
+            return
+        # --- Serial mode: existing behaviour unchanged ---
         unsupported = sorted({c for c in text if c != ' ' and c not in MORSE_CODE})
         if unsupported:
             messagebox.showerror("CW Text", f"Unsupported characters: {' '.join(unsupported)}")
@@ -1299,6 +1354,19 @@ class SX1280ControlApp(ttk.Frame):
         self._cw_text_thread.start()
 
     def _abort_cw_text(self):
+        if self.cw_conn_mode_var.get() == 'WiFi':
+            # Send ESC-4 (abort) to the UDP cwdaemon server
+            import socket
+            ip = self.cw_wifi_ip_var.get().strip()
+            if ip:
+                try:
+                    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                        s.settimeout(0.5)
+                        s.sendto(b'\x1b4', (ip, 6789))
+                except OSError:
+                    pass
+            return
+        # Serial mode – existing behaviour unchanged
         self._cw_stop_evt.set()
         try: self._send_cmd_safe("stop")
         except: pass
