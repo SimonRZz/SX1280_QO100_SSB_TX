@@ -3,7 +3,7 @@
 > **Work in progress.** It is not yet clear whether this project is useful to anyone
 > beyond my own shack. The README is incomplete, photos will be added later, and some
 > sections may still be inaccurate. If you find it useful or have questions, feel free
-> to open an issue.
+> to open an issue. This is my first attempt at working with Github, Claude and code. No guarantee for anything.
 
 A 2.4 GHz uplink transmitter for the QO-100 geostationary amateur radio satellite,
 built around the Semtech SX1280 LoRa chip and a Raspberry Pi Pico 2.
@@ -48,7 +48,8 @@ GPS-disciplined SI5351 synthesizer — a technique originally described by
 In this build the bare SX1280 module (~20 mW) is used instead of the SX1280F27.
 The reason is simple: the external PA used here (SG Labs PA2400 V3) is fully driven
 by 20 mW, so the integrated PA of the F27 is not needed. Whether the F27 produces
-relevant spurious emissions compared to the bare module has not been systematically tested.
+relevant spurious emissions compared to the bare module has not been systematically tested. 
+You can also use the SX1280f27, no problem. 
 
 ---
 
