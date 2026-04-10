@@ -1,286 +1,255 @@
-# SX1280 QO-100 SSB TX
+# SX1280 QO-100 SSB/CW Transmitter with GPS-Disciplined Oscillator
 
-**Experimental SSB/Digital transmitter for QO-100 satellite based on SX1280 module (2.4 GHz)**
+> **Work in progress.** It is not yet clear whether this project is useful to anyone
+> beyond my own shack. The README is incomplete, photos will be added later, and some
+> sections may still be inaccurate. If you find it useful or have questions, feel free
+> to open an issue.
 
-[![License: CC BY-NC 4.0](https://img.shields.io/badge/License-CC%20BY--NC%204.0-lightgrey.svg)](https://creativecommons.org/licenses/by-nc/4.0/)
+A 2.4 GHz uplink transmitter for the QO-100 geostationary amateur radio satellite,
+built around the Semtech SX1280 LoRa chip and a Raspberry Pi Pico 2.
 
-## Demo
+This is a fork of [SP8ESA's SX1280_QO100_SSB_TX](https://github.com/SP8ESA/SX1280_QO100_SSB_TX).
+The README has not yet been fully updated — the relevant work is in the code.
 
-📺 **Video test:** [YouTube Short - SSB TX Test](https://www.youtube.com/shorts/xTy9VHoNrlg)
+---
 
-![Waterfall signal from SX1280 with external PA](img/waterfall1.png)
-*SSB signal on QO-100 waterfall (with external amplifier)*
+## What this project adds
 
-## Project Description
+- **GPS-disciplined oscillator (GPSDO)** integrated directly into the Pico firmware —
+  no separate Arduino Nano required
+- **Transmit lock on GPS fix**: the transmitter does not start until the NEO-7M has
+  acquired enough satellites and the timepulse is stable
+- **Rock-stable frequency**: GPS-locked reference eliminates the thermal drift of the
+  SX1280's internal TCXO, making SSB fully usable
+- **CW keyer** with iambic A/B and straight key support — connect a key via a
+  TTL-to-USB adapter and operate directly from the GUI
+- **GPSDO status tab** in the Python GUI showing satellite count, lock status and
+  timepulse frequency
 
-SSB (Single Sideband) and digital modes transmitter for the 2.4 GHz band, designed for communication via the narrowband transponder of the geostationary satellite **QO-100 (Es'hail 2)**.
+---
 
-### Features
+## Background
 
-- **USB Audio** - Pico acts as USB sound card, audio input directly from computer
-- **Output power up to +27 dBm** - Built-in PA in LoRa1280F27 module
-- **Real-time DSP** - Bandpass filter, equalizer, compressor
-- **USB CDC configuration** - Serial port for parameter control
-- **PPM correction** - Precise frequency tuning
-- **Carrier mode** - Automatic CW when USB disconnected (after 10s)
+The original SP8ESA project demonstrated that the SX1280 LoRa chip can be used as a
+direct IQ-modulated 2.4 GHz SSB transmitter. The chip accepts raw IQ samples over SPI,
+which the Pico writes at audio rate to produce SSB modulation.
 
-## Author
+The main problem encountered during testing was **frequency instability**: the SX1280F27
+module (which includes an integrated 500 mW PA) runs its PA continuously, causing
+significant thermal drift. SP8ESA has demonstrated that SSB is possible despite this,
+and CW certainly works too — but in my tests the drift was severe enough to make
+narrow digital modes (such as FT8) impossible to decode. The TCXO on the module cannot
+compensate for it.
 
-**Kacper Kidała SP8ESA**
+The solution is to replace the SX1280's internal reference entirely with a
+GPS-disciplined SI5351 synthesizer — a technique originally described by
+[CT2GQV](https://speakyssb.blogspot.com/2019/10/si5351-gps-disciplined-oscillator-with.html).
 
-Code generated with assistance from **Claude Opus 4.5** and **GPT 5.2**.
+In this build the bare SX1280 module (~20 mW) is used instead of the SX1280F27.
+The reason is simple: the external PA used here (SG Labs PA2400 V3) is fully driven
+by 20 mW, so the integrated PA of the F27 is not needed. Whether the F27 produces
+relevant spurious emissions compared to the bare module has not been systematically tested.
+
+---
+
+## How the GPSDO works
+
+```
+u-blox NEO-7M  →  24 MHz Timepulse  →  SI5351 XA input  →  CLK1: 52 MHz  →  SX1280 XTA
+```
+
+1. The NEO-7M is configured via UBX command `UBX-CFG-TP5` to output an exact **24 MHz
+   timepulse** on its TIMEPULSE pin. 24 MHz = 48 MHz ÷ 2 — an exact integer divisor,
+   no pulse-swallowing, no jitter.
+2. The **quartz crystal on the SI5351 breakout board is desoldered**. The 24 MHz GPS
+   signal is fed directly into the XA pin of the SI5351, replacing the crystal.
+3. The SI5351 synthesizes **52 MHz** from this GPS-locked reference via its PLL.
+4. The 52 MHz signal is fed into the **XTA pin of the SX1280**, replacing its internal
+   TCXO (which must also be desoldered; TCXO mode is kept permanently enabled via GP22 HIGH).
+
+The GPSDO logic (UBX configuration, satellite count polling, timepulse validation) runs
+directly on the Pico — the Arduino Nano from the original CT2GQV design is not needed.
+
+**The transmitter will not activate until the GPS module reports a valid fix with
+sufficient satellites.** The GPSDO tab in the GUI shows live lock status.
+
+---
+
+## CW Keyer
+
+A CW keyer is built into the firmware and exposed in the Python GUI. To use it:
+
+1. Connect a straight key or iambic paddle to a **TTL-to-USB serial adapter**
+   (e.g. CH340, CP2102). The key contacts connect to the DTR/RTS lines of the adapter.
+2. Plug the adapter into the PC running the GUI.
+3. Open the **CW Keyer tab**, select the correct serial port, and choose keyer mode
+   (Straight / Iambic A / Iambic B) and speed (WPM).
+4. The GUI reads the key state and controls the SX1280 carrier accordingly via the Pico.
+
+Sidetone is generated in software through the PC audio output.
+
+---
 
 ## Hardware
 
-### Required Components
+### Bill of materials
 
-| Component | Description |
-|-----------|-------------|
-| Raspberry Pi Pico 2 | RP2350 microcontroller |
-| LoRa1280F27-TCXO | SX1280 module with PA (+27 dBm) and TCXO |
-| 2.4 GHz Antenna | SMA or u.FL connector |
+| Part | Notes |
+|---|---|
+| Raspberry Pi Pico 2 (or Pico 2W) | Pico 2W recommended for future WiFi support |
+| SX1280 module (no internal PA) | ~20 mW output |
+| u-blox NEO-7M GPS module | Must support UBX protocol — see note below |
+| SI5351 breakout board | Crystal will be removed |
+| Helix antenna (3D printed) | See below; or use a dish |
+| External PA (optional) | Needed without a large dish |
 
-### Prototype
+**Why the NEO-7M specifically?** Cheap GPS modules output only NMEA sentences and do
+not support the UBX binary protocol. The NEO-7M supports `UBX-CFG-TP5`, which allows
+configuring the timepulse output to exactly 24 MHz. This is essential for the GPSDO —
+no other commonly available module supports this out of the box.
 
-![Prototype transmitter](img/prototype.png)
+---
 
-*Prototype transmitter used for QO-100 tests - quick and dirty but it works!*
-
-## Wiring Diagram
+### Wiring diagram
 
 ```
-Raspberry Pi Pico 2          LoRa1280F27-TCXO Module
-===================          =======================
-GPIO 16 (SPI0 RX)  ───────── MISO
-GPIO 17            ───────── NSS (CS)
-GPIO 18 (SPI0 SCK) ───────── SCK
-GPIO 19 (SPI0 TX)  ───────── MOSI
-GPIO 20            ───────── RESET
-GPIO 21            ───────── BUSY
-GPIO 22            ───────── TCXO_EN
-GPIO 14            ───────── RX_EN
-GPIO 15            ───────── TX_EN
+┌─────────────────────────────────────────────────────┐
+│                  Raspberry Pi Pico 2                │
+│                                                     │
+│  SPI0: GP2(SCK) GP3(MOSI) GP4(MISO) GP5(CS)  ──►  SX1280
+│  GP6  ──► SX1280 RESET                             │
+│  GP7  ──► SX1280 BUSY                              │
+│  GP8  ──► SX1280 DIO1                              │
+│  GP22 ──► SX1280 TCXO_EN  (permanently HIGH)       │
+│                                                     │
+│  UART0 RX (GP1) ◄── u-blox NEO-7M TX (UBX)        │
+│                                                     │
+│  I2C0: GP16(SDA) GP17(SCL) ──► SI5351 SDA/SCL      │
+└─────────────────────────────────────────────────────┘
 
-VBUS (5V)          ───────── VCC
-GND                ───────── GND
+u-blox NEO-7M
+  VCC ──► 3.3 V  (+ 220 µF + 100 nF decoupling)
+  GND ──► GND
+  TX  ──► Pico GP1
 
-USB                ───────── To computer (Audio + CDC)
+SI5351
+  VCC  ──► 3.3 V  (+ 100 nF directly at pin)
+  GND  ──► GND
+  SDA  ──► Pico GP16
+  SCL  ──► Pico GP17
+  CLK1 ──► SX1280 XTA  (52 MHz reference — keep this wire short!)
+  Crystal on SI5351 board: DESOLDER
+
+SX1280 RF out ──► antenna or PA input
 ```
 
-### IMPORTANT - TCXO Module
+> **Important:** The wire from SI5351 CLK1 to SX1280 XTA should be as short as possible.
+> Shield it or run it in coax if you can.
 
-The LoRa1280F27-TCXO module requires **TCXO_EN to be HIGH BEFORE SX1280 reset**!
+---
 
-## Building
+### Antenna
+
+A 3D-printed helix antenna is a practical option if you do not have a dish.
+The design used here is based on
+[this Thingiverse model](https://www.thingiverse.com/thing:4980180), modified as follows:
+
+- 8 turns
+- Narrower wire feed holes (2 mm) for the antenna element
+- M8 mounting holes
+- Guide rail on the side — allows printing in two halves and gluing back together accurately
+
+---
+
+### Critical assembly notes
+
+- **Desolder the crystal from the SI5351 board.** Without this, the XA input will not
+  accept the external GPS signal.
+- **Desolder the TCXO from the SX1280 module.** Keep GP22 permanently HIGH to hold
+  the SX1280 in TCXO mode. Never issue a `tcxo 0` command.
+- **Decoupling on NEO-7M VCC:** 220 µF electrolytic + 100 nF ceramic, placed close
+  to the module. The NEO-7M draws current spikes that cause GPS lock loss without this.
+- **Decoupling on SI5351 VCC:** 100 nF ceramic directly at the VCC pin. A missing cap
+  here produces visible ~1024 Hz spurs in the output spectrum (SI5351 PLL artifacts).
+- Build the GPSDO section in a metal enclosure if possible to reduce interference.
+
+---
+
+## Software
 
 ### Requirements
-- [Raspberry Pi Pico SDK](https://github.com/raspberrypi/pico-sdk) 2.0+ (or use VS Code Pico Extension)
-- CMake 3.13+
-- ARM GCC toolchain
 
-### Clone with submodules
+- Python 3.10+
+- Git
+
+### Installation
+
 ```bash
-git clone --recurse-submodules https://github.com/SP8ESA/SX1280_QO100_SSB_TX.git
+git clone https://github.com/SimonRZz/SX1280_QO100_SSB_TX
 cd SX1280_QO100_SSB_TX
+pip install -r requirements.txt
 ```
 
-Or if already cloned:
-```bash
-git submodule update --init
-```
+### Build the Pico firmware
 
-### Build
 ```bash
 mkdir build && cd build
 cmake ..
 make -j4
 ```
 
-### Flash
+This produces a `.uf2` file in the `build/` directory.
+
+### Flash the Pico firmware
+
+1. Hold the **BOOTSEL** button on the Pico and connect it via USB — it appears as a
+   mass storage device.
+2. Copy the `.uf2` file from the `/firmware/` directory onto it.
+3. The Pico reboots and starts running immediately.
+
+### Start the GUI
+
 ```bash
-# Hold BOOTSEL and connect USB
-cp SX1280SDR.uf2 /media/$USER/RPI-RP2/
+python main.py
 ```
 
-## Usage
+The GUI provides:
 
-### USB Audio
-1. Connect Pico to computer
-2. Select "SX1280 QO-100 SSB TX" as audio output device
-3. Transmit using any software (SDR, WSJT-X, fldigi, etc.)
-
-### GUI Control Panel
-
-![GUI Control Panel](img/gui.png)
-*Python GUI for real-time control of all TX parameters*
-
-Run the GUI:
-```bash
-python3 gui.py
-```
-
-### Carrier Mode
-If USB is not connected within 10 seconds of startup, the device automatically starts CW transmission on 2400.300 MHz at full power.
-
-## CDC Commands
-
-After connecting USB, a serial port is available with the following commands:
-
-### Basic Commands
-
-| Command | Description |
-|---------|-------------|
-| `help` | List commands |
-| `get` | Show current configuration |
-| `diag` | SX1280 and buffer diagnostics |
-| `tx 0/1` | Enable/disable TX (SSB modulation) |
-| `cw` | Start CW test |
-| `stop` | Stop CW transmission |
-
-### Frequency Configuration
-
-| Command | Description |
-|---------|-------------|
-| `freq <Hz>` | Set frequency with sub-Hz precision (e.g. `freq 2400100050.5`) |
-| `ppm <value>` | Oscillator PPM correction (e.g. `ppm -0.5`) |
-
-**Note:** Frequency is automatically split into PLL steps (~198 Hz resolution) plus fine DSP offset for sub-Hz precision.
-
-### DSP Block Enable/Disable
-
-| Command | Description |
-|---------|-------------|
-| `enable bp 0/1` | Enable/disable bandpass filter |
-| `enable eq 0/1` | Enable/disable equalizer |
-| `enable comp 0/1` | Enable/disable compressor |
-
-### Bandpass Filter Settings
-
-| Command | Description |
-|---------|-------------|
-| `set bp_lo <Hz>` | Lower filter frequency (default 200 Hz) |
-| `set bp_hi <Hz>` | Upper filter frequency (default 2700 Hz) |
-| `set bp_stages <1-10>` | Filter steepness (12 dB/oct per stage) |
-
-### Equalizer Settings
-
-| Command | Description |
-|---------|-------------|
-| `set eq_low_hz <Hz>` | Low shelf frequency |
-| `set eq_low_db <dB>` | Low shelf gain |
-| `set eq_high_hz <Hz>` | High shelf frequency |
-| `set eq_high_db <dB>` | High shelf gain |
-
-### Compressor Settings
-
-| Command | Description |
-|---------|-------------|
-| `set comp_thr <dB>` | Compressor threshold |
-| `set comp_ratio <n>` | Compression ratio |
-| `set comp_att <ms>` | Attack time |
-| `set comp_rel <ms>` | Release time |
-| `set comp_makeup <dB>` | Makeup gain |
-| `set comp_knee <dB>` | Knee width |
-| `set comp_outlim <0..1>` | Output limiter |
-
-### Amplifier Settings
-
-| Command | Description |
-|---------|-------------|
-| `set amp_gain <float>` | Final gain |
-| `set amp_min_a <float>` | Minimum amplitude |
-
-### Additional Commands
-
-| Command | Description |
-|---------|-------------|
-| `txpwr <-18..13>` | Max TX power on SX1280 chip in dBm |
-
-## Technical Specifications
-
-| Parameter | Value |
-|-----------|-------|
-| Frequency range | 2400.000 - 2400.500 MHz |
-| Output power | up to +27 dBm |
-| Modulation | SSB (USB), CW |
-| Audio sample rate | 48 kHz (USB) → 8 kHz (DSP) |
-| TCXO stability | ±0.5 ppm |
-
-## QO-100 Uplink
-
-QO-100 Narrowband Transponder:
-- **Uplink:** 2400.000 - 2400.500 MHz
-- **Downlink:** 10489.500 - 10490.000 MHz
-
-## Changelog
-
-### v1.5.0
-- **New feature:** Sub-Hz frequency precision via automatic PLL + DSP fine tuning
-  - Frequency stored as double - no more 198 Hz PLL quantization visible to user
-  - Firmware automatically splits frequency into PLL steps + DSP complex carrier rotation
-- **GUI improvements:**
-  - **TX ON/OFF button** with green color when transmitting
-  - **PPM slider** (-2 to +2 ppm) with immediate response
-  - **Scroll wheel tuning** (50 Hz per step, toggleable checkbox)
-  - **QO-100 downlink frequency** display (uplink → downlink conversion)
-  - All sliders now respond immediately (no delay)
-- Added `tx 0/1` command for TX enable/disable
-- **Updated default DSP values** (optimized for voice):
-  - Bandpass: 50-2700 Hz
-  - EQ low shelf: -2.0 dB (was -9.5)
-  - Compressor threshold: -2.5 dB (was -12.5)
-  - Output limit: 0.940 (was 0.312)
-  - Amp gain: 2.9 (was 4.36)
-
-### v1.4.1
-- **CRITICAL FIX:** Fixed NaN bug in shelf filter that caused continuous carrier instead of SSB modulation
-- **CRITICAL FIX:** Reverted unstable DSP parameter changes from v1.4.0 that caused distorted audio
-- Removed experimental features (timing jitter, EQ slope) that caused instability
-- Restored proven default DSP values from v1.3.0
-- Kept only stable new features: TX power control (`txpwr`) and BP stages (`bp_stages`)
-- GUI updated to match firmware capabilities
-
-### v1.4.0 (DEPRECATED - DO NOT USE)
-- ⚠️ This version has critical bugs causing continuous carrier and distorted audio
-- Added adjustable bandpass filter stages (`set bp_stages 1-10`)
-- Added EQ slope parameter (removed in v1.4.1)
-- Added timing jitter dithering (removed in v1.4.1)
-- Added TX power control (`txpwr -18..13`)
-
-### v1.3.0
-- DSP chain reordered: EQ → Compressor → BPF
-- Added Python GUI for CDC control
-
-### v1.2.0
-- Fixed USB Audio compatibility on Windows
-- Added volume control support
-
-### v1.1.0
-- Initial release with basic SSB TX functionality
-
-## TODO
-
-- [ ] Add preset system for saving/loading configurations
-- [ ] Add spectrum analyzer display in GUI
-
-## Warning
-
-**Transmission on 2.4 GHz requires appropriate radio license!**
-
-Make sure you have a valid amateur radio license and comply with regulations in your country.
-
-## License
-
-This project is licensed under **CC BY-NC 4.0** (Creative Commons Attribution-NonCommercial).
-
-- Non-commercial use (including amateur radio) - OK
-- Modifications allowed - OK
-- Commercial use requires author's permission
-
-This project uses:
-- [TinyUSB](https://github.com/hathach/tinyusb) - MIT License
-- [Raspberry Pi Pico SDK](https://github.com/raspberrypi/pico-sdk) - BSD-3-Clause
+- **Waterfall display** and frequency tuning
+- **SSB transmit** via PC microphone
+- **GPSDO tab**: live satellite count, lock status, timepulse frequency.
+  Transmit is blocked until a valid GPS fix is confirmed.
+- **CW keyer tab**: select serial port, keyer mode (Straight / Iambic A / Iambic B),
+  speed in WPM. Connect a paddle or straight key via any TTL-to-USB adapter.
 
 ---
 
-73 de SP8ESA
+## Transponder frequency calibration
+
+The QO-100 narrowband transponder LO is not exactly at its nominal value.
+Measure your signal on the [WebSDR](https://eshail.batc.org.uk/nb/) and adjust
+the LO calibration value in the GUI. The value used in this build:
+**8089.4972 MHz** (nominal is 8089.5 MHz).
+
+---
+
+## Planned / maybe someday
+
+- **WiFi remote operation** using the Pico 2W's CYW43439 radio:
+  cwdaemon-compatible UDP server on port 6789, web interface for frequency/speed/power,
+  WiFi client or AP mode with onboarding page.
+  Reference implementation for the concept: [ok1cdj/SX1281_QO100_TX](https://github.com/ok1cdj/SX1281_QO100_TX)
+
+---
+
+## Credits
+
+- [SP8ESA](https://github.com/SP8ESA/SX1280_QO100_SSB_TX) — original SX1280 QO-100 SSB TX project
+- [CT2GQV](https://speakyssb.blogspot.com/2019/10/si5351-gps-disciplined-oscillator-with.html) — SI5351 GPSDO concept
+- [Thingiverse / original helix design](https://www.thingiverse.com/thing:4980180)
+
+---
+
+## License
+
+GPL-3.0 — see [LICENSE](LICENSE)
