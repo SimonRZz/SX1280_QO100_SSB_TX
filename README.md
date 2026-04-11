@@ -113,39 +113,43 @@ no other commonly available module supports this out of the box.
 
 ### Wiring diagram
 
-```
 ┌─────────────────────────────────────────────────────┐
 │                  Raspberry Pi Pico 2                │
 │                                                     │
-│  SPI0: GP2(SCK) GP3(MOSI) GP4(MISO) GP5(CS)  ──►  SX1280
-│  GP6  ──► SX1280 RESET                             │
-│  GP7  ──► SX1280 BUSY                              │
-│  GP8  ──► SX1280 DIO1                              │
+│  I2C0: GP0(SDA) GP1(SCL)  ──►  SI5351              │
+│                                                     │
+│  UART1: GP4(TX) ──► NEO-7M RX                      │
+│         GP5(RX) ◄── NEO-7M TX                      │
+│                                                     │
+│  I2C1: GP6(SDA) GP7(SCL)  ──►  OLED                │
+│                                                     │
+│  GP9  ◄── CW Dit paddle (active LOW)               │
+│  GP10 ◄── Encoder button (active LOW)              │
+│  GP11 ◄── CW Dah paddle (active LOW)               │
+│                                                     │
+│  GP14 ──► SX1280 RX_EN                             │
+│  GP15 ──► SX1280 TX_EN                             │
+│  SPI0: GP16(MISO) GP17(CS) GP18(SCK) GP19(MOSI) ──► SX1280
+│  GP20 ──► SX1280 NRESET                            │
+│  GP21 ──► SX1280 BUSY                              │
 │  GP22 ──► SX1280 TCXO_EN  (permanently HIGH)       │
-│                                                     │
-│  UART0 RX (GP1) ◄── u-blox NEO-7M TX (UBX)        │
-│                                                     │
-│  I2C0: GP16(SDA) GP17(SCL) ──► SI5351 SDA/SCL      │
 └─────────────────────────────────────────────────────┘
 
 u-blox NEO-7M
   VCC ──► 3.3 V  (+ 220 µF + 100 nF decoupling)
   GND ──► GND
-  TX  ──► Pico GP1
+  TX  ──► Pico GP5
+  RX  ◄── Pico GP4
 
 SI5351
   VCC  ──► 3.3 V  (+ 100 nF directly at pin)
   GND  ──► GND
-  SDA  ──► Pico GP16
-  SCL  ──► Pico GP17
+  SDA  ──► Pico GP0
+  SCL  ──► Pico GP1
   CLK1 ──► SX1280 XTA  (52 MHz reference — keep this wire short!)
   Crystal on SI5351 board: DESOLDER
 
 SX1280 RF out ──► antenna or PA input
-```
-
-> **Important:** The wire from SI5351 CLK1 to SX1280 XTA should be as short as possible.
-> Shield it or run it in coax if you can.
 
 ---
 
