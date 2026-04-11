@@ -111,8 +111,9 @@ no other commonly available module supports this out of the box.
 
 ---
 
-### Wiring diagram
+## Wiring diagram
 
+```
 Raspberry Pi Pico 2          SX1280 Module
 ===================          =============
 GP16 (SPI0 MISO)   ───────── MISO
@@ -143,6 +144,7 @@ NEO-7M  VCC:   220 µF electrolytic + 100 nF ceramic close to module
 SPI lines:     33 Ω series resistors on SCK/MOSI (reduce ringing)
 I2C lines:     4.7 kΩ pull-up resistors on SDA/SCL (if not on breakout)
 CLK1 → XTA:   shield wire or short coax run recommended
+```
 
 ---
 
