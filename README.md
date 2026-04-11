@@ -113,43 +113,36 @@ no other commonly available module supports this out of the box.
 
 ### Wiring diagram
 
-┌─────────────────────────────────────────────────────┐
-│                  Raspberry Pi Pico 2                │
-│                                                     │
-│  I2C0: GP0(SDA) GP1(SCL)  ──►  SI5351              │
-│                                                     │
-│  UART1: GP4(TX) ──► NEO-7M RX                      │
-│         GP5(RX) ◄── NEO-7M TX                      │
-│                                                     │
-│  I2C1: GP6(SDA) GP7(SCL)  ──►  OLED                │
-│                                                     │
-│  GP9  ◄── CW Dit paddle (active LOW)               │
-│  GP10 ◄── Encoder button (active LOW)              │
-│  GP11 ◄── CW Dah paddle (active LOW)               │
-│                                                     │
-│  GP14 ──► SX1280 RX_EN                             │
-│  GP15 ──► SX1280 TX_EN                             │
-│  SPI0: GP16(MISO) GP17(CS) GP18(SCK) GP19(MOSI) ──► SX1280
-│  GP20 ──► SX1280 NRESET                            │
-│  GP21 ──► SX1280 BUSY                              │
-│  GP22 ──► SX1280 TCXO_EN  (permanently HIGH)       │
-└─────────────────────────────────────────────────────┘
+Raspberry Pi Pico 2          SX1280 Module
+===================          =============
+GP16 (SPI0 MISO)   ───────── MISO
+GP17 (SPI0 CS)     ───────── NSS / CS
+GP18 (SPI0 SCK)    ───────── SCK
+GP19 (SPI0 MOSI)   ───────── MOSI
+GP20               ───────── NRESET
+GP21               ───────── BUSY
+GP22               ───────── TCXO_EN (permanently HIGH)
+GP14               ───────── RX_EN
+GP15               ───────── TX_EN
+3V3                ───────── VCC
+GND                ───────── GND
 
-u-blox NEO-7M
-  VCC ──► 3.3 V  (+ 220 µF + 100 nF decoupling)
-  GND ──► GND
-  TX  ──► Pico GP5
-  RX  ◄── Pico GP4
+SI5351 (I2C0)                u-blox NEO-7M (UART1)
+=============                =====================
+GP0  (I2C0 SDA)    ── SDA   GP4  (UART1 TX)   ── RX
+GP1  (I2C0 SCL)    ── SCL   GP5  (UART1 RX)   ── TX
+CLK1               ── SX1280 XTA (keep wire short!)
+3V3                ── VCC
+GND                ── GND
+Crystal: DESOLDER
 
-SI5351
-  VCC  ──► 3.3 V  (+ 100 nF directly at pin)
-  GND  ──► GND
-  SDA  ──► Pico GP0
-  SCL  ──► Pico GP1
-  CLK1 ──► SX1280 XTA  (52 MHz reference — keep this wire short!)
-  Crystal on SI5351 board: DESOLDER
-
-SX1280 RF out ──► antenna or PA input
+Optional: Decoupling
+====================
+SI5351  VCC:   100 nF ceramic directly at VCC pin
+NEO-7M  VCC:   220 µF electrolytic + 100 nF ceramic close to module
+SPI lines:     33 Ω series resistors on SCK/MOSI (reduce ringing)
+I2C lines:     4.7 kΩ pull-up resistors on SDA/SCL (if not on breakout)
+CLK1 → XTA:   shield wire or short coax run recommended
 
 ---
 
