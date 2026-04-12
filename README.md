@@ -74,7 +74,7 @@ directly on the Pico — the Arduino Nano from the original CT2GQV design is not
 **The transmitter will not activate until the GPS module reports a valid fix with
 sufficient satellites.** The GPSDO tab in the GUI shows live lock status.
 
-![Keyer Tab](img/GPSDO%Tab.jpg)
+![Keyer Tab](img/GPSDO%20Tab.jpg)
 
 ---
 
