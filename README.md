@@ -209,13 +209,17 @@ This produces a `.uf2` file in the `build/` directory.
 
 1. Hold the **BOOTSEL** button on the Pico and connect it via USB — it appears as a
    mass storage device.
-2. Copy the `.uf2` file from the `/firmware/` directory onto it.
+2. Copy the `.uf2` file from the `/build/` directory onto it.
 3. The Pico reboots and starts running immediately.
 
 ### Start the GUI
 
 ```bash
-python main.py
+python gui.py
+```
+or
+```bash
+python3 gui.py
 ```
 
 The GUI provides:
