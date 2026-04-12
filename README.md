@@ -170,12 +170,14 @@ The design used here is based on
 
 - **Desolder the crystal from the SI5351 board.** Without this, the XA input will not
   accept the external GPS signal.
+
+<img src="img/si5351.JPG" width="300">
 - **Desolder the TCXO from the SX1280 module.** Keep GP22 permanently HIGH to hold
   the SX1280 in TCXO mode. Never issue a `tcxo 0` command.
   
   <img src="img/SX1280f27_TCXO_removal.JPG" width="300">
 - **Decoupling on NEO-7M VCC:** 220 µF electrolytic + 100 nF ceramic, placed close
-  to the module. The NEO-7M draws current spikes that cause GPS lock loss without this.
+  to the module might be good practice.
 - **Decoupling on SI5351 VCC:** 100 nF ceramic directly at the VCC pin. A missing cap
   here could produces spurs.
 - Build the GPSDO section (or the entire transmitter) in a metal enclosure if possible to reduce interference.
