@@ -109,7 +109,7 @@ Sidetone is generated in software through the PC audio output.
 | u-blox NEO-7M GPS module | Must support UBX protocol — see note below |
 | SI5351 breakout board | Crystal will be removed |
 | Helix antenna (3D printed) | See below; or use a dish or Yagi |
-| External PA (optional) | Needed without a large dish |
+| External PA (optional) | Needed without a large dish for CW and SSB |
 
 **Why the NEO-7M specifically?** Cheap GPS modules output only NMEA sentences and do
 not support the UBX binary protocol. The NEO-7M supports `UBX-CFG-TP5`, which allows
