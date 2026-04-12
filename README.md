@@ -89,7 +89,7 @@ A CW keyer is built into the firmware and exposed in the Python GUI. To use it:
 
 Sidetone is generated in software through the PC audio output.
 
-![Keyer Tab](img/CW Keyer Tab.jpg)
+![Keyer Tab](img/CW%20Keyer%20Tab.jpg)
 
 
 ---
