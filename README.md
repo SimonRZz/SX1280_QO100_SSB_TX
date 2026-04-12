@@ -172,7 +172,8 @@ The design used here is based on
   accept the external GPS signal.
 - **Desolder the TCXO from the SX1280 module.** Keep GP22 permanently HIGH to hold
   the SX1280 in TCXO mode. Never issue a `tcxo 0` command.
-  <img src="img/SX1280f27_TCXO_removal.JPG.jpg" width="300">
+  
+  <img src="img/SX1280f27_TCXO_removal.JPG" width="300">
 - **Decoupling on NEO-7M VCC:** 220 µF electrolytic + 100 nF ceramic, placed close
   to the module. The NEO-7M draws current spikes that cause GPS lock loss without this.
 - **Decoupling on SI5351 VCC:** 100 nF ceramic directly at the VCC pin. A missing cap
