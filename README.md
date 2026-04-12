@@ -48,25 +48,28 @@ GPS-disciplined SI5351 synthesizer — a technique originally described by
 In this build the bare SX1280 module (~20 mW) is used instead of the SX1280F27.
 The reason is simple: the external PA used here (SG Labs PA2400 V3) is fully driven
 by 20 mW, so the integrated PA of the F27 is not needed. Whether the F27 produces
-relevant spurious emissions compared to the bare module has not been systematically tested. 
-You can also use the SX1280f27, no problem. 
+relevant spurious emissions compared to the bare module has not been systematically tested.
+You can also use the SX1280f27, no problem.
 
 ---
 
 ## How the GPSDO works
 
 ```
-u-blox NEO-7M  →  24 MHz Timepulse  →  SI5351 XA input  →  CLK1: 52 MHz  →  SX1280 XTA
+NEO-7M TIMEPULSE pin: 24 MHz  →  SI5351 XA pin  →  CLK1: 52 MHz  →  100 Ω  →  SX1280 XTA
 ```
 
 1. The NEO-7M is configured via UBX command `UBX-CFG-TP5` to output an exact **24 MHz
    timepulse** on its TIMEPULSE pin. 24 MHz = 48 MHz ÷ 2 — an exact integer divisor,
    no pulse-swallowing, no jitter.
-2. The **quartz crystal on the SI5351 breakout board is desoldered**. The 24 MHz GPS
-   signal is fed directly into the XA pin of the SI5351, replacing the crystal.
+2. The **quartz crystal on the SI5351 breakout board is desoldered**. The 24 MHz signal
+   from the NEO-7M TIMEPULSE pin is fed directly into the XA pin of the SI5351,
+   replacing the crystal.
 3. The SI5351 synthesizes **52 MHz** from this GPS-locked reference via its PLL.
-4. The 52 MHz signal is fed into the **XTA pin of the SX1280**, replacing its internal
-   TCXO (which must also be desoldered; TCXO mode is kept permanently enabled via GP22 HIGH).
+4. The 52 MHz signal is fed via a **100 Ω series resistor** into the **XTA pin of the
+   SX1280**, replacing its internal TCXO (which must also be desoldered; TCXO mode is
+   kept permanently enabled via GP22 HIGH). No external coupling capacitor is needed —
+   the SX1280 has one internally behind the XTA pin.
 
 The GPSDO logic (UBX configuration, satellite count polling, timepulse validation) runs
 directly on the Pico — the Arduino Nano from the original CT2GQV design is not needed.
@@ -74,7 +77,7 @@ directly on the Pico — the Arduino Nano from the original CT2GQV design is not
 **The transmitter will not activate until the GPS module reports a valid fix with
 sufficient satellites.** The GPSDO tab in the GUI shows live lock status.
 
-![Keyer Tab](img/GPSDO%20Tab.jpg)
+![GPSDO Tab](img/GPSDO%20Tab.jpg)
 
 ---
 
@@ -93,7 +96,6 @@ Sidetone is generated in software through the PC audio output.
 
 ![Keyer Tab](img/CW%20Keyer%20Tab.jpg)
 
-
 ---
 
 ## Hardware
@@ -103,7 +105,7 @@ Sidetone is generated in software through the PC audio output.
 | Part | Notes |
 |---|---|
 | Raspberry Pi Pico 2 (or Pico 2W) | Pico 2W recommended for future WiFi support |
-| SX1280 module (no internal PA) | ~20 mW output | or SX1280f27 with internal PA and ~500 mW output
+| SX1280 module (no internal PA) | ~20 mW output; or SX1280f27 with ~500 mW integrated PA |
 | u-blox NEO-7M GPS module | Must support UBX protocol — see note below |
 | SI5351 breakout board | Crystal will be removed |
 | Helix antenna (3D printed) | See below; or use a dish or Yagi |
@@ -137,10 +139,13 @@ SI5351 (I2C0)                u-blox NEO-7M (UART1)
 =============                =====================
 GP0  (I2C0 SDA)    ── SDA   GP4  (UART1 TX)   ── RX
 GP1  (I2C0 SCL)    ── SCL   GP5  (UART1 RX)   ── TX
-CLK1               ── SX1280 XTA (keep wire short!)
+CLK1  ── 100 Ω ── SX1280 XTA (keep wire short!)
 3V3                ── VCC
 GND                ── GND
 Crystal: DESOLDER
+
+NEO-7M TIMEPULSE pin  ──────── SI5351 XA pin
+(24 MHz GPS reference; replaces SI5351 crystal)
 
 Optional: Decoupling
 ====================
@@ -148,7 +153,7 @@ SI5351  VCC:   100 nF ceramic directly at VCC pin
 NEO-7M  VCC:   220 µF electrolytic + 100 nF ceramic close to module
 SPI lines:     33 Ω series resistors on SCK/MOSI (reduce ringing)
 I2C lines:     4.7 kΩ pull-up resistors on SDA/SCL (if not on breakout)
-CLK1 → XTA:   shield wire or short coax run recommended
+CLK1 → XTA:   100 Ω series resistor; shield wire or short coax run recommended
 ```
 
 ---
@@ -169,18 +174,25 @@ The design used here is based on
 ### Critical assembly notes
 
 - **Desolder the crystal from the SI5351 board.** Without this, the XA input will not
-  accept the external GPS signal.
+  accept the external GPS signal. Connect the NEO-7M TIMEPULSE pin directly to the
+  SI5351 XA pin.
 
 <img src="img/si5351.JPG" width="300">
+
 - **Desolder the TCXO from the SX1280 module.** Keep GP22 permanently HIGH to hold
   the SX1280 in TCXO mode. Never issue a `tcxo 0` command.
-  
-  <img src="img/SX1280f27_TCXO_removal.JPG" width="300">
+
+<img src="img/SX1280f27_TCXO_removal.JPG" width="300">
+
+- **100 Ω series resistor between SI5351 CLK1 and SX1280 XTA.** Damps ringing on the
+  line. No external coupling capacitor is needed — the SX1280 has one internally behind
+  the XTA pin.
 - **Decoupling on NEO-7M VCC:** 220 µF electrolytic + 100 nF ceramic, placed close
   to the module might be good practice.
 - **Decoupling on SI5351 VCC:** 100 nF ceramic directly at the VCC pin. A missing cap
-  here could produces spurs.
-- Build the GPSDO section (or the entire transmitter) in a metal enclosure if possible to reduce interference.
+  here could produce spurs.
+- Build the GPSDO section (or the entire transmitter) in a metal enclosure if possible
+  to reduce interference.
 
 ---
 
@@ -228,7 +240,7 @@ python3 gui.py
 
 The GUI provides:
 
-- **Fequency tuning**
+- **Frequency tuning**
 - **SSB transmit** via PC microphone
 - **GPSDO tab**: live satellite count, lock status, timepulse frequency.
   Transmit is blocked until a valid GPS fix is confirmed.
