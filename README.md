@@ -103,10 +103,10 @@ Sidetone is generated in software through the PC audio output.
 | Part | Notes |
 |---|---|
 | Raspberry Pi Pico 2 (or Pico 2W) | Pico 2W recommended for future WiFi support |
-| SX1280 module (no internal PA) | ~20 mW output |
+| SX1280 module (no internal PA) | ~20 mW output | or SX1280f27 with internal PA and ~500 mW output
 | u-blox NEO-7M GPS module | Must support UBX protocol — see note below |
 | SI5351 breakout board | Crystal will be removed |
-| Helix antenna (3D printed) | See below; or use a dish |
+| Helix antenna (3D printed) | See below; or use a dish or Yagi |
 | External PA (optional) | Needed without a large dish |
 
 **Why the NEO-7M specifically?** Cheap GPS modules output only NMEA sentences and do
@@ -220,7 +220,7 @@ python main.py
 
 The GUI provides:
 
-- **Waterfall display** and frequency tuning
+- **Fequency tuning**
 - **SSB transmit** via PC microphone
 - **GPSDO tab**: live satellite count, lock status, timepulse frequency.
   Transmit is blocked until a valid GPS fix is confirmed.
