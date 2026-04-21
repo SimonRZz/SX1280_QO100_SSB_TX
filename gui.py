@@ -733,6 +733,9 @@ class SX1280ControlApp(ttk.Frame):
         self.tune_var    = tk.BooleanVar(value=False)
         self.freq_mhz_var  = tk.DoubleVar(value=self.config.freq_hz / 1_000_000)
         self.freq_khz_var  = tk.StringVar(value=f"{self.config.freq_hz / 1000:.1f}")
+        _dl0 = self.config.freq_hz + QO100_LO_HZ
+        self.dl_mhz_var    = tk.DoubleVar(value=_dl0 / 1_000_000)
+        self.dl_khz_var    = tk.StringVar(value=f"{_dl0 / 1000:.1f}")
         self.ppm_var      = tk.DoubleVar(value=0.0)
         self.txpwr_var    = tk.IntVar(value=self.config.tx_power_dbm)
         self.tx_enabled_var          = tk.BooleanVar(value=True)
@@ -846,7 +849,7 @@ class SX1280ControlApp(ttk.Frame):
         ttk.Checkbutton(tbf, text="🖱️ Scroll Tune (50 Hz/step)",
                         variable=self.scroll_tune_enabled_var).pack(side="left", padx=20)
 
-        ttk.Label(rf, text="Frequency:").grid(row=1, column=0, sticky="w")
+        ttk.Label(rf, text="Uplink:").grid(row=1, column=0, sticky="w")
         fsf = ttk.Frame(rf)
         fsf.grid(row=1, column=1, sticky="ew", padx=5)
         fsf.columnconfigure(0, weight=1)
@@ -861,8 +864,25 @@ class SX1280ControlApp(ttk.Frame):
         self.freq_entry.bind("<Return>", lambda e: self._send_freq_from_entry())
         ttk.Label(fef, text=" kHz").pack(side="left")
 
+        ttk.Label(rf, text="Downlink:").grid(row=2, column=0, sticky="w")
+        dlf = ttk.Frame(rf)
+        dlf.grid(row=2, column=1, sticky="ew", padx=5)
+        dlf.columnconfigure(0, weight=1)
+        self.dl_scale = ttk.Scale(dlf,
+                                   from_=(self.FREQ_MIN_HZ + QO100_LO_HZ) / 1e6,
+                                   to=(self.FREQ_MAX_HZ + QO100_LO_HZ) / 1e6,
+                                   orient=tk.HORIZONTAL, variable=self.dl_mhz_var,
+                                   command=self._on_dl_slider)
+        self.dl_scale.grid(row=0, column=0, sticky="ew")
+        dlef = ttk.Frame(rf)
+        dlef.grid(row=2, column=2)
+        self.dl_entry = ttk.Entry(dlef, textvariable=self.dl_khz_var, width=14)
+        self.dl_entry.pack(side="left")
+        self.dl_entry.bind("<Return>", lambda e: self._send_dl_from_entry())
+        ttk.Label(dlef, text=" kHz").pack(side="left")
+
         fdf = ttk.Frame(rf)
-        fdf.grid(row=2, column=1, columnspan=2, sticky="w", padx=5)
+        fdf.grid(row=3, column=1, columnspan=2, sticky="w", padx=5)
         self.freq_mhz_label = ttk.Label(fdf, text="2400.4000 MHz ↑",
                                          font=("TkDefaultFont", 12, "bold"))
         self.freq_mhz_label.pack(side="left")
@@ -871,18 +891,18 @@ class SX1280ControlApp(ttk.Frame):
                                          font=("TkDefaultFont", 12, "bold"), foreground="blue")
         self.downlink_label.pack(side="left")
 
-        ttk.Label(rf, text="PPM:").grid(row=3, column=0, sticky="w", pady=(10, 0))
+        ttk.Label(rf, text="PPM:").grid(row=4, column=0, sticky="w", pady=(10, 0))
         pf = ttk.Frame(rf)
-        pf.grid(row=3, column=1, columnspan=2, sticky="ew", padx=5, pady=(10, 0))
+        pf.grid(row=4, column=1, columnspan=2, sticky="ew", padx=5, pady=(10, 0))
         pf.columnconfigure(0, weight=1)
         ttk.Scale(pf, from_=-2.0, to=2.0, orient=tk.HORIZONTAL,
                   variable=self.ppm_var, command=self._on_ppm_slider).grid(row=0, column=0, sticky="ew")
         self.ppm_label = ttk.Label(pf, text="0.000 ppm", width=12)
         self.ppm_label.grid(row=0, column=1, padx=5)
 
-        ttk.Label(rf, text="TX Power:").grid(row=4, column=0, sticky="w", pady=(10, 0))
+        ttk.Label(rf, text="TX Power:").grid(row=5, column=0, sticky="w", pady=(10, 0))
         tpf = ttk.Frame(rf)
-        tpf.grid(row=4, column=1, sticky="ew", padx=5, pady=(10, 0))
+        tpf.grid(row=5, column=1, sticky="ew", padx=5, pady=(10, 0))
         tpf.columnconfigure(0, weight=1)
         LabeledScale(tpf, "", self.txpwr_var, -18, 13, 1,
                      lambda v: self._send_cmd_safe(f"txpwr {int(v)}"),
@@ -1506,8 +1526,11 @@ class SX1280ControlApp(ttk.Frame):
     def _update_freq_display(self):
         try:    hz = float(self.freq_khz_var.get()) * 1000
         except: hz = self.config.freq_hz
+        dl_hz = hz + QO100_LO_HZ
         self.freq_mhz_label.config(text=f"{hz/1_000_000:.4f} MHz ↑")
-        self.downlink_label.config(text=f"{(hz+QO100_LO_HZ)/1_000_000:.4f} MHz ↓")
+        self.downlink_label.config(text=f"{dl_hz/1_000_000:.4f} MHz ↓")
+        self.dl_mhz_var.set(dl_hz / 1_000_000)
+        self.dl_khz_var.set(f"{dl_hz / 1000:.1f}")
 
     def _on_global_scroll(self, event):
         if not self.scroll_tune_enabled_var.get(): return
@@ -1540,6 +1563,21 @@ class SX1280ControlApp(ttk.Frame):
         self._update_freq_display()
         self._send_cmd_safe(f"freq {hz}")
 
+    def _on_dl_slider(self, _val):
+        if self._status_updating:
+            return
+        dl_hz = max(self.FREQ_MIN_HZ + QO100_LO_HZ,
+                    min(self.FREQ_MAX_HZ + QO100_LO_HZ,
+                        int(round(self.dl_mhz_var.get() * 1_000_000 / 100)) * 100))
+        ul_hz = dl_hz - QO100_LO_HZ
+        self.dl_mhz_var.set(dl_hz / 1_000_000)
+        self.dl_khz_var.set(f"{dl_hz / 1000:.1f}")
+        self.freq_mhz_var.set(ul_hz / 1_000_000)
+        self.freq_khz_var.set(f"{ul_hz / 1000:.1f}")
+        self.freq_mhz_label.config(text=f"{ul_hz/1_000_000:.4f} MHz ↑")
+        self.downlink_label.config(text=f"{dl_hz/1_000_000:.4f} MHz ↓")
+        self._send_cmd_safe(f"freq {ul_hz}")
+
     def _send_freq(self, hz):
         self._send_cmd_safe(f"freq {hz:.1f}")
 
@@ -1552,6 +1590,23 @@ class SX1280ControlApp(ttk.Frame):
             self.freq_mhz_var.set(hz / 1_000_000)
             self._update_freq_display()
             self._send_cmd_safe(f"freq {hz:.1f}")
+        except ValueError:
+            messagebox.showerror("Invalid frequency", "Frequency must be a number in kHz")
+
+    def _send_dl_from_entry(self):
+        try:
+            khz = float(self.dl_khz_var.get().replace(",", "."))
+            dl_hz = round(khz * 1000 / 100) * 100
+            dl_hz = max(self.FREQ_MIN_HZ + QO100_LO_HZ,
+                        min(self.FREQ_MAX_HZ + QO100_LO_HZ, dl_hz))
+            ul_hz = dl_hz - QO100_LO_HZ
+            self.dl_khz_var.set(f"{dl_hz / 1000:.1f}")
+            self.dl_mhz_var.set(dl_hz / 1_000_000)
+            self.freq_khz_var.set(f"{ul_hz / 1000:.1f}")
+            self.freq_mhz_var.set(ul_hz / 1_000_000)
+            self.freq_mhz_label.config(text=f"{ul_hz/1_000_000:.4f} MHz ↑")
+            self.downlink_label.config(text=f"{dl_hz/1_000_000:.4f} MHz ↓")
+            self._send_cmd_safe(f"freq {ul_hz:.1f}")
         except ValueError:
             messagebox.showerror("Invalid frequency", "Frequency must be a number in kHz")
 
