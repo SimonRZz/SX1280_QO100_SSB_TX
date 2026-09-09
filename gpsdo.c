@@ -40,7 +40,8 @@
 #define GPSDO_NMEA_STALE_MS 3000u
 #define GPSDO_GGA_STALE_MS  5000u
 #define GPSDO_GSV_FRESH_MS  10000u
-#define GPSDO_SI5351_POLL_MS 30000u   // SI5351 reg-0 re-read interval
+#define GPSDO_SI5351_POLL_MS 30000u   // SI5351 reg-0 re-read interval once locked
+#define GPSDO_SI5351_FAST_POLL_MS 500u // ... while still waiting for PLL lock at boot
 #define GPSDO_NMEA_BUF      128u
 #define GPSDO_BOOT_DELAY_MS 300u      // wait before sending UBX commands
 
@@ -577,31 +578,44 @@ void gpsdo_init(void)
     printf("[GPSDO] UBX config sent — waiting for GPS lock...\n");
 }
 
+static bool si_locked_now(void)
+{
+    return s_clk1Ok &&
+           !(s_si5351_status & SI_STATUS_LOS_XTAL) &&
+           !(s_si5351_status & SI_STATUS_LOL_A);
+}
+
 void gpsdo_task(void)
 {
     process_incoming_gps();
 
-    // Re-read SI5351 status register every 30 s (infrequent to avoid I2C noise during TX).
+    // Re-read the SI5351 status register. Fast while waiting for the PLL at
+    // boot (the GPS TIMEPULSE may appear a moment after UBX config); slow once
+    // locked, to keep I2C traffic away from an active transmission.
     if (s_clk1Ok) {
         uint32_t now_ms = to_ms_since_boot(get_absolute_time());
-        if ((now_ms - s_si5351_pollMs) >= GPSDO_SI5351_POLL_MS) {
+        uint32_t interval = si_locked_now() ? GPSDO_SI5351_POLL_MS
+                                            : GPSDO_SI5351_FAST_POLL_MS;
+        if ((now_ms - s_si5351_pollMs) >= interval) {
             s_si5351_pollMs = now_ms;
             si_read_reg(SI_REG_STATUS, &s_si5351_status);
         }
     }
 
-    const bool si_locked = s_clk1Ok &&
-                           !(s_si5351_status & SI_STATUS_LOS_XTAL) &&
-                           !(s_si5351_status & SI_STATUS_LOL_A);
     // READY when SI5351 is locked AND GPS has provided at least one UTC timestamp.
     // UTC appearing means the GPS module has disciplined its oscillator to at least
     // one satellite — the TIMEPULSE 24 MHz is now frequency-accurate.
     // Without UTC the GPS runs on its free-running TCXO (±2.5 ppm = ±6 kHz at 2.4 GHz).
     const bool utc_valid = (s_utc[0] != '-');
-    if (!s_gpsdoReady && si_locked && utc_valid) {
+    if (!s_gpsdoReady && si_locked_now() && utc_valid) {
         s_gpsdoReady = true;
-        printf("[GPSDO] READY — SI5351 locked + GPS UTC received, starting SX1280\n");
+        printf("[GPSDO] READY — SI5351 locked + GPS UTC received, TX enabled\n");
     }
+}
+
+bool gpsdo_clock_ok(void)
+{
+    return si_locked_now();
 }
 
 bool gpsdo_is_ready(void)

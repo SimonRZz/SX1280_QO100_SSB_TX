@@ -85,6 +85,11 @@
 #define COMP_OUTPUT_LIMIT           (0.940f)
 // ===============================================
 
+// ================== FIRMWARE VERSION ==================
+#define FW_VERSION      "2.2.0-dev"
+#define FW_BUILD        __DATE__ " " __TIME__
+// ======================================================
+
 // ================== MODULE VARIANT ==================
 // Set to 1 if using LoRa1280F27-TCXO module
 // Set to 0 if using SX1280 V1.0 (no PA) with SI5351 52 MHz on XTA
@@ -154,7 +159,16 @@ static volatile uint8_t g_tx_enabled = 1;  // TX enable flag (for GUI TX button)
 static volatile uint8_t g_tx_mode = 0;     // 0 = USB (SSB), 1 = CW
 static volatile uint8_t g_tune_active = 0; // 1 = TUNE carrier active
 static volatile uint8_t g_ptt_key = 0;     // 1 = dit or dah paddle pressed (live)
+static volatile uint8_t g_key_dit = 0;     // dit paddle (GP9), debounced
+static volatile uint8_t g_key_dah = 0;     // dah paddle (GP11), debounced
 static volatile uint8_t g_soft_ptt_key = 0; // Software PTT/KEY via CDC "key 0|1" (GUI CW keyer)
+// GPS gate: 1 = TX only when gpsdo_is_ready() (default), 0 = override for bench tests.
+// Deliberately not persisted — resets to enforced on every boot.
+static volatile uint8_t g_gps_gate = 1;
+
+static inline bool tx_allowed(void) {
+    return gpsdo_is_ready() || !g_gps_gate;
+}
 
 // --- Encoder UI state ---
 typedef enum {
@@ -783,7 +797,7 @@ static void carrier_poll(void) {
     bool key         = (bool)(g_ptt_key | g_soft_ptt_key);
 
     bool need_idle    = mode_cw || tune;
-    bool need_carrier = tune || (mode_cw && key);
+    bool need_carrier = tx_allowed() && (tune || (mode_cw && key));
 
     uint32_t now = to_ms_since_boot(get_absolute_time());
 
@@ -1206,11 +1220,13 @@ static void cfg_print(void) {
 
     cdc_printf(
         "CFG:\r\n"
+        "  fw=" FW_VERSION "  built=" FW_BUILD "\r\n"
         "  freq=%s Hz (target)  ppm=%.3f  tx=%s  txpwr=%d dBm\r\n"
-        "  mode=%s  tune=%s\r\n"
+        "  mode=%s  tune=%s  gps=%s  gpsgate=%s\r\n"
         "  corrected=%s Hz  base_steps=%lu  fine=%.1f Hz (auto)\r\n",
         freq_str, g_ppm_correction, g_tx_enabled ? "ON" : "OFF", g_tx_power_max_dbm,
         g_tx_mode ? "CW" : "USB", g_tune_active ? "ON" : "OFF",
+        gpsdo_is_ready() ? "ready" : "wait", g_gps_gate ? "ON" : "OFF",
         corr_str, (unsigned long)get_base_steps(), fine);
     cdc_printf(
         "  enable bp=%u eq=%u comp=%u\r\n"
@@ -1233,7 +1249,10 @@ static void cmd_help(void) {
         "Commands:\r\n"
         "  help\r\n"
         "  get\r\n"
+        "  version       - firmware version and build date\r\n"
         "  diag          - show SX1280 status\r\n"
+        "  gpsdo         - GPSDO status line\r\n"
+        "  gpsgate 0|1   - 1: TX only with GPS UTC (default); 0: override for bench tests\r\n"
         "  tx 0|1        - enable/disable TX (SSB modulation)\r\n"
         "  mode usb|cw   - set modulation mode\r\n"
         "  tune 0|1      - toggle TUNE carrier\r\n"
@@ -1286,6 +1305,8 @@ static void cdc_status_push_ex(bool force) {
     static int8_t   last_pwr  = 127;
     static float    last_ppm  = 9999.0f;
     static double   last_freq = 0.0;
+    static uint8_t  last_gps  = 0xFF;
+    static uint8_t  last_gate = 0xFF;
 
     if (!tud_cdc_connected()) return;
 
@@ -1295,12 +1316,15 @@ static void cdc_status_push_ex(bool force) {
     int8_t   cur_pwr  = g_tx_power_max_dbm;
     float    cur_ppm  = g_ppm_correction;
     double   cur_freq = (double)g_target_freq_hz;
+    uint8_t  cur_gps  = gpsdo_is_ready() ? 1 : 0;
+    uint8_t  cur_gate = g_gps_gate;
 
     if (!force) {
         // Check if anything changed
         bool changed = (cur_mode != last_mode) || (cur_tune != last_tune) ||
                        (cur_tx != last_tx) || (cur_pwr != last_pwr) ||
-                       (cur_ppm != last_ppm) || (cur_freq != last_freq);
+                       (cur_ppm != last_ppm) || (cur_freq != last_freq) ||
+                       (cur_gps != last_gps) || (cur_gate != last_gate);
 
         if (!changed) return;
 
@@ -1321,10 +1345,10 @@ static void cdc_status_push_ex(bool force) {
 
     char status_buf[128];
     snprintf(status_buf, sizeof(status_buf),
-             "!S mode=%u tune=%u tx=%u pwr=%d ppm=%s%lu.%04lu freq=%s\r\n",
+             "!S mode=%u tune=%u tx=%u pwr=%d ppm=%s%lu.%04lu freq=%s gps=%u gate=%u\r\n",
              cur_mode, cur_tune, cur_tx, cur_pwr,
              ppm_neg ? "-" : "", (unsigned long)ppm_int, (unsigned long)ppm_frac,
-             freq_str);
+             freq_str, cur_gps, cur_gate);
     cdc_write_str(status_buf);
 
     last_mode = cur_mode;
@@ -1333,6 +1357,8 @@ static void cdc_status_push_ex(bool force) {
     last_pwr  = cur_pwr;
     last_ppm  = cur_ppm;
     last_freq = cur_freq;
+    last_gps  = cur_gps;
+    last_gate = cur_gate;
     last_push_ms = to_ms_since_boot(get_absolute_time());
 }
 
@@ -1358,7 +1384,25 @@ static void cdc_handle_line(char *line) {
         cdc_write_str(gbuf);
         return;
     }
-    if (streqi(argv[0], "cw"))   { g_tune_active = 1; cdc_printf("OK tune=ON (carrier_poll handles SPI)\r\n"); return; }
+    if (streqi(argv[0], "version") || streqi(argv[0], "ver")) {
+        cdc_write_str("FW: " FW_VERSION " built " FW_BUILD "\r\n");
+        return;
+    }
+    if (streqi(argv[0], "gpsgate") && argc >= 2) {
+        uint8_t v;
+        if (!parse_bool(argv[1], &v)) { cdc_write_str("ERR: gpsgate 0|1\r\n"); return; }
+        g_gps_gate = v;
+        if (v) cdc_write_str("OK gpsgate=ON (TX requires GPS UTC)\r\n");
+        else   cdc_write_str("OK gpsgate=OFF — WARNING: TX without GPS discipline, "
+                             "up to +/-6 kHz error at 2.4 GHz. Not persisted.\r\n");
+        return;
+    }
+    if (streqi(argv[0], "cw")) {
+        g_tune_active = 1;
+        cdc_printf("OK tune=ON (carrier_poll handles SPI)\r\n");
+        if (!tx_allowed()) cdc_write_str("WARN: carrier blocked until GPS UTC valid (gpsgate 0 to override)\r\n");
+        return;
+    }
     if (streqi(argv[0], "stop")) { g_tune_active = 0; g_soft_ptt_key = 0; cdc_printf("OK tune=OFF\r\n"); return; }
 
     // Software PTT/KEY for GUI CW keyer: key 0|1
@@ -1404,6 +1448,7 @@ static void cdc_handle_line(char *line) {
         g_tune_active = v;
         // carrier_poll() will handle SPI transitions
         cdc_printf("OK tune=%s\r\n", g_tune_active ? "ON" : "OFF");
+        if (v && !tx_allowed()) cdc_write_str("WARN: carrier blocked until GPS UTC valid (gpsgate 0 to override)\r\n");
         return;
     }
 
@@ -1416,6 +1461,7 @@ static void cdc_handle_line(char *line) {
         }
         g_tx_enabled = v;
         cdc_printf("OK tx=%s\r\n", g_tx_enabled ? "ON" : "OFF");
+        if (v && !tx_allowed()) cdc_write_str("WARN: TX blocked until GPS UTC valid (gpsgate 0 to override)\r\n");
         return;
     }
 
@@ -1713,7 +1759,9 @@ static void oled_prepare_frame(void) {
     // Row 0: TX ON/OFF + radio icon
     {
         const char *tx_label;
-        if (g_tx_mode == 1 && g_ptt_key) {
+        if (!tx_allowed()) {
+            tx_label = "WAIT GPS";
+        } else if (g_tx_mode == 1 && g_ptt_key) {
             tx_label = "KEY";
         } else {
             tx_label = g_tx_enabled ? "TX ON" : "TX OFF";
@@ -1751,8 +1799,8 @@ static int8_t  enc_accum = 0;
 // Button debounce state
 static uint8_t  ok_was_pressed = 0;
 static uint32_t ok_debounce_ms = 0;
-static uint32_t ptt_debounce_ms = 0;
-static uint8_t  ptt_last_state = 0;
+static uint32_t dit_debounce_ms = 0, dah_debounce_ms = 0;
+static uint8_t  dit_last_state = 0,  dah_last_state = 0;
 
 #define DEBOUNCE_MS         5
 
@@ -1907,14 +1955,21 @@ static void button_poll(void) {
         }
     }
 
-    // --- CW dit/dah paddles (GP9 / GP11, active LOW) ---
-    uint8_t ptt_raw = (!gpio_get(PIN_KEY_DIT)) | (!gpio_get(PIN_KEY_DAH));
+    // --- CW dit/dah paddles (GP9 / GP11, active LOW), debounced separately ---
+    uint8_t dit_raw = !gpio_get(PIN_KEY_DIT);
+    uint8_t dah_raw = !gpio_get(PIN_KEY_DAH);
 
-    if (ptt_raw != ptt_last_state && (now_ms - ptt_debounce_ms) >= DEBOUNCE_MS) {
-        ptt_debounce_ms = now_ms;
-        ptt_last_state = ptt_raw;
-        g_ptt_key = ptt_raw;
+    if (dit_raw != dit_last_state && (now_ms - dit_debounce_ms) >= DEBOUNCE_MS) {
+        dit_debounce_ms = now_ms;
+        dit_last_state  = dit_raw;
+        g_key_dit = dit_raw;
     }
+    if (dah_raw != dah_last_state && (now_ms - dah_debounce_ms) >= DEBOUNCE_MS) {
+        dah_debounce_ms = now_ms;
+        dah_last_state  = dah_raw;
+        g_key_dah = dah_raw;
+    }
+    g_ptt_key = g_key_dit | g_key_dah;
 }
 
 // ==========================================================
@@ -2155,11 +2210,21 @@ static void usb_audio_pump(void) {
 }
 
 // ==========================================================
-// PIO Frequency Counter for TCXO on GP26
-// Uses PIO state machine to count edges in 1-second window
+// Boot screen while waiting for the SI5351 clock
 // ==========================================================
+static void oled_draw_boot_wait(uint32_t elapsed_ms) {
+    char line[22];
+    ssd1306_clear();
+    ssd1306_draw_string(0, 0, "QO-100 TX " FW_VERSION);
+    ssd1306_draw_string(0, 1, FW_BUILD);
+    ssd1306_draw_string(0, 3, "Waiting for clock");
+    ssd1306_draw_string(0, 4, gpsdo_si5351_ok() ? "SI5351: PLL unlocked"
+                                                : "SI5351: NOT FOUND");
+    snprintf(line, sizeof(line), "%lus", (unsigned long)(elapsed_ms / 1000u));
+    ssd1306_draw_string(0, 6, line);
+    ssd1306_display(OLED_I2C);
+}
 
-// ==========================================================
 // ==========================================================
 // MAIN (CORE0): init + DSP producer
 // ==========================================================
@@ -2215,27 +2280,35 @@ int main(void) {
     gpio_pull_up(PIN_OLED_SDA);
     gpio_pull_up(PIN_OLED_SCL);
     ssd1306_init(OLED_I2C);
-    ssd1306_clear();
-    ssd1306_draw_string(0, 0, "SX1280 SSB TX");
-    ssd1306_draw_string(0, 2, "Waiting GPSDO..");
-    ssd1306_display(OLED_I2C);
+    oled_draw_boot_wait(0u);
 
     // ---- GPSDO: SI5351 52 MHz (I2C0, GP0/GP1) + NEO-7M GPS (UART1, GP4/GP5) ----
-    // SX1280 NRESET is held LOW above. Released only after GPSDO is ready.
+    // Stage 1 (blocking): wait for a locked 52 MHz clock from the SI5351. The
+    // SX1280 has no other clock source, so NRESET stays LOW until then.
+    // Stage 2 (non-blocking): GPS discipline (UTC) only gates TX via
+    // tx_allowed() — the UI, CDC and OLED run normally while GPS acquires.
     gpsdo_init();
     {
+        const uint32_t boot_ms = to_ms_since_boot(get_absolute_time());
         uint32_t last_status_ms  = 0u;
+        uint32_t last_oled_ms    = 0u;
         uint8_t  si_warn_printed = 0u;
-        while (!gpsdo_is_ready()) {
+        while (!gpsdo_clock_ok()) {
             gpsdo_task();
             tud_task();
-            cdc_task();   // allow 'gpsdo' command while waiting
+            cdc_task();   // allow 'gpsdo' / 'version' while waiting
             uint32_t now_ms = to_ms_since_boot(get_absolute_time());
+            // 1 s cadence: ssd1306_display() blocks ~100 ms on I2C at 100 kHz,
+            // and only the seconds counter changes anyway.
+            if ((now_ms - last_oled_ms) >= 1000u) {
+                last_oled_ms = now_ms;
+                oled_draw_boot_wait(now_ms - boot_ms);
+            }
             if (tud_cdc_connected()) {
                 if (!si_warn_printed && !gpsdo_si5351_ok()) {
                     si_warn_printed = 1u;
                     cdc_write_str("GPSDO: WARNING — SI5351 not found (GP0/GP1).\r\n"
-                                  "GPSDO: SX1280 will NOT start until SI5351 is connected.\r\n");
+                                  "GPSDO: SX1280 has no clock and will NOT start until SI5351 is connected.\r\n");
                 }
                 if ((now_ms - last_status_ms) >= 2000u) {
                     last_status_ms = now_ms;
@@ -2247,7 +2320,8 @@ int main(void) {
             }
         }
         if (tud_cdc_connected()) {
-            cdc_write_str("GPSDO: READY — 52 MHz locked, GPS time valid. Starting SX1280.\r\n");
+            cdc_write_str("GPSDO: 52 MHz clock locked — starting SX1280. "
+                          "TX stays blocked until GPS UTC is valid (see 'gpsgate').\r\n");
         }
     }
 
@@ -2436,7 +2510,7 @@ int main(void) {
 #if CFG_TUD_CDC
         if (!greeted && tud_cdc_connected()) {
             greeted = 1;
-            cdc_write_str("\r\nSX1280_SDR control ready. Type 'help'.\r\n");
+            cdc_write_str("\r\nSX1280_SDR control ready. FW " FW_VERSION " built " FW_BUILD ". Type 'help'.\r\n");
             cfg_print();
         }
 
@@ -2644,8 +2718,8 @@ int main(void) {
                 if (p_acc >= 1.0f && p_high != p_low) { p_chosen = p_high; p_acc -= 1.0f; }
             }
 
-            // Check global TX enable flag (from GUI TX button)
-            if (!g_tx_enabled) {
+            // Global TX enable (GUI TX button) and GPS gate
+            if (!g_tx_enabled || !tx_allowed()) {
                 tx_on = 0;
             }
 

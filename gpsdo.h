@@ -24,9 +24,16 @@ void gpsdo_init(void);
 // update internal state. Call this frequently (every few ms is fine).
 void gpsdo_task(void);
 
-// Returns true once the SI5351 CLK1 is running AND at least one GPS
-// satellite has been acquired (fixQuality > 0, satsUsed >= 1).
-// Only when this returns true will main.c release the SX1280 reset.
+// Returns true while the SI5351 CLK1 (52 MHz) is running and its PLL is
+// locked to the GPS TIMEPULSE — i.e. the SX1280 has a usable clock.
+// This is the condition for releasing the SX1280 reset.  It does NOT
+// imply GPS discipline: without a satellite the NEO-7M free-runs at
+// ±2.5 ppm (≈ ±6 kHz at 2.4 GHz).
+bool gpsdo_clock_ok(void);
+
+// Returns true once gpsdo_clock_ok() AND the GPS has delivered a UTC
+// timestamp, meaning the 24 MHz TIMEPULSE is satellite-disciplined.
+// This is the condition for allowing transmission.
 bool gpsdo_is_ready(void);
 
 // Returns true if the SI5351 was found and CLK1 is running.
