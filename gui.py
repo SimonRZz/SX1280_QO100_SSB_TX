@@ -792,6 +792,11 @@ class SX1280ControlApp(ttk.Frame):
         self._gps_ready     = None   # None = unknown, else bool from !S gps=
         self._gps_gate      = None   # None = unknown, else bool from !S gate=
 
+        # On-device keyer (firmware), synced from !S kwpm= / kmode=
+        self.dev_kmode_var  = tk.StringVar(value="Iambic B")
+        self.dev_kwpm_var   = tk.IntVar(value=18)
+        self.dev_kratio_var = tk.DoubleVar(value=3.0)
+
     def _build_ui(self):
         self.master.title("SX1280 QO-100 SSB TX Control")
         self.master.geometry("900x820")
@@ -1133,6 +1138,44 @@ class SX1280ControlApp(ttk.Frame):
 
         ttk.Label(tab, text="ESC = Abort  |  Pin → Key → GND  |  Active Low",
                   foreground="gray").grid(row=4, column=0, columnspan=2, pady=2)
+
+        # --- On-device keyer (paddles wired to the Pico) ---
+        df = ttk.LabelFrame(tab, text="On-device keyer (paddles at Pico GP9 dit / GP11 dah)", padding=10)
+        df.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        ttk.Label(df, text="Mode:").grid(row=0, column=0, sticky="w")
+        cb = ttk.Combobox(df, textvariable=self.dev_kmode_var, width=10, state="readonly",
+                          values=self._DEV_KMODES)
+        cb.grid(row=0, column=1, padx=4)
+        cb.bind("<<ComboboxSelected>>", lambda e: self._dev_keyer_send("mode"))
+        ttk.Label(df, text="WPM:").grid(row=0, column=2, sticky="e", padx=(12, 0))
+        sp = ttk.Spinbox(df, from_=5, to=60, width=5, textvariable=self.dev_kwpm_var,
+                         command=lambda: self._dev_keyer_send("wpm"))
+        sp.grid(row=0, column=3, padx=4)
+        sp.bind("<Return>", lambda e: self._dev_keyer_send("wpm"))
+        ttk.Label(df, text="Dah ratio:").grid(row=0, column=4, sticky="e", padx=(12, 0))
+        sr = ttk.Spinbox(df, from_=2.0, to=5.0, increment=0.1, width=5, format="%.1f",
+                         textvariable=self.dev_kratio_var,
+                         command=lambda: self._dev_keyer_send("ratio"))
+        sr.grid(row=0, column=5, padx=4)
+        sr.bind("<Return>", lambda e: self._dev_keyer_send("ratio"))
+        ttk.Label(df, text="Runs in firmware — keys the transmitter without this PC. "
+                           "WPM is also on the OLED menu. Settings are saved to flash.",
+                  foreground="gray").grid(row=1, column=0, columnspan=6, sticky="w", pady=(4, 0))
+
+    _DEV_KMODES = ["Straight", "Iambic A", "Iambic B"]
+
+    def _dev_keyer_send(self, what):
+        if self._status_updating:
+            return
+        try:
+            if what == "mode":
+                self._send_cmd_safe(f"keyer mode {self._DEV_KMODES.index(self.dev_kmode_var.get())}")
+            elif what == "wpm":
+                self._send_cmd_safe(f"keyer wpm {int(self.dev_kwpm_var.get())}")
+            else:
+                self._send_cmd_safe(f"keyer ratio {float(self.dev_kratio_var.get()):.1f}")
+        except (ValueError, tk.TclError) as e:
+            self._log(f"[KEYER] invalid value: {e}", "error")
 
     def _build_gpsdo_tab(self):
         tab = ttk.Frame(self.notebook, padding=10)
@@ -1527,6 +1570,15 @@ class SX1280ControlApp(ttk.Frame):
 
             if "dirty" in kv:
                 self.cfg_dirty_var.set("● unsaved (autosave 5 s idle)" if kv["dirty"] == "1" else "")
+
+            if "kwpm" in kv:
+                w = int(kv["kwpm"])
+                if self.dev_kwpm_var.get() != w:
+                    self.dev_kwpm_var.set(w)
+            if "kmode" in kv:
+                m = self._DEV_KMODES[max(0, min(2, int(kv["kmode"])))]
+                if self.dev_kmode_var.get() != m:
+                    self.dev_kmode_var.set(m)
 
             self._status_updating = False
         except Exception as e:
