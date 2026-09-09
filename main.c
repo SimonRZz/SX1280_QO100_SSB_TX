@@ -207,7 +207,7 @@ typedef enum {
     UI_PARAM_TUNE,       // TUNE on/off      (col 0, row 1)
     UI_PARAM_WPM,        // keyer speed      (col 0, row 2)
     UI_PARAM_TX,         // TX on/off        (col 1, row 0)
-    UI_PARAM_PPM,        // PPM correction   (col 1, row 1)
+    UI_PARAM_VOL,        // sidetone volume  (col 1, row 1) — PPM stays on CDC/GUI (moot with GPSDO)
     UI_PARAM_PWR,        // TX power dBm     (col 1, row 2)
     UI_PARAM_COUNT       // sentinel (= 6)
 } ui_param_t;
@@ -2065,11 +2065,11 @@ static void oled_prepare_frame(void) {
         DRAW_R(ROW0_Y, tx_label, UI_PARAM_TX);
     }
 
-    // Row 1: PPM
+    // Row 1: sidetone volume
     {
-        char ppm_buf[12];
-        snprintf(ppm_buf, sizeof(ppm_buf), "%+.2f", (double)g_ppm_correction);
-        DRAW_R(ROW1_Y, ppm_buf, UI_PARAM_PPM);
+        char vol_buf[12];
+        snprintf(vol_buf, sizeof(vol_buf), "VOL %u%%", (unsigned)g_st_vol);
+        DRAW_R(ROW1_Y, vol_buf, UI_PARAM_VOL);
     }
 
     // Row 2: Power
@@ -2326,7 +2326,9 @@ static void sidetone_update_params(void) {
 
 static bool __not_in_flash_func(sidetone_tick)(repeating_timer_t *t) {
     (void)t;
-    const bool    on     = g_keyer_key || g_tune_active || g_st_test;
+    // Also sound while the volume is being edited on the OLED, so the level can be heard.
+    const bool    on     = g_keyer_key || g_tune_active || g_st_test ||
+                           (g_ui_state == UI_STATE_EDITING && g_ui_editing == UI_PARAM_VOL);
     const int32_t target = on ? 32767 : 0;
     const int32_t step   = 32767 / ST_RAMP_SAMPLES;
     if (s_st_env < target)      { s_st_env += step; if (s_st_env > target) s_st_env = target; }
@@ -2458,14 +2460,14 @@ static void encoder_poll(void) {
                 case UI_PARAM_TX:
                     g_tx_enabled = g_tx_enabled ? 0 : 1;
                     break;
-                case UI_PARAM_PPM:
+                case UI_PARAM_VOL:
                     {
-                        float ppm = g_ppm_correction + (float)step * 0.01f;
-                        if (ppm < -50.0f) ppm = -50.0f;
-                        if (ppm >  50.0f) ppm =  50.0f;
-                        g_ppm_correction = ppm;
+                        int v = (int)g_st_vol + step * 5;
+                        if (v < 0)   v = 0;
+                        if (v > 100) v = 100;
+                        g_st_vol = (uint8_t)v;
+                        sidetone_update_params();
                         persist_mark_dirty();
-                        if (g_tune_active) tune_apply_settings();
                     }
                     break;
                 case UI_PARAM_PWR:
