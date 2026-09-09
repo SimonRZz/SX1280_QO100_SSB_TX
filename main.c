@@ -2346,6 +2346,10 @@ static void keyer_poll(void) {
 static void keyer_diag_print(void) {
     static const char *cr_names[] = { "IDLE", "ARMING", "ARMED", "CARRIER_ON" };
     static const char *ks_names[] = { "IDLE", "DIT", "DAH", "IEL", "ICH", "IWD", "?", "?" };
+    static const char *ui_names[] = { "IDLE", "BROWSE", "EDITING", "?" };
+    cdc_printf("Encoder: GP2(A)=%u GP3(B)=%u GP10(SW)=%u  ui=%s cursor=%u  (1 = pin at GND)\r\n",
+               (unsigned)!gpio_get(PIN_ENC_A), (unsigned)!gpio_get(PIN_ENC_B), (unsigned)!gpio_get(PIN_ENC_OK),
+               ui_names[g_ui_state & 3], (unsigned)g_ui_cursor);
     cdc_printf("Paddles: GP9(dit) raw=%u db=%u  GP11(dah) raw=%u db=%u  (1 = pressed, pin at GND)\r\n",
                (unsigned)!gpio_get(PIN_KEY_DIT), (unsigned)g_key_dit,
                (unsigned)!gpio_get(PIN_KEY_DAH), (unsigned)g_key_dah);
