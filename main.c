@@ -17,6 +17,8 @@
 #include "hardware/clocks.h"
 #include "hardware/i2c.h"
 #include "hardware/pwm.h"
+#include "hardware/dma.h"
+#include "hardware/irq.h"
 
 // TinyUSB
 #include "bsp/board_api.h"
@@ -2302,61 +2304,124 @@ static void keyer_diag_print(void) {
 // ==========================================================
 // Sidetone: PWM audio on GP12 → RC low-pass → headphones
 // ==========================================================
-// 10-bit PWM at sysclk/1024 (244 kHz @ 250 MHz); samples come from a
-// 16 kHz repeating timer. A pure sine with a 5 ms linear envelope on
-// each key edge — same rise time as the RF power ramp — so what you
-// hear matches what goes out.
+// 10-bit PWM at sysclk/1024 (244 kHz @ 250 MHz). Samples are delivered
+// by DMA at 48 kHz, paced by the wrap DREQ of a spare PWM slice used as a
+// timebase — no per-sample interrupt, no jitter from USB IRQs. Two
+// ping-pong buffers of 2.7 ms are refilled from the DMA completion IRQ.
+// Pure sine, 5 ms raised-cosine envelope on each key edge (same rise
+// time as the RF power ramp), first-order error feedback so the 10-bit
+// PWM does not hiss at low volume.
 #define PIN_AUDIO_OUT    12
 #define ST_PWM_WRAP      1023u
-#define ST_PERIOD_US     62                       // ≈16.1 kHz
-#define ST_FS_HZ         (1000000.0 / (double)ST_PERIOD_US)
-#define ST_RAMP_SAMPLES  80                       // ≈5 ms
+#define ST_FS_HZ         48000u
+#define ST_TB_SLICE      7        // timebase slice; GP14/15 are plain GPIO, so its counter is free
+#define ST_BUF           128      // samples per half-buffer (2.7 ms → key latency ≤ 5.3 ms)
+#define ST_RAMP_SAMPLES  240      // 5 ms
 
 static int16_t           s_st_sin[256];
+static uint16_t          s_st_rc[257];            // raised cosine 0..32767
+static uint32_t          s_st_buf[2][ST_BUF];     // PWM CC values (channel A in the low half)
+static int               s_st_dma[2] = { -1, -1 };
+static uint              s_st_slice;
 static volatile uint32_t s_st_inc  = 0;           // phase increment per sample
 static volatile int32_t  s_st_gain = 0;           // Q15 volume
-static uint32_t          s_st_phase = 0;
-static int32_t           s_st_env   = 0;          // Q15 envelope
-static repeating_timer_t s_st_timer;
+static uint32_t          s_st_phase   = 0;
+static uint32_t          s_st_env_pos = 0;        // 0..ST_RAMP_SAMPLES on the envelope
+static int32_t           s_st_err     = 0;        // quantisation error carried to the next sample
+static uint32_t          s_st_fs      = ST_FS_HZ;
 
 static void sidetone_update_params(void) {
-    s_st_inc  = (uint32_t)((double)g_st_hz * 4294967296.0 / ST_FS_HZ);
+    s_st_inc  = (uint32_t)((double)g_st_hz * 4294967296.0 / (double)s_st_fs);
     s_st_gain = (int32_t)g_st_vol * 32767 / 100;
 }
 
-static bool __not_in_flash_func(sidetone_tick)(repeating_timer_t *t) {
-    (void)t;
+static void __not_in_flash_func(sidetone_fill)(uint32_t *dst) {
+    const uint32_t inc  = s_st_inc;
+    const int32_t  gain = s_st_gain;
     // Also sound while the volume is being edited on the OLED, so the level can be heard.
-    const bool    on     = g_keyer_key || g_tune_active || g_st_test ||
-                           (g_ui_state == UI_STATE_EDITING && g_ui_editing == UI_PARAM_VOL);
-    const int32_t target = on ? 32767 : 0;
-    const int32_t step   = 32767 / ST_RAMP_SAMPLES;
-    if (s_st_env < target)      { s_st_env += step; if (s_st_env > target) s_st_env = target; }
-    else if (s_st_env > target) { s_st_env -= step; if (s_st_env < target) s_st_env = target; }
+    const bool on = g_keyer_key || g_tune_active || g_st_test ||
+                    (g_ui_state == UI_STATE_EDITING && g_ui_editing == UI_PARAM_VOL);
 
-    s_st_phase += s_st_inc;
-    const int32_t s   = s_st_sin[s_st_phase >> 24];
-    const int32_t amp = (s_st_env * s_st_gain) >> 15;          // Q15
-    const int32_t out = 512 + (((s * amp) >> 15) >> 6);        // ±511 around mid-scale
-    pwm_set_gpio_level(PIN_AUDIO_OUT, (uint16_t)out);
-    return true;
+    for (uint32_t i = 0; i < ST_BUF; i++) {
+        if (on)  { if (s_st_env_pos < ST_RAMP_SAMPLES) s_st_env_pos++; }
+        else     { if (s_st_env_pos > 0)               s_st_env_pos--; }
+        const int32_t env = s_st_rc[(s_st_env_pos * 256u) / ST_RAMP_SAMPLES];
+
+        s_st_phase += inc;
+        const int32_t s   = s_st_sin[s_st_phase >> 24];
+        const int32_t amp = (env * gain) >> 15;              // Q15
+        const int32_t v   = (s * amp) >> 15;                 // ±32767 full scale
+
+        // 16-bit sample → 10-bit PWM level with the rounding error fed back
+        // into the next sample (pushes quantisation noise above the RC corner).
+        const int32_t want = (v + 32768) * (int32_t)(ST_PWM_WRAP + 1u) + s_st_err;
+        int32_t lvl = want >> 16;
+        s_st_err = want - (lvl << 16);
+        if (lvl < 0) lvl = 0;
+        if (lvl > (int32_t)ST_PWM_WRAP) lvl = (int32_t)ST_PWM_WRAP;
+        dst[i] = (uint32_t)lvl;
+    }
+}
+
+static void __not_in_flash_func(sidetone_dma_irq)(void) {
+    for (int b = 0; b < 2; b++) {
+        if (s_st_dma[b] >= 0 && dma_channel_get_irq0_status((uint)s_st_dma[b])) {
+            dma_channel_acknowledge_irq0((uint)s_st_dma[b]);
+            sidetone_fill(s_st_buf[b]);
+            // Re-arm for the next chain trigger; TRANS_COUNT reloads automatically.
+            dma_channel_set_read_addr((uint)s_st_dma[b], s_st_buf[b], false);
+        }
+    }
 }
 
 static void sidetone_init(void) {
     for (int i = 0; i < 256; i++) {
         s_st_sin[i] = (int16_t)lrintf(sinf(2.0f * (float)M_PI * (float)i / 256.0f) * 32767.0f);
     }
-    sidetone_update_params();
+    for (int i = 0; i <= 256; i++) {
+        s_st_rc[i] = (uint16_t)lrintf((1.0f - cosf((float)M_PI * (float)i / 256.0f)) * 0.5f * 32767.0f);
+    }
 
+    // Audio PWM on GP12
     gpio_set_function(PIN_AUDIO_OUT, GPIO_FUNC_PWM);
-    uint slice = pwm_gpio_to_slice_num(PIN_AUDIO_OUT);
+    s_st_slice = pwm_gpio_to_slice_num(PIN_AUDIO_OUT);
     pwm_config c = pwm_get_default_config();
     pwm_config_set_clkdiv(&c, 1.0f);
     pwm_config_set_wrap(&c, ST_PWM_WRAP);
-    pwm_init(slice, &c, true);
+    pwm_init(s_st_slice, &c, true);
     pwm_set_gpio_level(PIN_AUDIO_OUT, 512);   // silence = mid-scale (DC blocked by the output cap)
 
-    add_repeating_timer_us(-ST_PERIOD_US, sidetone_tick, NULL, &s_st_timer);
+    // Timebase: spare slice wrapping at the sample rate; its DREQ paces the DMA.
+    const uint32_t sys_hz = clock_get_hz(clk_sys);
+    const uint32_t tb_wrap = sys_hz / ST_FS_HZ - 1u;
+    s_st_fs = sys_hz / (tb_wrap + 1u);
+    pwm_config tb = pwm_get_default_config();
+    pwm_config_set_clkdiv(&tb, 1.0f);
+    pwm_config_set_wrap(&tb, (uint16_t)tb_wrap);
+    pwm_init(ST_TB_SLICE, &tb, true);
+
+    sidetone_update_params();
+    sidetone_fill(s_st_buf[0]);
+    sidetone_fill(s_st_buf[1]);
+
+    // Two channels chained to each other; each raises IRQ0 when its half is done.
+    s_st_dma[0] = dma_claim_unused_channel(true);
+    s_st_dma[1] = dma_claim_unused_channel(true);
+    for (int b = 0; b < 2; b++) {
+        dma_channel_config dc = dma_channel_get_default_config((uint)s_st_dma[b]);
+        channel_config_set_transfer_data_size(&dc, DMA_SIZE_32);
+        channel_config_set_read_increment(&dc, true);
+        channel_config_set_write_increment(&dc, false);
+        channel_config_set_dreq(&dc, pwm_get_dreq(ST_TB_SLICE));
+        channel_config_set_chain_to(&dc, (uint)s_st_dma[b ^ 1]);
+        dma_channel_configure((uint)s_st_dma[b], &dc,
+                              &pwm_hw->slice[s_st_slice].cc,   // write: CC register (A = low 16 bits)
+                              s_st_buf[b], ST_BUF, false);
+        dma_channel_set_irq0_enabled((uint)s_st_dma[b], true);
+    }
+    irq_add_shared_handler(DMA_IRQ_0, sidetone_dma_irq, PICO_SHARED_IRQ_HANDLER_DEFAULT_ORDER_PRIORITY);
+    irq_set_enabled(DMA_IRQ_0, true);
+    dma_channel_start((uint)s_st_dma[0]);
 }
 
 // Button debounce state
