@@ -803,6 +803,11 @@ class SX1280ControlApp(ttk.Frame):
         self.dev_stvol_var  = tk.IntVar(value=30)      # sidetone volume %
         self.dev_sttest_var = tk.BooleanVar(value=False)
 
+        # Audio source (firmware): "pc" = USB audio, "mic" = MAX4466 on GP26
+        self.audio_src_var  = tk.StringVar(value="pc")
+        self.mic_gain_var   = tk.DoubleVar(value=10.0)
+        self.mic_gate_var   = tk.DoubleVar(value=0.02)
+
     def _build_ui(self):
         self.master.title("SX1280 QO-100 SSB TX Control")
         self.master.geometry("900x820")
@@ -1006,8 +1011,33 @@ class SX1280ControlApp(ttk.Frame):
         self.notebook.add(tab, text="TX Control")
         tab.columnconfigure(0, weight=1)
 
+        # --- Audio source ---
+        asf = ttk.LabelFrame(tab, text="Audio source", padding=10)
+        asf.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        asf.columnconfigure(2, weight=1)
+        ttk.Radiobutton(asf, text="PC (USB audio)", variable=self.audio_src_var, value="pc",
+                        command=self._on_audio_src).grid(row=0, column=0, sticky="w")
+        ttk.Radiobutton(asf, text="Microphone (MAX4466 at Pico GP26)", variable=self.audio_src_var,
+                        value="mic", command=self._on_audio_src).grid(row=0, column=1, sticky="w", padx=(16, 0))
+        ttk.Label(asf, text="Mic gain:").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        ttk.Scale(asf, from_=1, to=50, orient="horizontal", variable=self.mic_gain_var,
+                  command=lambda v: self._on_mic_param("gain")).grid(row=1, column=1, columnspan=2,
+                                                                       sticky="ew", padx=6, pady=(6, 0))
+        self.mic_gain_lbl = ttk.Label(asf, text="10.0×", width=7)
+        self.mic_gain_lbl.grid(row=1, column=3, sticky="w", pady=(6, 0))
+        ttk.Label(asf, text="Noise gate:").grid(row=2, column=0, sticky="w", pady=(2, 0))
+        ttk.Scale(asf, from_=0.0, to=0.5, orient="horizontal", variable=self.mic_gate_var,
+                  command=lambda v: self._on_mic_param("gate")).grid(row=2, column=1, columnspan=2,
+                                                                       sticky="ew", padx=6, pady=(2, 0))
+        self.mic_gate_lbl = ttk.Label(asf, text="0.020", width=7)
+        self.mic_gate_lbl.grid(row=2, column=3, sticky="w", pady=(2, 0))
+        ttk.Label(asf, text="Without a microphone wired to GP26 keep PC selected — an open ADC input is noise. "
+                            "The OLED MODE item cycles USB PC → USB MIC → CW.",
+                  foreground="gray", wraplength=760, justify="left").grid(row=3, column=0, columnspan=4,
+                                                                           sticky="w", pady=(6, 0))
+
         cwf = ttk.LabelFrame(tab, text="CW Test Mode", padding=20)
-        cwf.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        cwf.grid(row=1, column=0, sticky="ew", pady=(0, 10))
         ttk.Label(cwf, text="Transmit continuous carrier for testing:").pack(anchor="w")
         bf = ttk.Frame(cwf)
         bf.pack(pady=10)
@@ -1015,7 +1045,7 @@ class SX1280ControlApp(ttk.Frame):
         ttk.Button(bf, text="⏹ Stop",     command=self._stop_cw,  width=15).pack(side="left", padx=10)
 
         qf = ttk.LabelFrame(tab, text="Quick Commands", padding=20)
-        qf.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+        qf.grid(row=2, column=0, sticky="ew", pady=(0, 10))
         qb = ttk.Frame(qf)
         qb.pack()
         ttk.Button(qb, text="GET Config", command=lambda: self._send_cmd_safe("get"),  width=15).pack(side="left", padx=5)
@@ -1023,7 +1053,7 @@ class SX1280ControlApp(ttk.Frame):
         ttk.Button(qb, text="HELP",       command=lambda: self._send_cmd_safe("help"), width=15).pack(side="left", padx=5)
 
         mf = ttk.LabelFrame(tab, text="Manual Command", padding=10)
-        mf.grid(row=2, column=0, sticky="ew", pady=(0, 10))
+        mf.grid(row=3, column=0, sticky="ew", pady=(0, 10))
         mf.columnconfigure(0, weight=1)
         self.manual_cmd_var = tk.StringVar()
         ce = ttk.Entry(mf, textvariable=self.manual_cmd_var)
@@ -1032,8 +1062,8 @@ class SX1280ControlApp(ttk.Frame):
         ttk.Button(mf, text="Send", command=self._send_manual_cmd).grid(row=0, column=1)
 
         inf = ttk.LabelFrame(tab, text="Device Info", padding=10)
-        inf.grid(row=3, column=0, sticky="nsew", pady=(0, 10))
-        tab.rowconfigure(3, weight=1)
+        inf.grid(row=4, column=0, sticky="nsew", pady=(0, 10))
+        tab.rowconfigure(4, weight=1)
         self.info_text = tk.Text(inf, height=10, wrap="word", state="disabled",
                                   bg="#f5f5f5", font=("Consolas", 10))
         self.info_text.pack(fill="both", expand=True)
@@ -1204,6 +1234,23 @@ class SX1280ControlApp(ttk.Frame):
                            "Decoded text uses the WPM above, so wrong letters mean the timing is off.",
                   foreground="gray", wraplength=760, justify="left").grid(row=4, column=0, columnspan=7,
                                                                            sticky="w", pady=(4, 0))
+
+    def _on_audio_src(self):
+        if self._status_updating:
+            return
+        self._send_cmd_safe(f"src {self.audio_src_var.get()}")
+
+    def _on_mic_param(self, what):
+        if self._status_updating:
+            return
+        if what == "gain":
+            v = float(self.mic_gain_var.get())
+            self.mic_gain_lbl.config(text=f"{v:.1f}×")
+            self.debounced_send.call(f"mic gain {v:.1f}")
+        else:
+            v = float(self.mic_gate_var.get())
+            self.mic_gate_lbl.config(text=f"{v:.3f}")
+            self.debounced_send.call(f"mic gate {v:.3f}")
 
     _DEV_KMODES = ["Straight", "Iambic A", "Iambic B"]
 
@@ -1666,6 +1713,10 @@ class SX1280ControlApp(ttk.Frame):
                 if int(float(self.dev_stvol_var.get())) != vol:
                     self.dev_stvol_var.set(vol)
                     self.dev_stvol_lbl.config(text=f"{vol} %")
+            if "src" in kv:
+                src = "mic" if kv["src"] == "1" else "pc"
+                if self.audio_src_var.get() != src:
+                    self.audio_src_var.set(src)
             if "key" in kv or "pdl" in kv:
                 pdl = int(kv.get("pdl", "0"))
                 key = kv.get("key", "0") == "1"

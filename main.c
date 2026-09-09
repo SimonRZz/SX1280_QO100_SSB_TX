@@ -19,6 +19,7 @@
 #include "hardware/pwm.h"
 #include "hardware/dma.h"
 #include "hardware/irq.h"
+#include "hardware/adc.h"
 
 // TinyUSB
 #include "bsp/board_api.h"
@@ -184,6 +185,14 @@ static volatile uint16_t g_st_hz   = 700;    // 300..1200
 static volatile uint8_t  g_st_vol  = 30;     // 0..100
 static volatile uint8_t  g_st_test = 0;      // 1 = continuous test tone (not persisted)
 static void sidetone_update_params(void);
+
+// --- Audio source: USB from the PC, or the MAX4466 microphone on GP26 (ADC0) ---
+enum { AUDIO_SRC_PC = 0, AUDIO_SRC_MIC = 1 };
+static volatile uint8_t g_audio_src = AUDIO_SRC_PC;
+static volatile float   g_mic_gain  = 10.0f;   // 1..50, applied after DC removal
+static volatile float   g_mic_gate  = 0.02f;   // 0..0.5, noise gate threshold on the gained signal
+static const char *audio_src_name(uint8_t s);
+static void mic_diag_print(void);
 // GPS gate: 1 = TX only when gpsdo_is_ready() (default), 0 = override for bench tests.
 // Deliberately not persisted — resets to enforced on every boot.
 static volatile uint8_t g_gps_gate = 1;
@@ -1275,6 +1284,7 @@ static void cfg_print(void) {
         "  freq=%s Hz (target)  ppm=%.3f  tx=%s  txpwr=%d dBm\r\n"
         "  mode=%s  tune=%s  gps=%s  gpsgate=%s  config=%s\r\n"
         "  keyer=%s  wpm=%u  ratio=%.1f  sidetone=%u Hz  vol=%u%%\r\n"
+        "  src=%s  mic_gain=%.1f  mic_gate=%.3f\r\n"
         "  corrected=%s Hz  base_steps=%lu  fine=%.1f Hz (auto)\r\n",
         freq_str, g_ppm_correction, g_tx_enabled ? "ON" : "OFF", g_tx_power_max_dbm,
         g_tx_mode ? "CW" : "USB", g_tune_active ? "ON" : "OFF",
@@ -1282,6 +1292,7 @@ static void cfg_print(void) {
         g_persist_dirty ? "unsaved" : (g_persist_loaded ? "flash" : "defaults"),
         keyer_mode_name(g_cw_mode), (unsigned)g_cw_wpm, (double)g_cw_ratio,
         (unsigned)g_st_hz, (unsigned)g_st_vol,
+        audio_src_name(g_audio_src), (double)g_mic_gain, (double)g_mic_gate,
         corr_str, (unsigned long)get_base_steps(), fine);
     cdc_printf(
         "  enable bp=%u eq=%u comp=%u\r\n"
@@ -1310,6 +1321,8 @@ static void cmd_help(void) {
         "  gpsgate 0|1   - 1: TX only with GPS UTC (default); 0: override for bench tests\r\n"
         "  save          - write freq/ppm/txpwr/mode/DSP to flash now (autosaves 5 s after idle)\r\n"
         "  defaults      - restore compile-time defaults and save\r\n"
+        "  src pc|mic    - audio source: USB from PC, or MAX4466 mic on GP26\r\n"
+        "  mic [gain <1..50> | gate <0..0.5>] - mic gain and noise-gate threshold\r\n"
         "  keyer [wpm <5..60> | mode <straight|a|b> | ratio <2..5>] - on-device paddle keyer\r\n"
         "        [tone <300..1200> | vol <0..100> | test 0|1]      - sidetone on GP12 (PWM)\r\n"
         "                  decoder events: !K e=.|-  !K c=<char>  !K w\r\n"
@@ -1361,7 +1374,7 @@ static void cfg_commit(const audio_cfg_t *c) {
 // GPS gate, soft key) is deliberately volatile and resets at boot.
 #define CFG_FLASH_OFFSET   (PICO_FLASH_SIZE_BYTES - FLASH_SECTOR_SIZE)
 #define CFG_MAGIC          0x51303130u   // 'Q010'
-#define CFG_VERSION        2u            // bump whenever persist_cfg_t layout changes
+#define CFG_VERSION        3u            // bump whenever persist_cfg_t layout changes
 
 typedef struct __attribute__((packed)) {
     uint32_t    magic;
@@ -1375,7 +1388,9 @@ typedef struct __attribute__((packed)) {
     float       cw_ratio;
     uint16_t    st_hz;           // sidetone
     uint8_t     st_vol;
-    uint8_t     _reserved;
+    uint8_t     audio_src;       // AUDIO_SRC_*
+    float       mic_gain;
+    float       mic_gate;
     audio_cfg_t dsp;
     uint32_t    crc32;           // over everything above
 } persist_cfg_t;
@@ -1412,6 +1427,9 @@ static void persist_collect(persist_cfg_t *c) {
     c->cw_ratio       = g_cw_ratio;
     c->st_hz          = g_st_hz;
     c->st_vol         = g_st_vol;
+    c->audio_src      = g_audio_src;
+    c->mic_gain       = g_mic_gain;
+    c->mic_gate       = g_mic_gate;
     __compiler_memory_barrier();
     memcpy(&c->dsp, (const void *)&g_cfg, sizeof(c->dsp));
     __compiler_memory_barrier();
@@ -1442,6 +1460,11 @@ static void persist_apply(const persist_cfg_t *c) {
     g_st_hz  = (c->st_hz >= 300 && c->st_hz <= 1200) ? c->st_hz : 700;
     g_st_vol = (c->st_vol <= 100) ? c->st_vol : 30;
     sidetone_update_params();
+
+    g_audio_src = (c->audio_src == AUDIO_SRC_MIC) ? AUDIO_SRC_MIC : AUDIO_SRC_PC;
+    float mg = c->mic_gain, mt = c->mic_gate;
+    g_mic_gain = (mg >= 1.0f && mg <= 50.0f) ? mg : 10.0f;
+    g_mic_gate = (mt >= 0.0f && mt <= 0.5f)  ? mt : 0.02f;
 
     audio_cfg_t d = c->dsp;
     cfg_sanitize(&d, (float)WAV_SAMPLE_RATE);
@@ -1507,6 +1530,7 @@ static void cdc_status_push_ex(bool force) {
     static uint8_t  last_pdl   = 0xFF;
     static uint16_t last_sthz  = 0;
     static uint8_t  last_stvol = 0xFF;
+    static uint8_t  last_src   = 0xFF;
 
     if (!tud_cdc_connected()) return;
 
@@ -1525,6 +1549,7 @@ static void cdc_status_push_ex(bool force) {
     uint8_t  cur_pdl   = (uint8_t)(g_key_dit | (g_key_dah << 1));
     uint16_t cur_sthz  = g_st_hz;
     uint8_t  cur_stvol = g_st_vol;
+    uint8_t  cur_src   = g_audio_src;
 
     if (!force) {
         // Check if anything changed
@@ -1535,7 +1560,8 @@ static void cdc_status_push_ex(bool force) {
                        (cur_dirty != last_dirty) ||
                        (cur_kwpm != last_kwpm) || (cur_kmode != last_kmode) ||
                        (cur_key != last_key) || (cur_pdl != last_pdl) ||
-                       (cur_sthz != last_sthz) || (cur_stvol != last_stvol);
+                       (cur_sthz != last_sthz) || (cur_stvol != last_stvol) ||
+                       (cur_src != last_src);
 
         if (!changed) return;
 
@@ -1556,11 +1582,11 @@ static void cdc_status_push_ex(bool force) {
 
     char status_buf[160];
     snprintf(status_buf, sizeof(status_buf),
-             "!S mode=%u tune=%u tx=%u pwr=%d ppm=%s%lu.%04lu freq=%s gps=%u gate=%u dirty=%u kwpm=%u kmode=%u key=%u pdl=%u sthz=%u stvol=%u\r\n",
+             "!S mode=%u tune=%u tx=%u pwr=%d ppm=%s%lu.%04lu freq=%s gps=%u gate=%u dirty=%u kwpm=%u kmode=%u key=%u pdl=%u sthz=%u stvol=%u src=%u\r\n",
              cur_mode, cur_tune, cur_tx, cur_pwr,
              ppm_neg ? "-" : "", (unsigned long)ppm_int, (unsigned long)ppm_frac,
              freq_str, cur_gps, cur_gate, cur_dirty, cur_kwpm, cur_kmode, cur_key, cur_pdl,
-             (unsigned)cur_sthz, (unsigned)cur_stvol);
+             (unsigned)cur_sthz, (unsigned)cur_stvol, (unsigned)cur_src);
     cdc_write_str(status_buf);
 
     last_mode = cur_mode;
@@ -1578,6 +1604,7 @@ static void cdc_status_push_ex(bool force) {
     last_pdl   = cur_pdl;
     last_sthz  = cur_sthz;
     last_stvol = cur_stvol;
+    last_src   = cur_src;
     last_push_ms = to_ms_since_boot(get_absolute_time());
 }
 
@@ -1619,12 +1646,45 @@ static void cdc_handle_line(char *line) {
         g_st_hz            = 700;
         g_st_vol           = 30;
         sidetone_update_params();
+        g_audio_src        = AUDIO_SRC_PC;
+        g_mic_gain         = 10.0f;
+        g_mic_gate         = 0.02f;
         keyer_reset();
         cfg_commit(&k_cfg_defaults);
         if (g_tune_active) tune_apply_settings();
         if (persist_save_now()) cdc_write_str("OK defaults restored and saved\r\n");
         else                    cdc_write_str("ERR: defaults restored in RAM, flash save failed\r\n");
         cfg_print();
+        return;
+    }
+    // Audio source: src pc|mic
+    if (streqi(argv[0], "src")) {
+        if (argc >= 2) {
+            uint8_t s;
+            if      (streqi(argv[1], "pc") || streqi(argv[1], "usb")) s = AUDIO_SRC_PC;
+            else if (streqi(argv[1], "mic") || streqi(argv[1], "adc")) s = AUDIO_SRC_MIC;
+            else { cdc_write_str("ERR: src pc|mic\r\n"); return; }
+            if (s != g_audio_src) { g_audio_src = s; persist_mark_dirty(); }
+        }
+        cdc_printf("OK src=%s\r\n", audio_src_name(g_audio_src));
+        return;
+    }
+    // Microphone: mic [gain <1..50> | gate <0..0.5>]
+    if (streqi(argv[0], "mic")) {
+        if (argc >= 3 && streqi(argv[1], "gain")) {
+            float v;
+            if (!parse_f(argv[2], &v) || v < 1.0f || v > 50.0f) { cdc_write_str("ERR: mic gain 1..50\r\n"); return; }
+            g_mic_gain = v; persist_mark_dirty();
+        } else if (argc >= 3 && streqi(argv[1], "gate")) {
+            float v;
+            if (!parse_f(argv[2], &v) || v < 0.0f || v > 0.5f) { cdc_write_str("ERR: mic gate 0..0.5\r\n"); return; }
+            g_mic_gate = v; persist_mark_dirty();
+        } else if (argc >= 2) {
+            cdc_write_str("ERR: mic [gain <1..50> | gate <0..0.5>]\r\n");
+            return;
+        }
+        cdc_printf("OK mic gain=%.1f gate=%.3f\r\n", (double)g_mic_gain, (double)g_mic_gate);
+        mic_diag_print();
         return;
     }
     if (streqi(argv[0], "version") || streqi(argv[0], "ver")) {
@@ -2041,7 +2101,7 @@ static void oled_prepare_frame(void) {
 
     // --- Column 0 (left) ---
     // Row 0: Mode (USB / CW)
-    DRAW_L(ROW0_Y, g_tx_mode ? "CW" : "USB", UI_PARAM_MODE);
+    DRAW_L(ROW0_Y, g_tx_mode ? "CW" : (g_audio_src == AUDIO_SRC_MIC ? "USB MIC" : "USB PC"), UI_PARAM_MODE);
 
     // Row 1: TUNE
     DRAW_L(ROW1_Y, g_tune_active ? "TUNE *" : "TUNE", UI_PARAM_TUNE);
@@ -2295,6 +2355,7 @@ static void keyer_diag_print(void) {
                (unsigned)g_keyer_key, (unsigned)g_soft_ptt_key);
     cdc_printf("Sidetone: GP12 PWM  tone=%u Hz vol=%u%% test=%u  (audible while keyer out=1 or tune=1)\r\n",
                (unsigned)g_st_hz, (unsigned)g_st_vol, (unsigned)g_st_test);
+    mic_diag_print();
     cdc_printf("Carrier: txmode=%s tune=%u state=%s cw_test_mode=%u pwr_now=%d dBm  tx_allowed=%u (gps=%u gate=%u)\r\n",
                g_tx_mode ? "CW" : "USB", (unsigned)g_tune_active,
                cr_names[g_cr_state & 3], (unsigned)g_cw_test_mode, (int)g_cr_pwr,
@@ -2424,6 +2485,98 @@ static void sidetone_init(void) {
     dma_channel_start((uint)s_st_dma[0]);
 }
 
+// ==========================================================
+// Microphone: MAX4466 on GP26 (ADC0), free-running 8 kHz → DMA ring
+// ==========================================================
+// The ADC samples continuously at exactly WAV_SAMPLE_RATE (48 MHz ADC
+// clock / 6000) and DMA drops the 12-bit values into a 4 KB ring with
+// address wrap. Core0 reads behind the DMA write pointer, so the mic
+// paces the producer at the same rate Core1 consumes — both clocks come
+// from the same crystal, no resampler needed.
+#define PIN_MIC          26
+#define MIC_RB_SAMPLES   2048u
+#define MIC_RB_MASK      (MIC_RB_SAMPLES - 1u)
+#define MIC_DMA_COUNT    0x0FFFFFFFu          // ~9 h at 8 kHz, then re-armed
+
+static uint16_t __attribute__((aligned(4096))) s_mic_rb[MIC_RB_SAMPLES];
+static int      s_mic_dma  = -1;
+static uint32_t s_mic_rd   = 0;
+static float    s_mic_dc   = 0.0f;   // DC estimate (MAX4466 idles at VCC/2)
+static float    s_mic_env  = 0.0f;   // gate envelope
+static float    s_mic_ggain = 0.0f;  // smoothed gate gain 0..1
+static uint32_t s_mic_hold = 0;
+
+static inline uint32_t mic_wr_index(void) {
+    uint32_t addr = dma_channel_hw_addr((uint)s_mic_dma)->write_addr;
+    return ((addr - (uint32_t)(uintptr_t)s_mic_rb) / 2u) & MIC_RB_MASK;
+}
+static inline uint32_t mic_available(void) { return (mic_wr_index() - s_mic_rd) & MIC_RB_MASK; }
+static inline void     mic_flush(void)     { s_mic_rd = mic_wr_index(); }
+
+static void mic_dma_rearm_if_done(void) {
+    if (s_mic_dma >= 0 && !dma_channel_is_busy((uint)s_mic_dma)) {
+        dma_channel_set_trans_count((uint)s_mic_dma, MIC_DMA_COUNT, true);
+    }
+}
+
+// One sample, normalised to ±1: DC removal → gain → noise gate (hysteresis,
+// 300 ms hold, smoothed so it does not click). Caller checks availability.
+static float mic_get_sample(void) {
+    uint16_t raw = s_mic_rb[s_mic_rd];
+    s_mic_rd = (s_mic_rd + 1u) & MIC_RB_MASK;
+
+    float x = ((float)(raw & 0x0FFFu) - 2048.0f) / 2048.0f;
+    s_mic_dc += 0.005f * (x - s_mic_dc);           // one-pole HPF, fc ≈ 6 Hz
+    x = (x - s_mic_dc) * g_mic_gain;
+
+    float ax = fabsf(x);
+    s_mic_env += (ax > s_mic_env ? 0.2f : 0.002f) * (ax - s_mic_env);
+    const float thr = g_mic_gate;
+    bool open;
+    if (s_mic_env > thr)             { open = true;  s_mic_hold = 2400u; }
+    else if (s_mic_hold)             { open = true;  s_mic_hold--; }
+    else                             { open = (s_mic_env > thr * 0.5f) && (s_mic_ggain > 0.5f); }
+    s_mic_ggain += open ? 0.05f : -0.002f;
+    if (s_mic_ggain > 1.0f) s_mic_ggain = 1.0f;
+    if (s_mic_ggain < 0.0f) s_mic_ggain = 0.0f;
+    x *= s_mic_ggain;
+
+    if (x >  1.0f) x =  1.0f;
+    if (x < -1.0f) x = -1.0f;
+    return x;
+}
+
+static void mic_init(void) {
+    adc_init();
+    adc_gpio_init(PIN_MIC);
+    adc_select_input(0);
+    adc_set_clkdiv(48000000.0f / (float)WAV_SAMPLE_RATE - 1.0f);   // one conversion per 1/8000 s
+    adc_fifo_setup(true, true, 1, false, false);
+
+    s_mic_dma = dma_claim_unused_channel(true);
+    dma_channel_config c = dma_channel_get_default_config((uint)s_mic_dma);
+    channel_config_set_transfer_data_size(&c, DMA_SIZE_16);
+    channel_config_set_read_increment(&c, false);
+    channel_config_set_write_increment(&c, true);
+    channel_config_set_ring(&c, true, 12);          // wrap the write address every 4 KB
+    channel_config_set_dreq(&c, DREQ_ADC);
+    dma_channel_configure((uint)s_mic_dma, &c, s_mic_rb, &adc_hw->fifo, MIC_DMA_COUNT, true);
+
+    adc_run(true);
+    mic_flush();
+}
+
+static const char *audio_src_name(uint8_t s) { return s == AUDIO_SRC_MIC ? "mic" : "pc"; }
+
+static void mic_diag_print(void) {
+    uint32_t wi  = mic_wr_index();
+    uint32_t raw = s_mic_rb[wi ? wi - 1u : MIC_RB_MASK] & 0x0FFFu;   // newest ADC value (2048 = idle)
+    cdc_printf("Audio: src=%s  mic GP26: ring=%lu/%u raw=%lu gain=%.1f gate=%.3f env=%.3f gate=%s\r\n",
+               audio_src_name(g_audio_src), (unsigned long)mic_available(), (unsigned)MIC_RB_SAMPLES,
+               (unsigned long)raw, (double)g_mic_gain, (double)g_mic_gate, (double)s_mic_env,
+               s_mic_ggain > 0.5f ? "open" : "closed");
+}
+
 // Button debounce state
 static uint8_t  ok_was_pressed = 0;
 static uint32_t ok_debounce_ms = 0;
@@ -2501,8 +2654,14 @@ static void encoder_poll(void) {
             // Adjust value of selected param
             switch (g_ui_editing) {
                 case UI_PARAM_MODE:
-                    g_tx_mode = g_tx_mode ? 0 : 1;
-                    persist_mark_dirty();
+                    {
+                        // Cycle USB PC → USB MIC → CW (both directions)
+                        int idx = g_tx_mode ? 2 : (g_audio_src == AUDIO_SRC_MIC ? 1 : 0);
+                        idx = (idx + step + 3) % 3;
+                        g_tx_mode   = (idx == 2) ? 1 : 0;
+                        if (idx < 2) g_audio_src = (idx == 1) ? AUDIO_SRC_MIC : AUDIO_SRC_PC;
+                        persist_mark_dirty();
+                    }
                     break;
                 case UI_PARAM_TUNE:
                     if (step > 0 && !g_tune_active) {
@@ -2926,6 +3085,8 @@ int main(void) {
 
     // --- Sidetone PWM (GP12) — starts silent at mid-scale ---
     sidetone_init();
+    // --- Microphone ADC (GP26) — runs continuously, used only when src=mic ---
+    mic_init();
 
     spi_init(SX_SPI, SX_SPI_BAUD);
     gpio_set_function(PIN_MISO, GPIO_FUNC_SPI);
@@ -3028,8 +3189,15 @@ int main(void) {
     {
         printf("[BOOT] Waiting for USB connection (encoder+CW active)...\n");
         absolute_time_t oled_next = {0};
+        // Powerbank / standalone: no host within 3 s → carry on without one.
+        // TinyUSB keeps running, so a PC plugged in later still enumerates.
+        absolute_time_t usb_deadline = make_timeout_time_ms(3000);
 
         while (!tud_ready()) {
+            if (absolute_time_diff_us(get_absolute_time(), usb_deadline) <= 0) {
+                printf("[BOOT] No USB host — standalone operation\n");
+                break;
+            }
             tud_task();
             encoder_poll();
             button_poll();
@@ -3218,6 +3386,32 @@ int main(void) {
         // Get current base steps (with freq and PPM correction) at block boundary
         int32_t base_steps = (int32_t)get_base_steps();
 
+        // --- Audio source for this block ---
+        const uint8_t src = g_audio_src;
+        {
+            static uint8_t last_src = AUDIO_SRC_PC;
+            if (src != last_src) {
+                if (src == AUDIO_SRC_MIC) mic_flush();   // drop whatever piled up while unused
+                last_src = src;
+            }
+        }
+        if (src == AUDIO_SRC_MIC) {
+            // Paced by the ADC: wait for a full block of mic samples, keeping
+            // USB/UI/keyer alive meanwhile. Bail out if the mode or source changes.
+            mic_dma_rearm_if_done();
+            bool bail = false;
+            while (mic_available() < BLOCK_SAMPLES) {
+                usb_audio_pump();
+                encoder_poll();
+                button_poll();
+                carrier_poll();
+                persist_maybe_autosave();
+                if (g_cw_test_mode || g_audio_src != AUDIO_SRC_MIC) { bail = true; break; }
+                tight_loop_contents();
+            }
+            if (bail) continue;
+        }
+
         sample_cmd_t *blk = g_blocks[b];
 
         for (uint32_t n = 0; n < BLOCK_SAMPLES; n++) {
@@ -3239,8 +3433,12 @@ int main(void) {
             if (sine_phase1 > 2.0f * (float)M_PI) sine_phase1 -= 2.0f * (float)M_PI;
 #endif
 #else
-            int16_t s = usb_audio_get_mono_8k();
-            x = (float)s / 32768.0f;
+            if (src == AUDIO_SRC_MIC) {
+                x = mic_get_sample();
+            } else {
+                int16_t s = usb_audio_get_mono_8k();
+                x = (float)s / 32768.0f;
+            }
 
             if (fabsf(x) < 1e-5f) {
                 if (silence_ctr < silence_samples) silence_ctr++;

@@ -72,6 +72,22 @@ No amplifier needed — headphones need only microwatts.
     The tone follows the on-device keyer and the TUNE carrier.
 
 ================================================================================
+MICROPHONE (MAX4466 electret module, ADC0 on GPIO 26 / Pin 31)
+================================================================================
+
+    MAX4466 VCC ──► 3V3(OUT)  (Pin 36)
+    MAX4466 GND ──► GND
+    MAX4466 OUT ──► GPIO 26   (Pin 31)   ADC0
+
+    Output idles at VCC/2 ≈ 1.65 V; the firmware removes the DC. Sampled
+    at exactly 8 kHz by the ADC itself (48 MHz / 6000) and moved by DMA.
+    Set the module's trim pot to roughly mid-travel, then adjust with
+    "mic gain <1..50>" and "mic gate <0..0.5>". Select with "src mic",
+    or via the OLED MODE item (USB PC -> USB MIC -> CW).
+
+    Without a microphone connected leave src=pc: an open ADC input is noise.
+
+================================================================================
 CW KEY / PADDLE JACK (3.5 mm stereo)
 ================================================================================
 
@@ -96,7 +112,7 @@ GPIO SUMMARY (this fork)
     GPIO  7  —  OLED SCL (I2C1)           GPIO 21  —  BUSY
     GPIO  8  —  (free)                    GPIO 22  —  TCXO_EN (unused, USE_TCXO_MODULE=0)
     GPIO  9  —  CW dit                    GPIO 25  —  onboard LED (underrun)
-    GPIO 10  —  Encoder push              GPIO 26  —  (free, ADC0 — reserved for mic)
+    GPIO 10  —  Encoder push              GPIO 26  —  Microphone (MAX4466, ADC0)
     GPIO 11  —  CW dah                    GPIO 27  —  (free, ADC1)
     GPIO 12  —  Sidetone PWM              GPIO 28  —  (free, ADC2)
     GPIO 13  —  (free)
