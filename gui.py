@@ -796,6 +796,7 @@ class SX1280ControlApp(ttk.Frame):
         self.dev_kmode_var  = tk.StringVar(value="Iambic B")
         self.dev_kwpm_var   = tk.IntVar(value=18)
         self.dev_kratio_var = tk.DoubleVar(value=3.0)
+        self.dev_key_var    = tk.StringVar(value="Paddle: —   Key: —")
 
     def _build_ui(self):
         self.master.title("SX1280 QO-100 SSB TX Control")
@@ -1158,9 +1159,11 @@ class SX1280ControlApp(ttk.Frame):
                          command=lambda: self._dev_keyer_send("ratio"))
         sr.grid(row=0, column=5, padx=4)
         sr.bind("<Return>", lambda e: self._dev_keyer_send("ratio"))
+        self.dev_key_lbl = ttk.Label(df, textvariable=self.dev_key_var, font=("Consolas", 10, "bold"))
+        self.dev_key_lbl.grid(row=1, column=0, columnspan=6, sticky="w", pady=(6, 0))
         ttk.Label(df, text="Runs in firmware — keys the transmitter without this PC. "
                            "WPM is also on the OLED menu. Settings are saved to flash.",
-                  foreground="gray").grid(row=1, column=0, columnspan=6, sticky="w", pady=(4, 0))
+                  foreground="gray").grid(row=2, column=0, columnspan=6, sticky="w", pady=(4, 0))
 
     _DEV_KMODES = ["Straight", "Iambic A", "Iambic B"]
 
@@ -1579,6 +1582,12 @@ class SX1280ControlApp(ttk.Frame):
                 m = self._DEV_KMODES[max(0, min(2, int(kv["kmode"])))]
                 if self.dev_kmode_var.get() != m:
                     self.dev_kmode_var.set(m)
+            if "key" in kv or "pdl" in kv:
+                pdl = int(kv.get("pdl", "0"))
+                key = kv.get("key", "0") == "1"
+                pdl_txt = ("dit " if pdl & 1 else "    ") + ("dah" if pdl & 2 else "   ")
+                self.dev_key_var.set(f"Paddle: [{pdl_txt}]   Key: {'DOWN' if key else 'up'}")
+                self.dev_key_lbl.config(foreground="#cc0000" if key else "#444444")
 
             self._status_updating = False
         except Exception as e:
@@ -1815,16 +1824,13 @@ class SX1280ControlApp(ttk.Frame):
             return
         self._cw_tx_active = not self._cw_tx_active
         if self._cw_tx_active:
-            # Enter CW keyer mode (no carrier until first key press)
-            try:
-                self.worker.send_line("mode cw")  # switch firmware to CW mode
-            except Exception: pass
+            # PC keyer may key the firmware: make sure it is in CW mode
+            self._send_cmd_safe("mode cw")
             self.cw_tx_btn.config(text="🔴  TX ON")
         else:
-            try:
-                self.worker.send_line("stop")      # stop any active carrier
-                self.worker.send_line("mode usb")  # return to SSB mode
-            except Exception: pass
+            # Only release the key/carrier. The mode is a persistent user
+            # setting now (OLED, flash, on-device keyer) — never flip it here.
+            self._send_cmd_safe("stop")
             self.cw_tx_btn.config(text="⬛  TX OFF")
 
     def _send_manual_cmd(self):

@@ -174,6 +174,7 @@ static volatile float   g_cw_ratio  = 3.0f;    // dah length in dits, 2.0..5.0
 static volatile uint8_t g_keyer_key = 0;       // keyer output: 1 = key down
 static void keyer_reset(void);
 static const char *keyer_mode_name(uint8_t m);
+static void keyer_diag_print(void);
 // GPS gate: 1 = TX only when gpsdo_is_ready() (default), 0 = override for bench tests.
 // Deliberately not persisted — resets to enforced on every boot.
 static volatile uint8_t g_gps_gate = 1;
@@ -665,6 +666,7 @@ static void sx_print_diag(void) {
     uint32_t usb_r = g_usb_r;
     uint32_t usb_fill = (usb_w >= usb_r) ? (usb_w - usb_r) : (USB_RB_FRAMES - usb_r + usb_w);
     cdc_printf("USB ringbuf: %lu/%lu frames\r\n", (unsigned long)usb_fill, (unsigned long)USB_RB_FRAMES);
+    keyer_diag_print();
     cdc_printf("==========================\r\n");
 #endif
 }
@@ -1480,6 +1482,8 @@ static void cdc_status_push_ex(bool force) {
     static uint8_t  last_dirty = 0xFF;
     static uint8_t  last_kwpm  = 0;
     static uint8_t  last_kmode = 0xFF;
+    static uint8_t  last_key   = 0xFF;
+    static uint8_t  last_pdl   = 0xFF;
 
     if (!tud_cdc_connected()) return;
 
@@ -1494,6 +1498,8 @@ static void cdc_status_push_ex(bool force) {
     uint8_t  cur_dirty = g_persist_dirty;
     uint8_t  cur_kwpm  = g_cw_wpm;
     uint8_t  cur_kmode = g_cw_mode;
+    uint8_t  cur_key   = (g_keyer_key | g_soft_ptt_key) ? 1 : 0;
+    uint8_t  cur_pdl   = (uint8_t)(g_key_dit | (g_key_dah << 1));
 
     if (!force) {
         // Check if anything changed
@@ -1502,7 +1508,8 @@ static void cdc_status_push_ex(bool force) {
                        (cur_ppm != last_ppm) || (cur_freq != last_freq) ||
                        (cur_gps != last_gps) || (cur_gate != last_gate) ||
                        (cur_dirty != last_dirty) ||
-                       (cur_kwpm != last_kwpm) || (cur_kmode != last_kmode);
+                       (cur_kwpm != last_kwpm) || (cur_kmode != last_kmode) ||
+                       (cur_key != last_key) || (cur_pdl != last_pdl);
 
         if (!changed) return;
 
@@ -1523,10 +1530,10 @@ static void cdc_status_push_ex(bool force) {
 
     char status_buf[160];
     snprintf(status_buf, sizeof(status_buf),
-             "!S mode=%u tune=%u tx=%u pwr=%d ppm=%s%lu.%04lu freq=%s gps=%u gate=%u dirty=%u kwpm=%u kmode=%u\r\n",
+             "!S mode=%u tune=%u tx=%u pwr=%d ppm=%s%lu.%04lu freq=%s gps=%u gate=%u dirty=%u kwpm=%u kmode=%u key=%u pdl=%u\r\n",
              cur_mode, cur_tune, cur_tx, cur_pwr,
              ppm_neg ? "-" : "", (unsigned long)ppm_int, (unsigned long)ppm_frac,
-             freq_str, cur_gps, cur_gate, cur_dirty, cur_kwpm, cur_kmode);
+             freq_str, cur_gps, cur_gate, cur_dirty, cur_kwpm, cur_kmode, cur_key, cur_pdl);
     cdc_write_str(status_buf);
 
     last_mode = cur_mode;
@@ -1540,6 +1547,8 @@ static void cdc_status_push_ex(bool force) {
     last_dirty = cur_dirty;
     last_kwpm  = cur_kwpm;
     last_kmode = cur_kmode;
+    last_key   = cur_key;
+    last_pdl   = cur_pdl;
     last_push_ms = to_ms_since_boot(get_absolute_time());
 }
 
@@ -2147,6 +2156,22 @@ static void keyer_poll(void) {
         }
         break;
     }
+}
+
+static void keyer_diag_print(void) {
+    static const char *cr_names[] = { "IDLE", "ARMING", "ARMED", "CARRIER_ON" };
+    static const char *ks_names[] = { "IDLE", "DIT", "DAH", "IEL" };
+    cdc_printf("Paddles: GP9(dit) raw=%u db=%u  GP11(dah) raw=%u db=%u  (1 = pressed, pin at GND)\r\n",
+               (unsigned)!gpio_get(PIN_KEY_DIT), (unsigned)g_key_dit,
+               (unsigned)!gpio_get(PIN_KEY_DAH), (unsigned)g_key_dah);
+    cdc_printf("Keyer: mode=%s wpm=%u ratio=%.1f state=%s pend=%u/%u out=%u softkey=%u\r\n",
+               keyer_mode_name(g_cw_mode), (unsigned)g_cw_wpm, (double)g_cw_ratio,
+               ks_names[s_kyr.state & 3], (unsigned)s_kyr.pend_dit, (unsigned)s_kyr.pend_dah,
+               (unsigned)g_keyer_key, (unsigned)g_soft_ptt_key);
+    cdc_printf("Carrier: txmode=%s tune=%u state=%s cw_test_mode=%u pwr_now=%d dBm  tx_allowed=%u (gps=%u gate=%u)\r\n",
+               g_tx_mode ? "CW" : "USB", (unsigned)g_tune_active,
+               cr_names[g_cr_state & 3], (unsigned)g_cw_test_mode, (int)g_cr_pwr,
+               (unsigned)tx_allowed(), (unsigned)gpsdo_is_ready(), (unsigned)g_gps_gate);
 }
 
 // Button debounce state
