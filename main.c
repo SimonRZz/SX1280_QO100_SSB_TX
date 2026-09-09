@@ -16,6 +16,7 @@
 #include "hardware/gpio.h"
 #include "hardware/clocks.h"
 #include "hardware/i2c.h"
+#include "hardware/pwm.h"
 
 // TinyUSB
 #include "bsp/board_api.h"
@@ -175,6 +176,12 @@ static volatile uint8_t g_keyer_key = 0;       // keyer output: 1 = key down
 static void keyer_reset(void);
 static const char *keyer_mode_name(uint8_t m);
 static void keyer_diag_print(void);
+
+// --- Sidetone (PWM audio on GP12, follows keyer output and TUNE) ---
+static volatile uint16_t g_st_hz   = 700;    // 300..1200
+static volatile uint8_t  g_st_vol  = 30;     // 0..100
+static volatile uint8_t  g_st_test = 0;      // 1 = continuous test tone (not persisted)
+static void sidetone_update_params(void);
 // GPS gate: 1 = TX only when gpsdo_is_ready() (default), 0 = override for bench tests.
 // Deliberately not persisted — resets to enforced on every boot.
 static volatile uint8_t g_gps_gate = 1;
@@ -1265,13 +1272,14 @@ static void cfg_print(void) {
         "  fw=" FW_VERSION "  built=" FW_BUILD "\r\n"
         "  freq=%s Hz (target)  ppm=%.3f  tx=%s  txpwr=%d dBm\r\n"
         "  mode=%s  tune=%s  gps=%s  gpsgate=%s  config=%s\r\n"
-        "  keyer=%s  wpm=%u  ratio=%.1f\r\n"
+        "  keyer=%s  wpm=%u  ratio=%.1f  sidetone=%u Hz  vol=%u%%\r\n"
         "  corrected=%s Hz  base_steps=%lu  fine=%.1f Hz (auto)\r\n",
         freq_str, g_ppm_correction, g_tx_enabled ? "ON" : "OFF", g_tx_power_max_dbm,
         g_tx_mode ? "CW" : "USB", g_tune_active ? "ON" : "OFF",
         gpsdo_is_ready() ? "ready" : "wait", g_gps_gate ? "ON" : "OFF",
         g_persist_dirty ? "unsaved" : (g_persist_loaded ? "flash" : "defaults"),
         keyer_mode_name(g_cw_mode), (unsigned)g_cw_wpm, (double)g_cw_ratio,
+        (unsigned)g_st_hz, (unsigned)g_st_vol,
         corr_str, (unsigned long)get_base_steps(), fine);
     cdc_printf(
         "  enable bp=%u eq=%u comp=%u\r\n"
@@ -1301,6 +1309,7 @@ static void cmd_help(void) {
         "  save          - write freq/ppm/txpwr/mode/DSP to flash now (autosaves 5 s after idle)\r\n"
         "  defaults      - restore compile-time defaults and save\r\n"
         "  keyer [wpm <5..60> | mode <straight|a|b> | ratio <2..5>] - on-device paddle keyer\r\n"
+        "        [tone <300..1200> | vol <0..100> | test 0|1]      - sidetone on GP12 (PWM)\r\n"
         "                  decoder events: !K e=.|-  !K c=<char>  !K w\r\n"
         "  tx 0|1        - enable/disable TX (SSB modulation)\r\n"
         "  mode usb|cw   - set modulation mode\r\n"
@@ -1350,7 +1359,7 @@ static void cfg_commit(const audio_cfg_t *c) {
 // GPS gate, soft key) is deliberately volatile and resets at boot.
 #define CFG_FLASH_OFFSET   (PICO_FLASH_SIZE_BYTES - FLASH_SECTOR_SIZE)
 #define CFG_MAGIC          0x51303130u   // 'Q010'
-#define CFG_VERSION        1u
+#define CFG_VERSION        2u            // bump whenever persist_cfg_t layout changes
 
 typedef struct __attribute__((packed)) {
     uint32_t    magic;
@@ -1362,6 +1371,9 @@ typedef struct __attribute__((packed)) {
     uint8_t     cw_mode;         // KEYER_*
     uint8_t     cw_wpm;
     float       cw_ratio;
+    uint16_t    st_hz;           // sidetone
+    uint8_t     st_vol;
+    uint8_t     _reserved;
     audio_cfg_t dsp;
     uint32_t    crc32;           // over everything above
 } persist_cfg_t;
@@ -1396,6 +1408,8 @@ static void persist_collect(persist_cfg_t *c) {
     c->cw_mode        = g_cw_mode;
     c->cw_wpm         = g_cw_wpm;
     c->cw_ratio       = g_cw_ratio;
+    c->st_hz          = g_st_hz;
+    c->st_vol         = g_st_vol;
     __compiler_memory_barrier();
     memcpy(&c->dsp, (const void *)&g_cfg, sizeof(c->dsp));
     __compiler_memory_barrier();
@@ -1422,6 +1436,10 @@ static void persist_apply(const persist_cfg_t *c) {
     g_cw_wpm  = (c->cw_wpm >= 5 && c->cw_wpm <= 60) ? c->cw_wpm : 18;
     float r = c->cw_ratio;
     g_cw_ratio = (r >= 2.0f && r <= 5.0f) ? r : 3.0f;   // also rejects NaN
+
+    g_st_hz  = (c->st_hz >= 300 && c->st_hz <= 1200) ? c->st_hz : 700;
+    g_st_vol = (c->st_vol <= 100) ? c->st_vol : 30;
+    sidetone_update_params();
 
     audio_cfg_t d = c->dsp;
     cfg_sanitize(&d, (float)WAV_SAMPLE_RATE);
@@ -1485,6 +1503,8 @@ static void cdc_status_push_ex(bool force) {
     static uint8_t  last_kmode = 0xFF;
     static uint8_t  last_key   = 0xFF;
     static uint8_t  last_pdl   = 0xFF;
+    static uint16_t last_sthz  = 0;
+    static uint8_t  last_stvol = 0xFF;
 
     if (!tud_cdc_connected()) return;
 
@@ -1501,6 +1521,8 @@ static void cdc_status_push_ex(bool force) {
     uint8_t  cur_kmode = g_cw_mode;
     uint8_t  cur_key   = (g_keyer_key | g_soft_ptt_key) ? 1 : 0;
     uint8_t  cur_pdl   = (uint8_t)(g_key_dit | (g_key_dah << 1));
+    uint16_t cur_sthz  = g_st_hz;
+    uint8_t  cur_stvol = g_st_vol;
 
     if (!force) {
         // Check if anything changed
@@ -1510,7 +1532,8 @@ static void cdc_status_push_ex(bool force) {
                        (cur_gps != last_gps) || (cur_gate != last_gate) ||
                        (cur_dirty != last_dirty) ||
                        (cur_kwpm != last_kwpm) || (cur_kmode != last_kmode) ||
-                       (cur_key != last_key) || (cur_pdl != last_pdl);
+                       (cur_key != last_key) || (cur_pdl != last_pdl) ||
+                       (cur_sthz != last_sthz) || (cur_stvol != last_stvol);
 
         if (!changed) return;
 
@@ -1531,10 +1554,11 @@ static void cdc_status_push_ex(bool force) {
 
     char status_buf[160];
     snprintf(status_buf, sizeof(status_buf),
-             "!S mode=%u tune=%u tx=%u pwr=%d ppm=%s%lu.%04lu freq=%s gps=%u gate=%u dirty=%u kwpm=%u kmode=%u key=%u pdl=%u\r\n",
+             "!S mode=%u tune=%u tx=%u pwr=%d ppm=%s%lu.%04lu freq=%s gps=%u gate=%u dirty=%u kwpm=%u kmode=%u key=%u pdl=%u sthz=%u stvol=%u\r\n",
              cur_mode, cur_tune, cur_tx, cur_pwr,
              ppm_neg ? "-" : "", (unsigned long)ppm_int, (unsigned long)ppm_frac,
-             freq_str, cur_gps, cur_gate, cur_dirty, cur_kwpm, cur_kmode, cur_key, cur_pdl);
+             freq_str, cur_gps, cur_gate, cur_dirty, cur_kwpm, cur_kmode, cur_key, cur_pdl,
+             (unsigned)cur_sthz, (unsigned)cur_stvol);
     cdc_write_str(status_buf);
 
     last_mode = cur_mode;
@@ -1550,6 +1574,8 @@ static void cdc_status_push_ex(bool force) {
     last_kmode = cur_kmode;
     last_key   = cur_key;
     last_pdl   = cur_pdl;
+    last_sthz  = cur_sthz;
+    last_stvol = cur_stvol;
     last_push_ms = to_ms_since_boot(get_absolute_time());
 }
 
@@ -1588,6 +1614,9 @@ static void cdc_handle_line(char *line) {
         g_cw_mode          = KEYER_IAMBIC_B;
         g_cw_wpm           = 18;
         g_cw_ratio         = 3.0f;
+        g_st_hz            = 700;
+        g_st_vol           = 30;
+        sidetone_update_params();
         keyer_reset();
         cfg_commit(&k_cfg_defaults);
         if (g_tune_active) tune_apply_settings();
@@ -1636,12 +1665,29 @@ static void cdc_handle_line(char *line) {
             if (!parse_f(argv[2], &v) || v < 2.0f || v > 5.0f) { cdc_write_str("ERR: keyer ratio 2.0..5.0\r\n"); return; }
             g_cw_ratio = v;
             persist_mark_dirty();
+        } else if (argc >= 3 && streqi(argv[1], "tone")) {
+            float v;
+            if (!parse_f(argv[2], &v) || v < 300.0f || v > 1200.0f) { cdc_write_str("ERR: keyer tone 300..1200 Hz\r\n"); return; }
+            g_st_hz = (uint16_t)v;
+            sidetone_update_params();
+            persist_mark_dirty();
+        } else if (argc >= 3 && streqi(argv[1], "vol")) {
+            float v;
+            if (!parse_f(argv[2], &v) || v < 0.0f || v > 100.0f) { cdc_write_str("ERR: keyer vol 0..100\r\n"); return; }
+            g_st_vol = (uint8_t)v;
+            sidetone_update_params();
+            persist_mark_dirty();
+        } else if (argc >= 3 && streqi(argv[1], "test")) {
+            uint8_t v;
+            if (!parse_bool(argv[2], &v)) { cdc_write_str("ERR: keyer test 0|1\r\n"); return; }
+            g_st_test = v;   // continuous sidetone for checking the headphone wiring
         } else if (argc >= 2) {
-            cdc_write_str("ERR: keyer [wpm <n> | mode <straight|a|b> | ratio <r>]\r\n");
+            cdc_write_str("ERR: keyer [wpm <n> | mode <straight|a|b> | ratio <r> | tone <Hz> | vol <0..100> | test 0|1]\r\n");
             return;
         }
-        cdc_printf("OK keyer mode=%s wpm=%u ratio=%.1f\r\n",
-                   keyer_mode_name(g_cw_mode), (unsigned)g_cw_wpm, (double)g_cw_ratio);
+        cdc_printf("OK keyer mode=%s wpm=%u ratio=%.1f tone=%u vol=%u%s\r\n",
+                   keyer_mode_name(g_cw_mode), (unsigned)g_cw_wpm, (double)g_cw_ratio,
+                   (unsigned)g_st_hz, (unsigned)g_st_vol, g_st_test ? " test=ON" : "");
         return;
     }
 
@@ -2245,10 +2291,70 @@ static void keyer_diag_print(void) {
                keyer_mode_name(g_cw_mode), (unsigned)g_cw_wpm, (double)g_cw_ratio,
                ks_names[s_kyr.state & 7], (unsigned)s_kyr.pend_dit, (unsigned)s_kyr.pend_dah,
                (unsigned)g_keyer_key, (unsigned)g_soft_ptt_key);
+    cdc_printf("Sidetone: GP12 PWM  tone=%u Hz vol=%u%% test=%u  (audible while keyer out=1 or tune=1)\r\n",
+               (unsigned)g_st_hz, (unsigned)g_st_vol, (unsigned)g_st_test);
     cdc_printf("Carrier: txmode=%s tune=%u state=%s cw_test_mode=%u pwr_now=%d dBm  tx_allowed=%u (gps=%u gate=%u)\r\n",
                g_tx_mode ? "CW" : "USB", (unsigned)g_tune_active,
                cr_names[g_cr_state & 3], (unsigned)g_cw_test_mode, (int)g_cr_pwr,
                (unsigned)tx_allowed(), (unsigned)gpsdo_is_ready(), (unsigned)g_gps_gate);
+}
+
+// ==========================================================
+// Sidetone: PWM audio on GP12 → RC low-pass → headphones
+// ==========================================================
+// 10-bit PWM at sysclk/1024 (244 kHz @ 250 MHz); samples come from a
+// 16 kHz repeating timer. A pure sine with a 5 ms linear envelope on
+// each key edge — same rise time as the RF power ramp — so what you
+// hear matches what goes out.
+#define PIN_AUDIO_OUT    12
+#define ST_PWM_WRAP      1023u
+#define ST_PERIOD_US     62                       // ≈16.1 kHz
+#define ST_FS_HZ         (1000000.0 / (double)ST_PERIOD_US)
+#define ST_RAMP_SAMPLES  80                       // ≈5 ms
+
+static int16_t           s_st_sin[256];
+static volatile uint32_t s_st_inc  = 0;           // phase increment per sample
+static volatile int32_t  s_st_gain = 0;           // Q15 volume
+static uint32_t          s_st_phase = 0;
+static int32_t           s_st_env   = 0;          // Q15 envelope
+static repeating_timer_t s_st_timer;
+
+static void sidetone_update_params(void) {
+    s_st_inc  = (uint32_t)((double)g_st_hz * 4294967296.0 / ST_FS_HZ);
+    s_st_gain = (int32_t)g_st_vol * 32767 / 100;
+}
+
+static bool __not_in_flash_func(sidetone_tick)(repeating_timer_t *t) {
+    (void)t;
+    const bool    on     = g_keyer_key || g_tune_active || g_st_test;
+    const int32_t target = on ? 32767 : 0;
+    const int32_t step   = 32767 / ST_RAMP_SAMPLES;
+    if (s_st_env < target)      { s_st_env += step; if (s_st_env > target) s_st_env = target; }
+    else if (s_st_env > target) { s_st_env -= step; if (s_st_env < target) s_st_env = target; }
+
+    s_st_phase += s_st_inc;
+    const int32_t s   = s_st_sin[s_st_phase >> 24];
+    const int32_t amp = (s_st_env * s_st_gain) >> 15;          // Q15
+    const int32_t out = 512 + (((s * amp) >> 15) >> 6);        // ±511 around mid-scale
+    pwm_set_gpio_level(PIN_AUDIO_OUT, (uint16_t)out);
+    return true;
+}
+
+static void sidetone_init(void) {
+    for (int i = 0; i < 256; i++) {
+        s_st_sin[i] = (int16_t)lrintf(sinf(2.0f * (float)M_PI * (float)i / 256.0f) * 32767.0f);
+    }
+    sidetone_update_params();
+
+    gpio_set_function(PIN_AUDIO_OUT, GPIO_FUNC_PWM);
+    uint slice = pwm_gpio_to_slice_num(PIN_AUDIO_OUT);
+    pwm_config c = pwm_get_default_config();
+    pwm_config_set_clkdiv(&c, 1.0f);
+    pwm_config_set_wrap(&c, ST_PWM_WRAP);
+    pwm_init(slice, &c, true);
+    pwm_set_gpio_level(PIN_AUDIO_OUT, 512);   // silence = mid-scale (DC blocked by the output cap)
+
+    add_repeating_timer_us(-ST_PERIOD_US, sidetone_tick, NULL, &s_st_timer);
 }
 
 // Button debounce state
@@ -2750,6 +2856,9 @@ int main(void) {
     gpio_init(PIN_KEY_DAH); gpio_set_dir(PIN_KEY_DAH, GPIO_IN); gpio_pull_up(PIN_KEY_DAH);
     // Initialize encoder last state
     enc_last_ab = ((gpio_get(PIN_ENC_A) ? 0 : 1) << 1) | (gpio_get(PIN_ENC_B) ? 0 : 1);
+
+    // --- Sidetone PWM (GP12) — starts silent at mid-scale ---
+    sidetone_init();
 
     spi_init(SX_SPI, SX_SPI_BAUD);
     gpio_set_function(PIN_MISO, GPIO_FUNC_SPI);

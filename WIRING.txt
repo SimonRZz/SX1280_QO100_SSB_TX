@@ -46,3 +46,57 @@ LoRa1280F27-TCXO    Name       Pi Pico       Pi Pico
       Pin                       GPIO           Pin
 --------------------------------------------------------------
        2           TCXOEN      GPIO 22       Pin 29
+
+NOTE: In this fork GPIO 5 is the GPS UART1 RX. Do NOT connect DIO1 —
+the firmware never uses it (BUSY polling only).
+
+================================================================================
+SIDETONE / HEADPHONE OUTPUT (PWM on GPIO 12, Pin 16)
+================================================================================
+
+No amplifier needed — headphones need only microwatts.
+
+  GPIO12 ──[ 100 Ω ]──┬──[ 10 µF ]──[ 220 Ω ]──► 3.5 mm jack  Tip + Ring
+                      │                (+ to GPIO side)
+                   [ 100 nF ]
+                      │
+                     GND ────────────────────────► 3.5 mm jack  Sleeve
+
+    100 Ω / 100 nF   : RC low-pass, fc ≈ 16 kHz, removes the 244 kHz PWM carrier
+    10 µF            : DC blocking (output idles at 1.65 V)
+    220 Ω            : level + short-circuit protection (≈ 0.7 mW into 32 Ω,
+                       already very loud — run the firmware volume at 10–30 %)
+    Tip + Ring joined: mono on both ears
+
+    Firmware: keyer tone <300..1200>   keyer vol <0..100>   keyer test 1|0
+    The tone follows the on-device keyer and the TUNE carrier.
+
+================================================================================
+CW KEY / PADDLE JACK (3.5 mm stereo)
+================================================================================
+
+    Tip    ──► GPIO 9   (Pin 12)   dit
+    Ring   ──► GPIO 11  (Pin 15)   dah
+    Sleeve ──► GND
+
+    Internal pull-ups, active LOW. A straight key on Tip works in
+    "keyer mode straight" (either contact keys).
+
+================================================================================
+GPIO SUMMARY (this fork)
+================================================================================
+
+    GPIO  0  —  SI5351 SDA (I2C0)         GPIO 14  —  RX_EN
+    GPIO  1  —  SI5351 SCL (I2C0)         GPIO 15  —  TX_EN
+    GPIO  2  —  Encoder A                 GPIO 16  —  SPI0 MISO
+    GPIO  3  —  Encoder B                 GPIO 17  —  SPI0 NSS
+    GPIO  4  —  GPS TX (UART1)            GPIO 18  —  SPI0 SCK
+    GPIO  5  —  GPS RX (UART1)            GPIO 19  —  SPI0 MOSI
+    GPIO  6  —  OLED SDA (I2C1)           GPIO 20  —  NRESET
+    GPIO  7  —  OLED SCL (I2C1)           GPIO 21  —  BUSY
+    GPIO  8  —  (free)                    GPIO 22  —  TCXO_EN (unused, USE_TCXO_MODULE=0)
+    GPIO  9  —  CW dit                    GPIO 25  —  onboard LED (underrun)
+    GPIO 10  —  Encoder push              GPIO 26  —  (free, ADC0 — reserved for mic)
+    GPIO 11  —  CW dah                    GPIO 27  —  (free, ADC1)
+    GPIO 12  —  Sidetone PWM              GPIO 28  —  (free, ADC2)
+    GPIO 13  —  (free)

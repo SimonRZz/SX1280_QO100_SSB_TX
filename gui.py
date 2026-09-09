@@ -799,6 +799,9 @@ class SX1280ControlApp(ttk.Frame):
         self.dev_key_var    = tk.StringVar(value="Paddle: —   Key: —")
         self.dev_sym_var    = tk.StringVar(value="")   # elements of the character being keyed
         self._dev_sym       = ""
+        self.dev_sthz_var   = tk.IntVar(value=700)     # sidetone Hz (firmware, GP12)
+        self.dev_stvol_var  = tk.IntVar(value=30)      # sidetone volume %
+        self.dev_sttest_var = tk.BooleanVar(value=False)
 
     def _build_ui(self):
         self.master.title("SX1280 QO-100 SSB TX Control")
@@ -1163,16 +1166,32 @@ class SX1280ControlApp(ttk.Frame):
         sr.bind("<Return>", lambda e: self._dev_keyer_send("ratio"))
         df.columnconfigure(6, weight=1)
 
+        # Sidetone (PWM on GP12 → headphones)
+        ttk.Label(df, text="Sidetone:").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        sh = ttk.Spinbox(df, from_=300, to=1200, increment=50, width=5, textvariable=self.dev_sthz_var,
+                         command=lambda: self._dev_keyer_send("tone"))
+        sh.grid(row=1, column=1, padx=4, pady=(6, 0))
+        sh.bind("<Return>", lambda e: self._dev_keyer_send("tone"))
+        ttk.Label(df, text="Volume:").grid(row=1, column=2, sticky="e", padx=(12, 0), pady=(6, 0))
+        ttk.Scale(df, from_=0, to=100, orient="horizontal", variable=self.dev_stvol_var,
+                  command=lambda v: self._dev_keyer_send("vol")).grid(row=1, column=3, columnspan=2,
+                                                                      sticky="ew", padx=4, pady=(6, 0))
+        self.dev_stvol_lbl = ttk.Label(df, text="30 %", width=5)
+        self.dev_stvol_lbl.grid(row=1, column=5, sticky="w", pady=(6, 0))
+        ttk.Checkbutton(df, text="Test tone", variable=self.dev_sttest_var,
+                        command=lambda: self._dev_keyer_send("test")).grid(row=1, column=6, sticky="w",
+                                                                           padx=(12, 0), pady=(6, 0))
+
         # Live view: paddle contacts, key output, elements of the current character
         self.dev_key_lbl = ttk.Label(df, textvariable=self.dev_key_var, font=("Consolas", 10, "bold"))
-        self.dev_key_lbl.grid(row=1, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        self.dev_key_lbl.grid(row=2, column=0, columnspan=4, sticky="w", pady=(8, 0))
         ttk.Label(df, textvariable=self.dev_sym_var, font=("Consolas", 20, "bold"),
-                  foreground="#cc8800", width=8, anchor="w").grid(row=1, column=4, columnspan=3,
+                  foreground="#cc8800", width=8, anchor="w").grid(row=2, column=4, columnspan=3,
                                                                   sticky="w", pady=(2, 0))
 
         # Decoded text — the firmware's reading of what was keyed at the jack
         dtf = ttk.Frame(df)
-        dtf.grid(row=2, column=0, columnspan=7, sticky="ew", pady=(6, 0))
+        dtf.grid(row=3, column=0, columnspan=7, sticky="ew", pady=(6, 0))
         dtf.columnconfigure(0, weight=1)
         self.dev_decoded = tk.Text(dtf, height=3, wrap="word", font=("Consolas", 12),
                                    state="disabled", bg="#f7f7f7")
@@ -1183,7 +1202,7 @@ class SX1280ControlApp(ttk.Frame):
         ttk.Label(df, text="Runs in firmware — keys the transmitter without this PC. "
                            "WPM is also on the OLED menu. Settings are saved to flash. "
                            "Decoded text uses the WPM above, so wrong letters mean the timing is off.",
-                  foreground="gray", wraplength=760, justify="left").grid(row=3, column=0, columnspan=7,
+                  foreground="gray", wraplength=760, justify="left").grid(row=4, column=0, columnspan=7,
                                                                            sticky="w", pady=(4, 0))
 
     _DEV_KMODES = ["Straight", "Iambic A", "Iambic B"]
@@ -1223,8 +1242,16 @@ class SX1280ControlApp(ttk.Frame):
                 self._send_cmd_safe(f"keyer mode {self._DEV_KMODES.index(self.dev_kmode_var.get())}")
             elif what == "wpm":
                 self._send_cmd_safe(f"keyer wpm {int(self.dev_kwpm_var.get())}")
-            else:
+            elif what == "ratio":
                 self._send_cmd_safe(f"keyer ratio {float(self.dev_kratio_var.get()):.1f}")
+            elif what == "tone":
+                self._send_cmd_safe(f"keyer tone {int(self.dev_sthz_var.get())}")
+            elif what == "vol":
+                v = int(float(self.dev_stvol_var.get()))
+                self.dev_stvol_lbl.config(text=f"{v} %")
+                self.debounced_send.call(f"keyer vol {v}")   # slider drags coalesce
+            elif what == "test":
+                self._send_cmd_safe(f"keyer test {1 if self.dev_sttest_var.get() else 0}")
         except (ValueError, tk.TclError) as e:
             self._log(f"[KEYER] invalid value: {e}", "error")
 
@@ -1630,6 +1657,15 @@ class SX1280ControlApp(ttk.Frame):
                 m = self._DEV_KMODES[max(0, min(2, int(kv["kmode"])))]
                 if self.dev_kmode_var.get() != m:
                     self.dev_kmode_var.set(m)
+            if "sthz" in kv:
+                hz = int(kv["sthz"])
+                if self.dev_sthz_var.get() != hz:
+                    self.dev_sthz_var.set(hz)
+            if "stvol" in kv:
+                vol = int(kv["stvol"])
+                if int(float(self.dev_stvol_var.get())) != vol:
+                    self.dev_stvol_var.set(vol)
+                    self.dev_stvol_lbl.config(text=f"{vol} %")
             if "key" in kv or "pdl" in kv:
                 pdl = int(kv.get("pdl", "0"))
                 key = kv.get("key", "0") == "1"
