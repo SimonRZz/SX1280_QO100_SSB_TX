@@ -8,6 +8,9 @@
 
 #include "pico/stdlib.h"
 #include "pico/multicore.h"
+#include "pico/flash.h"
+#include "hardware/flash.h"
+#include <stddef.h>
 
 #include "hardware/spi.h"
 #include "hardware/gpio.h"
@@ -168,6 +171,17 @@ static volatile uint8_t g_gps_gate = 1;
 
 static inline bool tx_allowed(void) {
     return gpsdo_is_ready() || !g_gps_gate;
+}
+
+// --- Persistent config (last flash sector) ---
+static volatile uint8_t  g_persist_dirty       = 0;  // something worth saving changed
+static volatile uint32_t g_persist_dirty_since = 0;  // ms of last change
+static uint8_t           g_persist_loaded      = 0;  // 1 = boot config came from flash
+
+// The main loop autosaves after an idle period, so knob turns don't erase flash repeatedly.
+static inline void persist_mark_dirty(void) {
+    g_persist_dirty = 1;
+    g_persist_dirty_since = to_ms_since_boot(get_absolute_time());
 }
 
 // --- Encoder UI state ---
@@ -1038,31 +1052,30 @@ typedef struct {
     float amp_min_a;
 } audio_cfg_t;
 
-static volatile audio_cfg_t g_cfg = {
-    .enable_bandpass = AUDIO_ENABLE_BANDPASS,
-    .enable_eq       = AUDIO_ENABLE_EQ,
-    .enable_comp     = AUDIO_ENABLE_COMPRESSOR,
+#define AUDIO_CFG_DEFAULTS { \
+    .enable_bandpass = AUDIO_ENABLE_BANDPASS, \
+    .enable_eq       = AUDIO_ENABLE_EQ, \
+    .enable_comp     = AUDIO_ENABLE_COMPRESSOR, \
+    .bp_lo_hz  = AUDIO_BP_LO_HZ, \
+    .bp_hi_hz  = AUDIO_BP_HI_HZ, \
+    .bp_stages = AUDIO_BP_DEFAULT_STAGES, \
+    .eq_low_hz  = EQ_LOW_SHELF_HZ, \
+    .eq_low_db  = EQ_LOW_SHELF_DB, \
+    .eq_high_hz = EQ_HIGH_SHELF_HZ, \
+    .eq_high_db = EQ_HIGH_SHELF_DB, \
+    .comp_thr_db     = COMP_THRESHOLD_DB, \
+    .comp_ratio      = COMP_RATIO, \
+    .comp_attack_ms  = COMP_ATTACK_MS, \
+    .comp_release_ms = COMP_RELEASE_MS, \
+    .comp_makeup_db  = COMP_MAKEUP_DB, \
+    .comp_knee_db    = COMP_KNEE_DB, \
+    .comp_out_limit  = COMP_OUTPUT_LIMIT, \
+    .amp_gain  = AMP_GAIN, \
+    .amp_min_a = AMP_MIN_A, \
+}
 
-    .bp_lo_hz  = AUDIO_BP_LO_HZ,
-    .bp_hi_hz  = AUDIO_BP_HI_HZ,
-    .bp_stages = AUDIO_BP_DEFAULT_STAGES,
-
-    .eq_low_hz  = EQ_LOW_SHELF_HZ,
-    .eq_low_db  = EQ_LOW_SHELF_DB,
-    .eq_high_hz = EQ_HIGH_SHELF_HZ,
-    .eq_high_db = EQ_HIGH_SHELF_DB,
-
-    .comp_thr_db     = COMP_THRESHOLD_DB,
-    .comp_ratio      = COMP_RATIO,
-    .comp_attack_ms  = COMP_ATTACK_MS,
-    .comp_release_ms = COMP_RELEASE_MS,
-    .comp_makeup_db  = COMP_MAKEUP_DB,
-    .comp_knee_db    = COMP_KNEE_DB,
-    .comp_out_limit  = COMP_OUTPUT_LIMIT,
-
-    .amp_gain  = AMP_GAIN,
-    .amp_min_a = AMP_MIN_A,
-};
+static const audio_cfg_t k_cfg_defaults = AUDIO_CFG_DEFAULTS;
+static volatile audio_cfg_t g_cfg = AUDIO_CFG_DEFAULTS;
 static volatile uint8_t g_cfg_dirty = 1;
 
 static void compressor_reconfig(compressor_t *c, float fs, const audio_cfg_t *cfg) {
@@ -1222,11 +1235,12 @@ static void cfg_print(void) {
         "CFG:\r\n"
         "  fw=" FW_VERSION "  built=" FW_BUILD "\r\n"
         "  freq=%s Hz (target)  ppm=%.3f  tx=%s  txpwr=%d dBm\r\n"
-        "  mode=%s  tune=%s  gps=%s  gpsgate=%s\r\n"
+        "  mode=%s  tune=%s  gps=%s  gpsgate=%s  config=%s\r\n"
         "  corrected=%s Hz  base_steps=%lu  fine=%.1f Hz (auto)\r\n",
         freq_str, g_ppm_correction, g_tx_enabled ? "ON" : "OFF", g_tx_power_max_dbm,
         g_tx_mode ? "CW" : "USB", g_tune_active ? "ON" : "OFF",
         gpsdo_is_ready() ? "ready" : "wait", g_gps_gate ? "ON" : "OFF",
+        g_persist_dirty ? "unsaved" : (g_persist_loaded ? "flash" : "defaults"),
         corr_str, (unsigned long)get_base_steps(), fine);
     cdc_printf(
         "  enable bp=%u eq=%u comp=%u\r\n"
@@ -1253,6 +1267,8 @@ static void cmd_help(void) {
         "  diag          - show SX1280 status\r\n"
         "  gpsdo         - GPSDO status line\r\n"
         "  gpsgate 0|1   - 1: TX only with GPS UTC (default); 0: override for bench tests\r\n"
+        "  save          - write freq/ppm/txpwr/mode/DSP to flash now (autosaves 5 s after idle)\r\n"
+        "  defaults      - restore compile-time defaults and save\r\n"
         "  tx 0|1        - enable/disable TX (SSB modulation)\r\n"
         "  mode usb|cw   - set modulation mode\r\n"
         "  tune 0|1      - toggle TUNE carrier\r\n"
@@ -1291,6 +1307,120 @@ static void cfg_commit(const audio_cfg_t *c) {
     memcpy((void*)&g_cfg, c, sizeof(*c));
     g_cfg_dirty = 1;
     __compiler_memory_barrier();
+    persist_mark_dirty();
+}
+
+// ==========================================================
+// Persistent configuration in the last 4 KB flash sector
+// ==========================================================
+// Layout: one flash page. Anything not listed here (TX enable, TUNE,
+// GPS gate, soft key) is deliberately volatile and resets at boot.
+#define CFG_FLASH_OFFSET   (PICO_FLASH_SIZE_BYTES - FLASH_SECTOR_SIZE)
+#define CFG_MAGIC          0x51303130u   // 'Q010'
+#define CFG_VERSION        1u
+
+typedef struct __attribute__((packed)) {
+    uint32_t    magic;
+    uint32_t    version;
+    double      freq_hz;
+    float       ppm_correction;
+    int8_t      tx_power_dbm;
+    uint8_t     tx_mode;         // 0 = USB, 1 = CW
+    uint8_t     _reserved[2];
+    audio_cfg_t dsp;
+    uint32_t    crc32;           // over everything above
+} persist_cfg_t;
+
+_Static_assert(sizeof(persist_cfg_t) <= FLASH_PAGE_SIZE,
+               "persist_cfg_t must fit in one flash page");
+
+static uint32_t crc32_update(uint32_t crc, const uint8_t *data, size_t len) {
+    crc ^= 0xFFFFFFFFu;
+    for (size_t i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (int k = 0; k < 8; k++) {
+            uint32_t mask = -(int32_t)(crc & 1u);
+            crc = (crc >> 1) ^ (0xEDB88320u & mask);
+        }
+    }
+    return crc ^ 0xFFFFFFFFu;
+}
+
+static inline uint32_t persist_cfg_crc(const persist_cfg_t *c) {
+    return crc32_update(0, (const uint8_t *)c, offsetof(persist_cfg_t, crc32));
+}
+
+static void persist_collect(persist_cfg_t *c) {
+    memset(c, 0, sizeof(*c));
+    c->magic          = CFG_MAGIC;
+    c->version        = CFG_VERSION;
+    c->freq_hz        = g_target_freq_hz;
+    c->ppm_correction = g_ppm_correction;
+    c->tx_power_dbm   = g_tx_power_max_dbm;
+    c->tx_mode        = g_tx_mode;
+    __compiler_memory_barrier();
+    memcpy(&c->dsp, (const void *)&g_cfg, sizeof(c->dsp));
+    __compiler_memory_barrier();
+    c->crc32          = persist_cfg_crc(c);
+}
+
+static void persist_apply(const persist_cfg_t *c) {
+    double f = c->freq_hz;
+    if (!(f >= 2400000000.0 && f <= 2500000000.0)) f = (double)BASE_FREQ_HZ;  // also rejects NaN
+    g_target_freq_hz = f;
+
+    float ppm = c->ppm_correction;
+    if (!(ppm >= -100.0f && ppm <= 100.0f)) ppm = 0.0f;
+    g_ppm_correction = ppm;
+
+    int8_t p = c->tx_power_dbm;
+    if (p < PWR_MIN_DBM) p = PWR_MIN_DBM;
+    if (p > PWR_MAX_DBM) p = PWR_MAX_DBM;
+    g_tx_power_max_dbm = p;
+
+    g_tx_mode = (c->tx_mode == 1) ? 1 : 0;
+
+    audio_cfg_t d = c->dsp;
+    cfg_sanitize(&d, (float)WAV_SAMPLE_RATE);
+    cfg_commit(&d);
+}
+
+static bool persist_load(void) {
+    const persist_cfg_t *p = (const persist_cfg_t *)(XIP_BASE + CFG_FLASH_OFFSET);
+    if (p->magic != CFG_MAGIC)          return false;
+    if (p->version != CFG_VERSION)      return false;
+    if (persist_cfg_crc(p) != p->crc32) return false;
+    persist_apply(p);
+    g_persist_dirty  = 0;   // cfg_commit() marked dirty; a fresh load is clean by definition
+    g_persist_loaded = 1;
+    return true;
+}
+
+// Runs with IRQs off on Core0 and Core1 parked by flash_safe_execute().
+// Must stay in RAM: XIP is unavailable while flash is being erased.
+static void __not_in_flash_func(persist_flash_op)(void *param) {
+    flash_range_erase(CFG_FLASH_OFFSET, FLASH_SECTOR_SIZE);
+    flash_range_program(CFG_FLASH_OFFSET, (const uint8_t *)param, FLASH_PAGE_SIZE);
+}
+
+// ~20 ms erase + ~1 ms program. Core1's SPI loop is stalled meanwhile, so the
+// SX1280 holds its last state for that long — hence autosave only when idle.
+static bool persist_save_now(void) {
+    persist_cfg_t c;
+    persist_collect(&c);
+
+    static uint8_t page[FLASH_PAGE_SIZE];
+    memset(page, 0xFF, sizeof(page));
+    memcpy(page, &c, sizeof(c));
+
+    int r = flash_safe_execute(persist_flash_op, page, 100);
+    if (r == PICO_OK) {
+        g_persist_dirty = 0;
+        return true;
+    }
+    // Don't retry back-to-back: each failed attempt costs up to 100 ms.
+    g_persist_dirty_since = to_ms_since_boot(get_absolute_time());
+    return false;
 }
 
 // Periodic status push to CDC for GUI synchronization.
@@ -1307,6 +1437,7 @@ static void cdc_status_push_ex(bool force) {
     static double   last_freq = 0.0;
     static uint8_t  last_gps  = 0xFF;
     static uint8_t  last_gate = 0xFF;
+    static uint8_t  last_dirty = 0xFF;
 
     if (!tud_cdc_connected()) return;
 
@@ -1318,13 +1449,15 @@ static void cdc_status_push_ex(bool force) {
     double   cur_freq = (double)g_target_freq_hz;
     uint8_t  cur_gps  = gpsdo_is_ready() ? 1 : 0;
     uint8_t  cur_gate = g_gps_gate;
+    uint8_t  cur_dirty = g_persist_dirty;
 
     if (!force) {
         // Check if anything changed
         bool changed = (cur_mode != last_mode) || (cur_tune != last_tune) ||
                        (cur_tx != last_tx) || (cur_pwr != last_pwr) ||
                        (cur_ppm != last_ppm) || (cur_freq != last_freq) ||
-                       (cur_gps != last_gps) || (cur_gate != last_gate);
+                       (cur_gps != last_gps) || (cur_gate != last_gate) ||
+                       (cur_dirty != last_dirty);
 
         if (!changed) return;
 
@@ -1345,10 +1478,10 @@ static void cdc_status_push_ex(bool force) {
 
     char status_buf[128];
     snprintf(status_buf, sizeof(status_buf),
-             "!S mode=%u tune=%u tx=%u pwr=%d ppm=%s%lu.%04lu freq=%s gps=%u gate=%u\r\n",
+             "!S mode=%u tune=%u tx=%u pwr=%d ppm=%s%lu.%04lu freq=%s gps=%u gate=%u dirty=%u\r\n",
              cur_mode, cur_tune, cur_tx, cur_pwr,
              ppm_neg ? "-" : "", (unsigned long)ppm_int, (unsigned long)ppm_frac,
-             freq_str, cur_gps, cur_gate);
+             freq_str, cur_gps, cur_gate, cur_dirty);
     cdc_write_str(status_buf);
 
     last_mode = cur_mode;
@@ -1359,6 +1492,7 @@ static void cdc_status_push_ex(bool force) {
     last_freq = cur_freq;
     last_gps  = cur_gps;
     last_gate = cur_gate;
+    last_dirty = cur_dirty;
     last_push_ms = to_ms_since_boot(get_absolute_time());
 }
 
@@ -1382,6 +1516,23 @@ static void cdc_handle_line(char *line) {
         char gbuf[128];
         gpsdo_format_status(gbuf, sizeof(gbuf));
         cdc_write_str(gbuf);
+        return;
+    }
+    if (streqi(argv[0], "save")) {
+        if (persist_save_now()) cdc_write_str("OK saved to flash\r\n");
+        else                    cdc_write_str("ERR: flash save failed (core lockout timeout?)\r\n");
+        return;
+    }
+    if (streqi(argv[0], "defaults")) {
+        g_target_freq_hz   = (double)BASE_FREQ_HZ;
+        g_ppm_correction   = 0.0f;
+        g_tx_power_max_dbm = PWR_MAX_DBM;
+        g_tx_mode          = 0;
+        cfg_commit(&k_cfg_defaults);
+        if (g_tune_active) tune_apply_settings();
+        if (persist_save_now()) cdc_write_str("OK defaults restored and saved\r\n");
+        else                    cdc_write_str("ERR: defaults restored in RAM, flash save failed\r\n");
+        cfg_print();
         return;
     }
     if (streqi(argv[0], "version") || streqi(argv[0], "ver")) {
@@ -1413,6 +1564,7 @@ static void cdc_handle_line(char *line) {
     }
     // cwkey: enter CW mode and arm keyer (alias for mode cw, used by GUI keyer)
     if (streqi(argv[0], "cwkey")) {
+        if (g_tx_mode != 1) persist_mark_dirty();
         g_tx_mode = 1;
         g_soft_ptt_key = 0;
         cdc_printf("OK cwkey mode=CW\r\n");
@@ -1427,9 +1579,11 @@ static void cdc_handle_line(char *line) {
     // Mode: mode usb|cw
     if (streqi(argv[0], "mode") && argc >= 2) {
         if (streqi(argv[1], "usb") || streqi(argv[1], "ssb")) {
+            if (g_tx_mode != 0) persist_mark_dirty();
             g_tx_mode = 0;
             cdc_printf("OK mode=USB\r\n");
         } else if (streqi(argv[1], "cw")) {
+            if (g_tx_mode != 1) persist_mark_dirty();
             g_tx_mode = 1;
             cdc_printf("OK mode=CW\r\n");
         } else {
@@ -1474,6 +1628,7 @@ static void cdc_handle_line(char *line) {
             return;
         }
         g_target_freq_hz = f;
+        persist_mark_dirty();
         double corrected = get_corrected_freq_hz();
         float fine = get_fine_tune_hz();
         cdc_printf("OK freq=%.1f Hz (corrected=%.1f, steps=%lu, fine=%.1f Hz)\r\n", 
@@ -1495,6 +1650,7 @@ static void cdc_handle_line(char *line) {
             return;
         }
         g_ppm_correction = ppm;
+        persist_mark_dirty();
         double corrected = get_corrected_freq_hz();
         float fine = get_fine_tune_hz();
         cdc_printf("OK ppm=%.3f (corrected=%.1f Hz, steps=%lu, fine=%.1f Hz)\r\n", 
@@ -1514,6 +1670,7 @@ static void cdc_handle_line(char *line) {
         if (pwr < (float)PWR_MIN_DBM) pwr = (float)PWR_MIN_DBM;
         if (pwr > (float)PWR_MAX_DBM) pwr = (float)PWR_MAX_DBM;
         g_tx_power_max_dbm = (int8_t)pwr;
+        persist_mark_dirty();
         cdc_printf("OK txpwr=%d dBm\r\n", g_tx_power_max_dbm);
         if (g_tune_active) tune_apply_settings();
         return;
@@ -1854,6 +2011,7 @@ static void encoder_poll(void) {
                 if (f < 2400000000.0) f = 2400000000.0;
                 if (f > 2500000000.0) f = 2500000000.0;
                 g_target_freq_hz = f;
+                persist_mark_dirty();
                 if (g_tune_active) tune_apply_settings();
             }
             break;
@@ -1873,6 +2031,7 @@ static void encoder_poll(void) {
             switch (g_ui_editing) {
                 case UI_PARAM_MODE:
                     g_tx_mode = g_tx_mode ? 0 : 1;
+                    persist_mark_dirty();
                     break;
                 case UI_PARAM_TUNE:
                     if (step > 0 && !g_tune_active) {
@@ -1895,6 +2054,7 @@ static void encoder_poll(void) {
                         if (ppm < -50.0f) ppm = -50.0f;
                         if (ppm >  50.0f) ppm =  50.0f;
                         g_ppm_correction = ppm;
+                        persist_mark_dirty();
                         if (g_tune_active) tune_apply_settings();
                     }
                     break;
@@ -1904,6 +2064,7 @@ static void encoder_poll(void) {
                         if (p < PWR_MIN_DBM) p = PWR_MIN_DBM;
                         if (p > PWR_MAX_DBM) p = PWR_MAX_DBM;
                         g_tx_power_max_dbm = p;
+                        persist_mark_dirty();
                         if (g_tune_active) tune_apply_settings();
                     }
                     break;
@@ -2039,6 +2200,9 @@ static inline float duty_from_A(float A) {
 // CORE1: timed radio apply loop
 // ==========================================================
 static void core1_radio_apply_loop(void) {
+    // Lets Core0's flash_safe_execute() park this core during flash writes.
+    flash_safe_execute_core_init();
+
     const uint32_t sample_period_us = 1000000u / WAV_SAMPLE_RATE;
     const uint32_t substeps = (DITHER_SUBSTEPS <= 1) ? 1u : (uint32_t)DITHER_SUBSTEPS;
     const uint32_t sub_period_us = (substeps == 1) ? sample_period_us : (sample_period_us / substeps);
@@ -2209,6 +2373,17 @@ static void usb_audio_pump(void) {
     }
 }
 
+// Autosave 5 s after the last change, but only while nothing is on the air:
+// the ~20 ms flash erase parks Core1, which would freeze the SX1280 mid-word.
+static void persist_maybe_autosave(void) {
+    if (!g_persist_dirty) return;
+    if (g_ui_state != UI_STATE_IDLE) return;                     // still in the menu
+    if (g_tune_active || g_ptt_key || g_soft_ptt_key) return;   // carrier / key down
+    uint32_t now = to_ms_since_boot(get_absolute_time());
+    if ((now - g_persist_dirty_since) < 5000u) return;
+    persist_save_now();
+}
+
 // ==========================================================
 // Boot screen while waiting for the SI5351 clock
 // ==========================================================
@@ -2231,6 +2406,9 @@ static void oled_draw_boot_wait(uint32_t elapsed_ms) {
 int main(void) {
     bool ok = set_sys_clock_khz(250000, false);
     if (!ok) set_sys_clock_khz(200000, true);
+
+    // Restore saved config before anything displays or uses it.
+    persist_load();
 
     // ---- USB device init ----
     board_init();
@@ -2469,6 +2647,7 @@ int main(void) {
             encoder_poll();
             button_poll();
             carrier_poll();
+            persist_maybe_autosave();
 
 #if CFG_TUD_CDC
             cdc_task();
@@ -2499,6 +2678,7 @@ int main(void) {
             encoder_poll();
             button_poll();
             carrier_poll();
+            persist_maybe_autosave();
 
 #if CFG_TUD_CDC
             cdc_status_push();
@@ -2511,6 +2691,8 @@ int main(void) {
         if (!greeted && tud_cdc_connected()) {
             greeted = 1;
             cdc_write_str("\r\nSX1280_SDR control ready. FW " FW_VERSION " built " FW_BUILD ". Type 'help'.\r\n");
+            cdc_write_str(g_persist_loaded ? "Config: restored from flash.\r\n"
+                                           : "Config: compile-time defaults (nothing valid in flash).\r\n");
             cfg_print();
         }
 

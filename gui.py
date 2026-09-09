@@ -786,6 +786,7 @@ class SX1280ControlApp(ttk.Frame):
         self.gpsdo_alt_var  = tk.StringVar(value="--")
 
         self.fw_version_var = tk.StringVar(value="")
+        self.cfg_dirty_var  = tk.StringVar(value="")
         self.txgate_var     = tk.StringVar(value="")
         self.gps_gate_var   = tk.BooleanVar(value=True)
         self._gps_ready     = None   # None = unknown, else bool from !S gps=
@@ -826,6 +827,8 @@ class SX1280ControlApp(ttk.Frame):
         ttk.Label(f, textvariable=self.status_var).grid(row=0, column=3, padx=(10, 0))
         ttk.Label(f, textvariable=self.fw_version_var,
                   foreground="gray").grid(row=0, column=4, padx=(10, 0))
+        ttk.Label(f, textvariable=self.cfg_dirty_var,
+                  foreground="#cc6600").grid(row=0, column=5, padx=(10, 0))
         self.txgate_bar_lbl = ttk.Label(f, textvariable=self.txgate_var,
                                         font=("TkDefaultFont", 9, "bold"))
         self.txgate_bar_lbl.grid(row=1, column=0, columnspan=5, sticky="w", pady=(2, 0))
@@ -1273,6 +1276,8 @@ class SX1280ControlApp(ttk.Frame):
         ttk.Button(bf, text="Clear Log", command=self._clear_log).pack(side="left")
         ttk.Button(bf, text="Save Log…", command=self._save_log).pack(side="left", padx=(6, 0))
         ttk.Button(bf, text="Send All Settings", command=self._send_all).pack(side="right")
+        ttk.Button(bf, text="Save to Flash",
+                   command=lambda: self._send_cmd_safe("save")).pack(side="right", padx=(0, 6))
 
     def _console_send(self, _event=None):
         cmd = self.console_cmd_var.get().strip()
@@ -1519,6 +1524,9 @@ class SX1280ControlApp(ttk.Frame):
 
             if "gps" in kv or "gate" in kv:
                 self._update_txgate(kv.get("gps"), kv.get("gate"))
+
+            if "dirty" in kv:
+                self.cfg_dirty_var.set("● unsaved (autosave 5 s idle)" if kv["dirty"] == "1" else "")
 
             self._status_updating = False
         except Exception as e:
