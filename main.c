@@ -2400,6 +2400,16 @@ int main(void) {
             cdc_task();
             cdc_status_push();
 #endif
+            // Service GPS UART here too — skipping gpsdo_task() in the
+            // continue below would starve the UART FIFO whenever CW mode
+            // is active, causing the UTC timestamp and visible-sat count
+            // to freeze within seconds.
+            gpsdo_task();
+            if (gpsdo_status_due()) {
+                char gbuf[128];
+                gpsdo_format_status(gbuf, sizeof(gbuf));
+                cdc_write_str(gbuf);
+            }
             tight_loop_contents();
             continue;   // Skip block production entirely
         }
