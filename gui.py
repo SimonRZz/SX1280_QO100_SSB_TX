@@ -797,6 +797,8 @@ class SX1280ControlApp(ttk.Frame):
         self.dev_kwpm_var   = tk.IntVar(value=18)
         self.dev_kratio_var = tk.DoubleVar(value=3.0)
         self.dev_key_var    = tk.StringVar(value="Paddle: —   Key: —")
+        self.dev_sym_var    = tk.StringVar(value="")   # elements of the character being keyed
+        self._dev_sym       = ""
 
     def _build_ui(self):
         self.master.title("SX1280 QO-100 SSB TX Control")
@@ -1159,13 +1161,59 @@ class SX1280ControlApp(ttk.Frame):
                          command=lambda: self._dev_keyer_send("ratio"))
         sr.grid(row=0, column=5, padx=4)
         sr.bind("<Return>", lambda e: self._dev_keyer_send("ratio"))
+        df.columnconfigure(6, weight=1)
+
+        # Live view: paddle contacts, key output, elements of the current character
         self.dev_key_lbl = ttk.Label(df, textvariable=self.dev_key_var, font=("Consolas", 10, "bold"))
-        self.dev_key_lbl.grid(row=1, column=0, columnspan=6, sticky="w", pady=(6, 0))
+        self.dev_key_lbl.grid(row=1, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        ttk.Label(df, textvariable=self.dev_sym_var, font=("Consolas", 20, "bold"),
+                  foreground="#cc8800", width=8, anchor="w").grid(row=1, column=4, columnspan=3,
+                                                                  sticky="w", pady=(2, 0))
+
+        # Decoded text — the firmware's reading of what was keyed at the jack
+        dtf = ttk.Frame(df)
+        dtf.grid(row=2, column=0, columnspan=7, sticky="ew", pady=(6, 0))
+        dtf.columnconfigure(0, weight=1)
+        self.dev_decoded = tk.Text(dtf, height=3, wrap="word", font=("Consolas", 12),
+                                   state="disabled", bg="#f7f7f7")
+        self.dev_decoded.grid(row=0, column=0, sticky="ew")
+        ttk.Button(dtf, text="Clear", width=6,
+                   command=self._dev_decoded_clear).grid(row=0, column=1, sticky="n", padx=(6, 0))
+
         ttk.Label(df, text="Runs in firmware — keys the transmitter without this PC. "
-                           "WPM is also on the OLED menu. Settings are saved to flash.",
-                  foreground="gray").grid(row=2, column=0, columnspan=6, sticky="w", pady=(4, 0))
+                           "WPM is also on the OLED menu. Settings are saved to flash. "
+                           "Decoded text uses the WPM above, so wrong letters mean the timing is off.",
+                  foreground="gray", wraplength=760, justify="left").grid(row=3, column=0, columnspan=7,
+                                                                           sticky="w", pady=(4, 0))
 
     _DEV_KMODES = ["Straight", "Iambic A", "Iambic B"]
+
+    def _handle_keyer_event(self, line):
+        p = line[3:].strip()
+        if p.startswith("e="):
+            self._dev_sym += p[2:3]
+            self.dev_sym_var.set(self._dev_sym)
+        elif p.startswith("c="):
+            self._dev_sym = ""
+            self.dev_sym_var.set("")
+            self._dev_decoded_append(p[2:3] or "?")
+        elif p == "w":
+            self._dev_decoded_append(" ")
+
+    def _dev_decoded_append(self, s):
+        self.dev_decoded.config(state="normal")
+        self.dev_decoded.insert("end", s)
+        if int(self.dev_decoded.index("end-1c").split(".")[0]) > 50:
+            self.dev_decoded.delete("1.0", "2.0")
+        self.dev_decoded.see("end")
+        self.dev_decoded.config(state="disabled")
+
+    def _dev_decoded_clear(self):
+        self.dev_decoded.config(state="normal")
+        self.dev_decoded.delete("1.0", "end")
+        self.dev_decoded.config(state="disabled")
+        self._dev_sym = ""
+        self.dev_sym_var.set("")
 
     def _dev_keyer_send(self, what):
         if self._status_updating:
@@ -1877,7 +1925,7 @@ class SX1280ControlApp(ttk.Frame):
     def _classify_log(msg, tag):
         if tag != "recv":
             return tag
-        if msg.startswith("!S "):
+        if msg.startswith(("!S ", "!K ")):
             return "status"
         if msg.startswith("GPSDO:"):
             return "gpsdo"
@@ -2020,6 +2068,10 @@ class SX1280ControlApp(ttk.Frame):
                     latest_status = line  # keep only the newest status push
                     # Only buffered when enabled — otherwise the 2 s heartbeat
                     # would flush useful lines out of the console history.
+                    if self.log_show_status_var.get():
+                        self._log(line, "recv")
+                elif line.startswith("!K "):
+                    self._handle_keyer_event(line)
                     if self.log_show_status_var.get():
                         self._log(line, "recv")
                 else:

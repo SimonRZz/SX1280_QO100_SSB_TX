@@ -1301,6 +1301,7 @@ static void cmd_help(void) {
         "  save          - write freq/ppm/txpwr/mode/DSP to flash now (autosaves 5 s after idle)\r\n"
         "  defaults      - restore compile-time defaults and save\r\n"
         "  keyer [wpm <5..60> | mode <straight|a|b> | ratio <2..5>] - on-device paddle keyer\r\n"
+        "                  decoder events: !K e=.|-  !K c=<char>  !K w\r\n"
         "  tx 0|1        - enable/disable TX (SSB modulation)\r\n"
         "  mode usb|cw   - set modulation mode\r\n"
         "  tune 0|1      - toggle TUNE carrier\r\n"
@@ -2054,14 +2055,53 @@ static int8_t  enc_accum = 0;
 //  - same-paddle level is re-latched at element END (hold-to-repeat)
 //  - Iambic B additionally latches the opposite paddle during an element
 //  - Iambic A drops latches for paddles already released at element end
-typedef enum { KS_IDLE = 0, KS_DIT, KS_DAH, KS_IEL } keyer_state_t;
+// ICH/IWD only serve the decoder (character / word gap detection); keying
+// itself is finished once IEL has elapsed.
+typedef enum { KS_IDLE = 0, KS_DIT, KS_DAH, KS_IEL, KS_ICH, KS_IWD } keyer_state_t;
 
 static struct {
     keyer_state_t state;
     uint64_t      t0_us;
     uint8_t       pend_dit, pend_dah, was_dit;
     uint8_t       dit_prev, dah_prev;
+    char          sym[8];        // elements of the character being keyed
+    uint8_t       sym_len;
 } s_kyr;
+
+static const struct { const char *code; char ch; } k_morse[] = {
+    {".-",'A'},   {"-...",'B'}, {"-.-.",'C'}, {"-..",'D'},  {".",'E'},    {"..-.",'F'},
+    {"--.",'G'},  {"....",'H'}, {"..",'I'},   {".---",'J'}, {"-.-",'K'},  {".-..",'L'},
+    {"--",'M'},   {"-.",'N'},   {"---",'O'},  {".--.",'P'}, {"--.-",'Q'}, {".-.",'R'},
+    {"...",'S'},  {"-",'T'},    {"..-",'U'},  {"...-",'V'}, {".--",'W'},  {"-..-",'X'},
+    {"-.--",'Y'}, {"--..",'Z'},
+    {".----",'1'},{"..---",'2'},{"...--",'3'},{"....-",'4'},{".....",'5'},
+    {"-....",'6'},{"--...",'7'},{"---..",'8'},{"----.",'9'},{"-----",'0'},
+    {".-.-.-",'.'},{"--..--",','},{"..--..",'?'},{".----.",'\''},{"-..-.",'/'},
+    {"---...",':'},{"-.--.",'('},{"-.--.-",')'},{".-...",'&'},{"-...-",'='},
+    {".-.-.",'+'},{"-....-",'-'},{".-..-.",'"'},{".--.-.",'@'},
+};
+
+// Decoder events for the GUI: "!K e=." / "!K e=-" per element,
+// "!K c=<char>" per decoded character, "!K w" per word gap.
+static inline void keyer_emit(const char *s) { cdc_write_str(s); }
+
+static void keyer_sym_push(char c) {
+    if (s_kyr.sym_len < sizeof(s_kyr.sym) - 1) s_kyr.sym[s_kyr.sym_len++] = c;
+    keyer_emit(c == '.' ? "!K e=.\r\n" : "!K e=-\r\n");
+}
+
+static void keyer_decode_char(void) {
+    if (!s_kyr.sym_len) return;
+    s_kyr.sym[s_kyr.sym_len] = '\0';
+    char ch = '?';
+    for (size_t i = 0; i < sizeof(k_morse) / sizeof(k_morse[0]); i++) {
+        if (strcmp(k_morse[i].code, s_kyr.sym) == 0) { ch = k_morse[i].ch; break; }
+    }
+    s_kyr.sym_len = 0;
+    char line[12];
+    snprintf(line, sizeof(line), "!K c=%c\r\n", ch);
+    keyer_emit(line);
+}
 
 static const char *keyer_mode_name(uint8_t m) {
     return (m == KEYER_STRAIGHT) ? "straight" : (m == KEYER_IAMBIC_A) ? "iambic-a" : "iambic-b";
@@ -2070,6 +2110,7 @@ static const char *keyer_mode_name(uint8_t m) {
 static void keyer_reset(void) {
     s_kyr.state = KS_IDLE;
     s_kyr.pend_dit = s_kyr.pend_dah = 0;
+    s_kyr.sym_len = 0;
     g_keyer_key = 0;
 }
 
@@ -2099,19 +2140,34 @@ static void keyer_poll(void) {
     s_kyr.dit_prev = dit;
     s_kyr.dah_prev = dah;
 
-    if (g_cw_mode == KEYER_STRAIGHT) {
-        // Either contact is the key: works for a straight key on tip and for paddles alike
-        g_keyer_key = dit | dah;
-        s_kyr.pend_dit = s_kyr.pend_dah = 0;
-        s_kyr.state = KS_IDLE;
-        return;
-    }
-
     const uint64_t now    = time_us_64();
     const uint64_t el     = now - s_kyr.t0_us;
     const uint32_t dit_us = 1200000u / (g_cw_wpm ? g_cw_wpm : 18u);
     const uint32_t dah_us = (uint32_t)((float)dit_us * g_cw_ratio);
     const bool     mode_a = (g_cw_mode == KEYER_IAMBIC_A);
+
+    if (g_cw_mode == KEYER_STRAIGHT) {
+        // Either contact is the key: works for a straight key on tip and for paddles alike.
+        // Elements are classified by hold time for the decoder only.
+        const uint8_t k = dit | dah;
+        s_kyr.pend_dit = s_kyr.pend_dah = 0;
+        if (k && !g_keyer_key) {
+            g_keyer_key = 1; s_kyr.t0_us = now; s_kyr.state = KS_DIT;
+        } else if (!k && g_keyer_key) {
+            g_keyer_key = 0;
+            keyer_sym_push(el < (uint64_t)dit_us * 2u ? '.' : '-');
+            s_kyr.t0_us = now; s_kyr.state = KS_ICH;
+        } else if (!k) {
+            if (s_kyr.state == KS_ICH && el >= (uint64_t)dit_us * 3u) {
+                keyer_decode_char();
+                s_kyr.state = KS_IWD; s_kyr.t0_us = now;
+            } else if (s_kyr.state == KS_IWD && el >= (uint64_t)dit_us * 4u) {
+                keyer_emit("!K w\r\n");
+                s_kyr.state = KS_IDLE;
+            }
+        }
+        return;
+    }
 
     switch (s_kyr.state) {
     case KS_IDLE:
@@ -2126,6 +2182,7 @@ static void keyer_poll(void) {
         if (el >= dit_us) {
             s_kyr.was_dit = 1;
             g_keyer_key = 0;
+            keyer_sym_push('.');
             if (dit) s_kyr.pend_dit = 1;
             if (mode_a) { if (!dit) s_kyr.pend_dit = 0; if (!dah) s_kyr.pend_dah = 0; }
             s_kyr.state = KS_IEL; s_kyr.t0_us = now;
@@ -2138,6 +2195,7 @@ static void keyer_poll(void) {
         if (el >= dah_us) {
             s_kyr.was_dit = 0;
             g_keyer_key = 0;
+            keyer_sym_push('-');
             if (dah) s_kyr.pend_dah = 1;
             if (mode_a) { if (!dit) s_kyr.pend_dit = 0; if (!dah) s_kyr.pend_dah = 0; }
             s_kyr.state = KS_IEL; s_kyr.t0_us = now;
@@ -2152,7 +2210,26 @@ static void keyer_poll(void) {
                 if (s_kyr.was_dit) keyer_send_dah(now); else keyer_send_dit(now);
             } else if (s_kyr.pend_dah) keyer_send_dah(now);
             else if (s_kyr.pend_dit)   keyer_send_dit(now);
-            else                       s_kyr.state = KS_IDLE;
+            else { s_kyr.state = KS_ICH; s_kyr.t0_us = now; }
+        }
+        break;
+
+    case KS_ICH:
+        // Character gap running (decoder only). A new element continues the same character.
+        if (s_kyr.pend_dit || s_kyr.pend_dah) {
+            if (s_kyr.pend_dah) keyer_send_dah(now); else keyer_send_dit(now);
+        } else if (el >= (uint64_t)dit_us * 3u) {
+            keyer_decode_char();
+            s_kyr.state = KS_IWD; s_kyr.t0_us = now;
+        }
+        break;
+
+    case KS_IWD:
+        if (s_kyr.pend_dit || s_kyr.pend_dah) {
+            s_kyr.state = KS_IDLE;   // IDLE sends it on the next poll
+        } else if (el >= (uint64_t)dit_us * 4u) {
+            keyer_emit("!K w\r\n");
+            s_kyr.state = KS_IDLE;
         }
         break;
     }
@@ -2160,13 +2237,13 @@ static void keyer_poll(void) {
 
 static void keyer_diag_print(void) {
     static const char *cr_names[] = { "IDLE", "ARMING", "ARMED", "CARRIER_ON" };
-    static const char *ks_names[] = { "IDLE", "DIT", "DAH", "IEL" };
+    static const char *ks_names[] = { "IDLE", "DIT", "DAH", "IEL", "ICH", "IWD", "?", "?" };
     cdc_printf("Paddles: GP9(dit) raw=%u db=%u  GP11(dah) raw=%u db=%u  (1 = pressed, pin at GND)\r\n",
                (unsigned)!gpio_get(PIN_KEY_DIT), (unsigned)g_key_dit,
                (unsigned)!gpio_get(PIN_KEY_DAH), (unsigned)g_key_dah);
     cdc_printf("Keyer: mode=%s wpm=%u ratio=%.1f state=%s pend=%u/%u out=%u softkey=%u\r\n",
                keyer_mode_name(g_cw_mode), (unsigned)g_cw_wpm, (double)g_cw_ratio,
-               ks_names[s_kyr.state & 3], (unsigned)s_kyr.pend_dit, (unsigned)s_kyr.pend_dah,
+               ks_names[s_kyr.state & 7], (unsigned)s_kyr.pend_dit, (unsigned)s_kyr.pend_dah,
                (unsigned)g_keyer_key, (unsigned)g_soft_ptt_key);
     cdc_printf("Carrier: txmode=%s tune=%u state=%s cw_test_mode=%u pwr_now=%d dBm  tx_allowed=%u (gps=%u gate=%u)\r\n",
                g_tx_mode ? "CW" : "USB", (unsigned)g_tune_active,
