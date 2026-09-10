@@ -212,45 +212,29 @@ static inline void persist_mark_dirty(void) {
     g_persist_dirty_since = to_ms_since_boot(get_absolute_time());
 }
 
-// --- Encoder UI: tune screen + scrollable menu ---
+// --- Encoder UI state ---
 typedef enum {
-    MI_MODE = 0,   // USB PC / USB MIC / CW
-    MI_TX,         // toggle
-    MI_TUNE,       // toggle
-    MI_PWR,
-    MI_STEP,       // tuning step 100 Hz / 1 kHz / 10 kHz
-    MI_KEYER,      // straight / iambic A / iambic B
-    MI_WPM,
-    MI_RATIO,
-    MI_TONE,
-    MI_VOL,
-    MI_MICGAIN,
-    MI_MICGATE,
-    MI_PPM,
-    MI_GPSGATE,    // toggle
-    MI_SAVE,       // action
-    MI_EXIT,       // action
-    MI_COUNT
-} menu_item_t;
+    UI_PARAM_MODE = 0,   // USB / CW        (col 0, row 0)
+    UI_PARAM_TUNE,       // TUNE on/off      (col 0, row 1)
+    UI_PARAM_WPM,        // keyer speed      (col 0, row 2)
+    UI_PARAM_TX,         // TX on/off        (col 1, row 0)
+    UI_PARAM_VOL,        // sidetone volume  (col 1, row 1) — PPM stays on CDC/GUI (moot with GPSDO)
+    UI_PARAM_PWR,        // TX power dBm     (col 1, row 2)
+    UI_PARAM_COUNT       // sentinel (= 6)
+} ui_param_t;
 
 typedef enum {
-    UI_STATE_IDLE = 0,   // tune screen: turn = frequency, click = step size, hold = menu
-    UI_STATE_BROWSE,     // menu: turn = cursor, click = edit/toggle/action, hold = exit
-    UI_STATE_EDITING     // menu item inverted: turn = value, click = back to browse
+    UI_STATE_IDLE = 0,   // Default: encoder adjusts frequency
+    UI_STATE_BROWSE,     // Click opened menu: frame around item, rotate moves cursor
+    UI_STATE_EDITING     // Click confirmed item: inverted, rotate adjusts value
 } ui_state_t;
 
-static volatile ui_state_t  g_ui_state   = UI_STATE_IDLE;
-static volatile menu_item_t g_ui_cursor  = MI_MODE;
-static volatile menu_item_t g_ui_editing = MI_MODE;
-static volatile uint32_t    g_ui_last_activity_ms = 0;
-static uint8_t              g_menu_top   = 0;            // first visible menu row (scroll)
-static volatile uint8_t     g_tune_step_idx = 0;         // index into k_tune_steps_hz
-static const double         k_tune_steps_hz[] = { 100.0, 1000.0, 10000.0 };
-static const char * const   k_tune_step_names[] = { "100Hz", "1kHz", "10kHz" };
-#define TUNE_STEP_COUNT     3u
-#define MENU_ROWS           6                            // visible rows below the header
-#define UI_TIMEOUT_MS       10000                        // menu falls back to the tune screen
-#define UI_LONG_PRESS_MS    500
+static volatile ui_state_t g_ui_state = UI_STATE_IDLE;
+static volatile ui_param_t g_ui_cursor = UI_PARAM_MODE;    // browse cursor position
+static volatile ui_param_t g_ui_editing = UI_PARAM_MODE;   // which param is being edited
+static volatile uint32_t   g_ui_last_activity_ms = 0;      // for auto-timeout
+
+#define UI_TIMEOUT_MS   5000    // Return to IDLE after 5s inactivity
 
 // --- Hilbert ---
 #define HILBERT_TAPS        247
@@ -1390,7 +1374,7 @@ static void cfg_commit(const audio_cfg_t *c) {
 // GPS gate, soft key) is deliberately volatile and resets at boot.
 #define CFG_FLASH_OFFSET   (PICO_FLASH_SIZE_BYTES - FLASH_SECTOR_SIZE)
 #define CFG_MAGIC          0x51303130u   // 'Q010'
-#define CFG_VERSION        4u            // bump whenever persist_cfg_t layout changes
+#define CFG_VERSION        3u            // bump whenever persist_cfg_t layout changes
 
 typedef struct __attribute__((packed)) {
     uint32_t    magic;
@@ -1407,8 +1391,6 @@ typedef struct __attribute__((packed)) {
     uint8_t     audio_src;       // AUDIO_SRC_*
     float       mic_gain;
     float       mic_gate;
-    uint8_t     tune_step;       // index into k_tune_steps_hz
-    uint8_t     _reserved[3];
     audio_cfg_t dsp;
     uint32_t    crc32;           // over everything above
 } persist_cfg_t;
@@ -1448,7 +1430,6 @@ static void persist_collect(persist_cfg_t *c) {
     c->audio_src      = g_audio_src;
     c->mic_gain       = g_mic_gain;
     c->mic_gate       = g_mic_gate;
-    c->tune_step      = g_tune_step_idx;
     __compiler_memory_barrier();
     memcpy(&c->dsp, (const void *)&g_cfg, sizeof(c->dsp));
     __compiler_memory_barrier();
@@ -1484,7 +1465,6 @@ static void persist_apply(const persist_cfg_t *c) {
     float mg = c->mic_gain, mt = c->mic_gate;
     g_mic_gain = (mg >= 1.0f && mg <= 50.0f) ? mg : 10.0f;
     g_mic_gate = (mt >= 0.0f && mt <= 0.5f)  ? mt : 0.02f;
-    g_tune_step_idx = (c->tune_step < TUNE_STEP_COUNT) ? c->tune_step : 0;
 
     audio_cfg_t d = c->dsp;
     cfg_sanitize(&d, (float)WAV_SAMPLE_RATE);
@@ -1669,7 +1649,6 @@ static void cdc_handle_line(char *line) {
         g_audio_src        = AUDIO_SRC_PC;
         g_mic_gain         = 10.0f;
         g_mic_gate         = 0.02f;
-        g_tune_step_idx    = 0;
         keyer_reset();
         cfg_commit(&k_cfg_defaults);
         if (g_tune_active) tune_apply_settings();
@@ -2046,70 +2025,11 @@ static void draw_radio_off_xy(int x, int y) {
 }
 
 // Prepare framebuffer content (fast, no I2C)
-// Label + value text of one menu item
-static void menu_item_text(menu_item_t it, const char **label, char *val, size_t vl) {
-    switch (it) {
-    case MI_MODE:    *label = "Mode";
-        snprintf(val, vl, "%s", g_tx_mode ? "CW" : (g_audio_src == AUDIO_SRC_MIC ? "USB MIC" : "USB PC")); break;
-    case MI_TX:      *label = "TX";        snprintf(val, vl, "%s", g_tx_enabled ? "ON" : "OFF"); break;
-    case MI_TUNE:    *label = "Tune";      snprintf(val, vl, "%s", g_tune_active ? "ON" : "OFF"); break;
-    case MI_PWR:     *label = "Power";     snprintf(val, vl, "%+d dBm", g_tx_power_max_dbm); break;
-    case MI_STEP:    *label = "Step";      snprintf(val, vl, "%s", k_tune_step_names[g_tune_step_idx]); break;
-    case MI_KEYER:   *label = "Keyer";
-        snprintf(val, vl, "%s", g_cw_mode == KEYER_STRAIGHT ? "Straight" : g_cw_mode == KEYER_IAMBIC_A ? "Iambic A" : "Iambic B"); break;
-    case MI_WPM:     *label = "WPM";       snprintf(val, vl, "%u", (unsigned)g_cw_wpm); break;
-    case MI_RATIO:   *label = "Dah ratio"; snprintf(val, vl, "%.1f", (double)g_cw_ratio); break;
-    case MI_TONE:    *label = "Sidetone";  snprintf(val, vl, "%u Hz", (unsigned)g_st_hz); break;
-    case MI_VOL:     *label = "Volume";    snprintf(val, vl, "%u %%", (unsigned)g_st_vol); break;
-    case MI_MICGAIN: *label = "Mic gain";  snprintf(val, vl, "%.1f", (double)g_mic_gain); break;
-    case MI_MICGATE: *label = "Mic gate";  snprintf(val, vl, "%.3f", (double)g_mic_gate); break;
-    case MI_PPM:     *label = "PPM";       snprintf(val, vl, "%+.2f", (double)g_ppm_correction); break;
-    case MI_GPSGATE: *label = "GPS gate";  snprintf(val, vl, "%s", g_gps_gate ? "ON" : "OFF"); break;
-    case MI_SAVE:    *label = "Save";      snprintf(val, vl, "%s", g_persist_dirty ? "unsaved" : "saved"); break;
-    case MI_EXIT:    *label = "Exit";      val[0] = '\0'; break;
-    default:         *label = "?";         val[0] = '\0'; break;
-    }
-}
-
-// Menu screen: header + MENU_ROWS rows of 9 px. Cursor row framed while
-// browsing, fully inverted while editing. Scrolls with g_menu_top.
-static void oled_draw_menu(void) {
-    ssd1306_draw_string_bold_y_inv(0, 0,
-        g_ui_state == UI_STATE_EDITING ? " EDIT   turn=change" : " MENU   hold=exit", 128);
-
-    for (int r = 0; r < MENU_ROWS; r++) {
-        int it = (int)g_menu_top + r;
-        if (it >= (int)MI_COUNT) break;
-        const int y = 10 + r * 9;
-
-        const char *label; char val[14]; char line[24];
-        menu_item_text((menu_item_t)it, &label, val, sizeof(val));
-        snprintf(line, sizeof(line), "%-9s%11s", label, val);
-
-        if (g_ui_state == UI_STATE_EDITING && it == (int)g_ui_editing) {
-            ssd1306_draw_string_bold_y_inv(2, y, line, 124);
-        } else {
-            ssd1306_draw_string_bold_y(2, y, line);
-            if (it == (int)g_ui_cursor) {
-                ssd1306_hline(0, 127, y - 1);
-                ssd1306_hline(0, 127, y + 7);
-                ssd1306_vline(0,   y - 1, y + 7);
-                ssd1306_vline(127, y - 1, y + 7);
-            }
-        }
-    }
-}
-
 static void oled_prepare_frame(void) {
     double freq = g_target_freq_hz;
     double downlink = freq + QO100_DOWNLINK_OFFSET_HZ;
 
     ssd1306_clear();
-
-    if (g_ui_state != UI_STATE_IDLE) {
-        oled_draw_menu();
-        return;
-    }
 
     // --- Row 0 (pages 0-1): ↑ arrow + right-justified uplink freq ---
     draw_arrow_up_2x(0, 0);
@@ -2123,16 +2043,6 @@ static void oled_prepare_frame(void) {
         int len = 0; { const char *p = buf; while (*p++) len++; }
         int x_start = 128 - len * 12;
         ssd1306_draw_string_2x(x_start, 0, buf);
-
-        // Underline the digit the encoder moves. "…400.0": 100 Hz is the
-        // last char, 1 kHz skips the '.', 10 kHz one further left.
-        static const int from_right[TUNE_STEP_COUNT] = { 1, 3, 4 };
-        int ci = len - from_right[g_tune_step_idx];
-        if (ci >= 0) {
-            int ux = x_start + ci * 12;
-            ssd1306_hline(ux, ux + 10, 14);
-            ssd1306_hline(ux, ux + 10, 15);
-        }
     }
 
     // --- Row 1 (pages 2-3): ↓ arrow + right-justified downlink freq ---
@@ -2151,28 +2061,89 @@ static void oled_prepare_frame(void) {
     // --- Separator line at y=32 ---
     ssd1306_hline(0, 127, 32);
 
-    // --- Status rows (21 chars × 6 px) ---
+    // --- Bottom half: 2 columns × 3 rows, all navigable ---
+    // Vertical divider at x=63
+    ssd1306_vline(63, 33, 63);
+
+    // Column positions and widths
+    const int COL0_X = 2;    // left column text start
+    const int COL0_W = 60;   // left column field width for inverted rendering
+    const int COL0_R = 61;   // left column right edge for frame
+    const int COL1_X = 66;   // right column text start
+    const int COL1_W = 60;   // right column field width
+    const int COL1_R = 126;  // right column right edge for frame
+    // Row Y positions (stride 10: 7px text + 3px gap)
+    const int ROW0_Y = 34;
+    const int ROW1_Y = 44;
+    const int ROW2_Y = 54;
+
+    // Helper macro: draw a navigable item in either column
+    #define DRAW_ITEM(col_x, col_w, col_l, col_r, y_pos, text, param_id) do { \
+        if (g_ui_state == UI_STATE_EDITING && g_ui_editing == (param_id)) { \
+            /* EDITING: inverted (white bg, black text) */ \
+            ssd1306_draw_string_bold_y_inv((col_x), (y_pos), (text), (col_w)); \
+        } else if (g_ui_state == UI_STATE_BROWSE && g_ui_cursor == (param_id)) { \
+            /* BROWSE: frame around this item */ \
+            ssd1306_draw_string_bold_y((col_x), (y_pos), (text)); \
+            ssd1306_hline((col_l), (col_r), (y_pos)-1); \
+            ssd1306_hline((col_l), (col_r), (y_pos)+8); \
+            ssd1306_vline((col_l), (y_pos)-1, (y_pos)+8); \
+            ssd1306_vline((col_r), (y_pos)-1, (y_pos)+8); \
+        } else { \
+            /* IDLE or non-selected: normal text */ \
+            ssd1306_draw_string_bold_y((col_x), (y_pos), (text)); \
+        } \
+    } while(0)
+
+    // Shorthand for left/right columns
+    #define DRAW_L(y, text, pid) DRAW_ITEM(COL0_X, COL0_W, 0,  COL0_R, y, text, pid)
+    #define DRAW_R(y, text, pid) DRAW_ITEM(COL1_X, COL1_W, 64, COL1_R, y, text, pid)
+
+    // --- Column 0 (left) ---
+    // Row 0: Mode (USB / CW)
+    DRAW_L(ROW0_Y, g_tx_mode ? "CW" : (g_audio_src == AUDIO_SRC_MIC ? "USB MIC" : "USB PC"), UI_PARAM_MODE);
+
+    // Row 1: TUNE
+    DRAW_L(ROW1_Y, g_tune_active ? "TUNE *" : "TUNE", UI_PARAM_TUNE);
+
+    // Row 2: MENU (placeholder)
+    {
+        char wpm_buf[12];
+        snprintf(wpm_buf, sizeof(wpm_buf), "%u WPM", (unsigned)g_cw_wpm);
+        DRAW_L(ROW2_Y, wpm_buf, UI_PARAM_WPM);
+    }
+
+    // --- Column 1 (right) ---
+    // Row 0: TX ON/OFF + radio icon
     {
         const char *tx_label;
-        if (!tx_allowed())                                          tx_label = "NO GPS";
-        else if (g_tx_mode == 1 && (g_keyer_key | g_soft_ptt_key))  tx_label = "KEY";
-        else if (g_tune_active)                                     tx_label = "TUNE";
-        else                                                        tx_label = g_tx_enabled ? "TX ON" : "TX OFF";
-
-        char line[24];
-        snprintf(line, sizeof(line), "%-7s %-6s %+3ddBm",
-                 g_tx_mode ? "CW" : (g_audio_src == AUDIO_SRC_MIC ? "USB MIC" : "USB PC"),
-                 tx_label, g_tx_power_max_dbm);
-        ssd1306_draw_string_bold_y(0, 35, line);
-
-        snprintf(line, sizeof(line), "%2uWPM VOL%3u%% GPS:%s",
-                 (unsigned)g_cw_wpm, (unsigned)g_st_vol, gpsdo_is_ready() ? "ok" : "--");
-        ssd1306_draw_string_bold_y(0, 45, line);
-
-        snprintf(line, sizeof(line), "STEP %-5s %s",
-                 k_tune_step_names[g_tune_step_idx], g_persist_dirty ? "unsaved" : "hold=menu");
-        ssd1306_draw_string_bold_y(0, 55, line);
+        if (!tx_allowed()) {
+            tx_label = "WAIT GPS";
+        } else if (g_tx_mode == 1 && (g_keyer_key | g_soft_ptt_key)) {
+            tx_label = "KEY";
+        } else {
+            tx_label = g_tx_enabled ? "TX ON" : "TX OFF";
+        }
+        DRAW_R(ROW0_Y, tx_label, UI_PARAM_TX);
     }
+
+    // Row 1: sidetone volume
+    {
+        char vol_buf[12];
+        snprintf(vol_buf, sizeof(vol_buf), "VOL %u%%", (unsigned)g_st_vol);
+        DRAW_R(ROW1_Y, vol_buf, UI_PARAM_VOL);
+    }
+
+    // Row 2: Power
+    {
+        char pwr_buf[12];
+        snprintf(pwr_buf, sizeof(pwr_buf), "%+ddBm", g_tx_power_max_dbm);
+        DRAW_R(ROW2_Y, pwr_buf, UI_PARAM_PWR);
+    }
+
+    #undef DRAW_ITEM
+    #undef DRAW_L
+    #undef DRAW_R
 }
 
 // ==========================================================
@@ -2434,8 +2405,7 @@ static void __not_in_flash_func(sidetone_fill)(uint32_t *dst) {
     const int32_t  gain = s_st_gain;
     // Also sound while the volume is being edited on the OLED, so the level can be heard.
     const bool on = g_keyer_key || g_tune_active || g_st_test ||
-                    (g_ui_state == UI_STATE_EDITING &&
-                     (g_ui_editing == MI_VOL || g_ui_editing == MI_TONE));
+                    (g_ui_state == UI_STATE_EDITING && g_ui_editing == UI_PARAM_VOL);
 
     for (uint32_t i = 0; i < ST_BUF; i++) {
         if (on)  { if (s_st_env_pos < ST_RAMP_SAMPLES) s_st_env_pos++; }
@@ -2614,162 +2584,16 @@ static void mic_diag_print(void) {
 // Button debounce state
 static uint8_t  ok_was_pressed = 0;
 static uint32_t ok_debounce_ms = 0;
-static uint32_t ok_press_start_ms = 0;
-static uint8_t  ok_long_fired = 0;
 static uint32_t dit_debounce_ms = 0, dah_debounce_ms = 0;
 static uint8_t  dit_last_state = 0,  dah_last_state = 0;
 
 #define DEBOUNCE_MS         5
 
+// Frequency step for encoder (Hz)
+#define ENC_FREQ_STEP_HZ   100.0
+
 static inline void ui_touch(void) {
     g_ui_last_activity_ms = to_ms_since_boot(get_absolute_time());
-}
-
-static inline void ui_enter_menu(void) {
-    g_ui_state  = UI_STATE_BROWSE;
-    g_ui_cursor = MI_MODE;
-    g_menu_top  = 0;
-}
-
-static void menu_toggle(menu_item_t it) {
-    switch (it) {
-    case MI_TX:      g_tx_enabled = g_tx_enabled ? 0 : 1; break;
-    case MI_TUNE:    g_tune_active = g_tune_active ? 0 : 1; break;   // carrier_poll() does the SPI work
-    case MI_GPSGATE: g_gps_gate = g_gps_gate ? 0 : 1; break;
-    default: break;
-    }
-}
-
-// Apply one encoder detent to the item being edited
-static void menu_edit_apply(menu_item_t it, int step) {
-    switch (it) {
-    case MI_MODE: {
-        // Cycle USB PC → USB MIC → CW (both directions)
-        int idx = g_tx_mode ? 2 : (g_audio_src == AUDIO_SRC_MIC ? 1 : 0);
-        idx = (idx + step + 3) % 3;
-        g_tx_mode = (idx == 2) ? 1 : 0;
-        if (idx < 2) g_audio_src = (idx == 1) ? AUDIO_SRC_MIC : AUDIO_SRC_PC;
-        persist_mark_dirty();
-        break;
-    }
-    case MI_TX:
-    case MI_TUNE:
-    case MI_GPSGATE:
-        menu_toggle(it);
-        break;
-    case MI_PWR: {
-        int p = (int)g_tx_power_max_dbm + step;
-        if (p < PWR_MIN_DBM) p = PWR_MIN_DBM;
-        if (p > PWR_MAX_DBM) p = PWR_MAX_DBM;
-        g_tx_power_max_dbm = (int8_t)p;
-        persist_mark_dirty();
-        if (g_tune_active) tune_apply_settings();
-        break;
-    }
-    case MI_STEP:
-        g_tune_step_idx = (uint8_t)(((int)g_tune_step_idx + step + (int)TUNE_STEP_COUNT) % (int)TUNE_STEP_COUNT);
-        persist_mark_dirty();
-        break;
-    case MI_KEYER:
-        g_cw_mode = (uint8_t)(((int)g_cw_mode + step + 3) % 3);
-        keyer_reset();
-        persist_mark_dirty();
-        break;
-    case MI_WPM: {
-        int w = (int)g_cw_wpm + step;
-        if (w < 5)  w = 5;
-        if (w > 60) w = 60;
-        g_cw_wpm = (uint8_t)w;
-        persist_mark_dirty();
-        break;
-    }
-    case MI_RATIO: {
-        float r = g_cw_ratio + 0.1f * (float)step;
-        if (r < 2.0f) r = 2.0f;
-        if (r > 5.0f) r = 5.0f;
-        g_cw_ratio = r;
-        persist_mark_dirty();
-        break;
-    }
-    case MI_TONE: {
-        int t = (int)g_st_hz + 50 * step;
-        if (t < 300)  t = 300;
-        if (t > 1200) t = 1200;
-        g_st_hz = (uint16_t)t;
-        sidetone_update_params();
-        persist_mark_dirty();
-        break;
-    }
-    case MI_VOL: {
-        int v = (int)g_st_vol + 5 * step;
-        if (v < 0)   v = 0;
-        if (v > 100) v = 100;
-        g_st_vol = (uint8_t)v;
-        sidetone_update_params();
-        persist_mark_dirty();
-        break;
-    }
-    case MI_MICGAIN: {
-        float g = g_mic_gain + (float)step;
-        if (g < 1.0f)  g = 1.0f;
-        if (g > 50.0f) g = 50.0f;
-        g_mic_gain = g;
-        persist_mark_dirty();
-        break;
-    }
-    case MI_MICGATE: {
-        float t = g_mic_gate + 0.005f * (float)step;
-        if (t < 0.0f) t = 0.0f;
-        if (t > 0.5f) t = 0.5f;
-        g_mic_gate = t;
-        persist_mark_dirty();
-        break;
-    }
-    case MI_PPM: {
-        float ppm = g_ppm_correction + 0.01f * (float)step;
-        if (ppm < -50.0f) ppm = -50.0f;
-        if (ppm >  50.0f) ppm =  50.0f;
-        g_ppm_correction = ppm;
-        persist_mark_dirty();
-        if (g_tune_active) tune_apply_settings();
-        break;
-    }
-    default: break;
-    }
-}
-
-static void ui_short_click(void) {
-    switch (g_ui_state) {
-    case UI_STATE_IDLE:
-        g_tune_step_idx = (uint8_t)((g_tune_step_idx + 1u) % TUNE_STEP_COUNT);
-        persist_mark_dirty();
-        break;
-    case UI_STATE_BROWSE:
-        switch (g_ui_cursor) {
-        case MI_TX: case MI_TUNE: case MI_GPSGATE:
-            menu_toggle(g_ui_cursor);            // toggles act immediately
-            break;
-        case MI_SAVE:
-            persist_save_now();
-            break;
-        case MI_EXIT:
-            g_ui_state = UI_STATE_IDLE;
-            break;
-        default:
-            g_ui_editing = g_ui_cursor;
-            g_ui_state = UI_STATE_EDITING;
-            break;
-        }
-        break;
-    case UI_STATE_EDITING:
-        g_ui_state = UI_STATE_BROWSE;
-        break;
-    }
-}
-
-static void ui_long_press(void) {
-    if (g_ui_state == UI_STATE_IDLE) ui_enter_menu();
-    else                             g_ui_state = UI_STATE_IDLE;
 }
 
 static void encoder_poll(void) {
@@ -2808,29 +2632,84 @@ static void encoder_poll(void) {
     ui_touch();
 
     switch (g_ui_state) {
-        case UI_STATE_IDLE: {
-            double f = g_target_freq_hz + (double)step * k_tune_steps_hz[g_tune_step_idx];
-            if (f < 2400000000.0) f = 2400000000.0;
-            if (f > 2500000000.0) f = 2500000000.0;
-            g_target_freq_hz = f;
-            persist_mark_dirty();
-            if (g_tune_active) tune_apply_settings();
+        case UI_STATE_IDLE:
+            // Default: encoder adjusts frequency
+            {
+                double f = g_target_freq_hz + step * ENC_FREQ_STEP_HZ;
+                if (f < 2400000000.0) f = 2400000000.0;
+                if (f > 2500000000.0) f = 2500000000.0;
+                g_target_freq_hz = f;
+                persist_mark_dirty();
+                if (g_tune_active) tune_apply_settings();
+            }
             break;
-        }
 
-        case UI_STATE_BROWSE: {
-            int c = (int)g_ui_cursor + step;
-            if (c < 0) c = (int)MI_COUNT - 1;
-            if (c >= (int)MI_COUNT) c = 0;
-            g_ui_cursor = (menu_item_t)c;
-            // keep the cursor row visible
-            if (c < (int)g_menu_top)                    g_menu_top = (uint8_t)c;
-            if (c >= (int)g_menu_top + MENU_ROWS)       g_menu_top = (uint8_t)(c - MENU_ROWS + 1);
+        case UI_STATE_BROWSE:
+            // Move cursor between params
+            {
+                int c = (int)g_ui_cursor + step;
+                if (c < 0) c = UI_PARAM_COUNT - 1;
+                if (c >= (int)UI_PARAM_COUNT) c = 0;
+                g_ui_cursor = (ui_param_t)c;
+            }
             break;
-        }
 
         case UI_STATE_EDITING:
-            menu_edit_apply(g_ui_editing, step);
+            // Adjust value of selected param
+            switch (g_ui_editing) {
+                case UI_PARAM_MODE:
+                    {
+                        // Cycle USB PC → USB MIC → CW (both directions)
+                        int idx = g_tx_mode ? 2 : (g_audio_src == AUDIO_SRC_MIC ? 1 : 0);
+                        idx = (idx + step + 3) % 3;
+                        g_tx_mode   = (idx == 2) ? 1 : 0;
+                        if (idx < 2) g_audio_src = (idx == 1) ? AUDIO_SRC_MIC : AUDIO_SRC_PC;
+                        persist_mark_dirty();
+                    }
+                    break;
+                case UI_PARAM_TUNE:
+                    if (step > 0 && !g_tune_active) {
+                        g_tune_active = 1;
+                        // carrier_poll() will arm Core1 idle + start carrier
+                    } else if (step < 0 && g_tune_active) {
+                        g_tune_active = 0;
+                        // carrier_poll() will stop carrier (or keep idle if CW mode)
+                    }
+                    break;
+                case UI_PARAM_WPM:
+                    {
+                        int w = (int)g_cw_wpm + step;
+                        if (w < 5)  w = 5;
+                        if (w > 60) w = 60;
+                        g_cw_wpm = (uint8_t)w;
+                        persist_mark_dirty();
+                    }
+                    break;
+                case UI_PARAM_TX:
+                    g_tx_enabled = g_tx_enabled ? 0 : 1;
+                    break;
+                case UI_PARAM_VOL:
+                    {
+                        int v = (int)g_st_vol + step * 5;
+                        if (v < 0)   v = 0;
+                        if (v > 100) v = 100;
+                        g_st_vol = (uint8_t)v;
+                        sidetone_update_params();
+                        persist_mark_dirty();
+                    }
+                    break;
+                case UI_PARAM_PWR:
+                    {
+                        int8_t p = g_tx_power_max_dbm + (int8_t)step;
+                        if (p < PWR_MIN_DBM) p = PWR_MIN_DBM;
+                        if (p > PWR_MAX_DBM) p = PWR_MAX_DBM;
+                        g_tx_power_max_dbm = p;
+                        persist_mark_dirty();
+                        if (g_tune_active) tune_apply_settings();
+                    }
+                    break;
+                default: break;
+            }
             break;
     }
 }
@@ -2845,24 +2724,36 @@ static void button_poll(void) {
         }
     }
 
-    // --- OK button (encoder push): short click on release, long press while held ---
+    // --- OK button (encoder push) ---
     uint8_t ok_raw = gpio_get(PIN_ENC_OK) ? 0 : 1;  // Active LOW
 
     if (ok_raw != ok_was_pressed && (now_ms - ok_debounce_ms) >= DEBOUNCE_MS) {
         ok_debounce_ms = now_ms;
         ok_was_pressed = ok_raw;
+
         if (ok_raw) {
-            ok_press_start_ms = now_ms;
-            ok_long_fired = 0;
-        } else if (!ok_long_fired) {
+            // Button just pressed
             ui_touch();
-            ui_short_click();
+
+            switch (g_ui_state) {
+                case UI_STATE_IDLE:
+                    // Enter browse mode
+                    g_ui_state = UI_STATE_BROWSE;
+                    g_ui_cursor = UI_PARAM_MODE;  // start at first item
+                    break;
+
+                case UI_STATE_BROWSE:
+                    // Confirm selection — enter editing mode
+                    g_ui_editing = g_ui_cursor;
+                    g_ui_state = UI_STATE_EDITING;
+                    break;
+
+                case UI_STATE_EDITING:
+                    // Deselect — back to browse mode
+                    g_ui_state = UI_STATE_BROWSE;
+                    break;
+            }
         }
-    }
-    if (ok_was_pressed && !ok_long_fired && (now_ms - ok_press_start_ms) >= UI_LONG_PRESS_MS) {
-        ok_long_fired = 1;
-        ui_touch();
-        ui_long_press();
     }
 
     // --- CW dit/dah paddles (GP9 / GP11, active LOW), debounced separately ---
