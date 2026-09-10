@@ -3300,6 +3300,7 @@ int main(void) {
             encoder_poll();
             button_poll();
             carrier_poll();
+            gpsdo_task();
 
             // OLED refresh during wait
             if (!ssd1306_dma_busy() &&
@@ -3397,6 +3398,15 @@ int main(void) {
             carrier_poll();
             persist_maybe_autosave();
 
+            // GPS UART must be drained here too: with the mode persisted the
+            // device can boot straight into CW and never reach the SSB path.
+            gpsdo_task();
+            if (gpsdo_status_due()) {
+                char gbuf[128];
+                gpsdo_format_status(gbuf, sizeof(gbuf));
+                cdc_write_str(gbuf);
+            }
+
 #if CFG_TUD_CDC
             cdc_task();
             cdc_status_push();
@@ -3427,6 +3437,7 @@ int main(void) {
             button_poll();
             carrier_poll();
             persist_maybe_autosave();
+            gpsdo_task();   // 32-byte UART FIFO fills in ~33 ms at 9600 baud — keep draining
 
 #if CFG_TUD_CDC
             cdc_status_push();
@@ -3504,6 +3515,7 @@ int main(void) {
                 button_poll();
                 carrier_poll();
                 persist_maybe_autosave();
+                gpsdo_task();
                 if (g_cw_test_mode || g_audio_src != AUDIO_SRC_MIC) { bail = true; break; }
                 tight_loop_contents();
             }
