@@ -197,8 +197,17 @@ static void mic_diag_print(void);
 // Deliberately not persisted — resets to enforced on every boot.
 static volatile uint8_t g_gps_gate = 1;
 
+// Blank the TX for a moment after a mode change, so scrolling through the
+// modes on the encoder (or a burst of "mode" commands) cannot emit a stub.
+#define TX_MODE_GUARD_MS 120
+static volatile uint32_t g_mode_change_ms = 0;
+static inline void tx_mode_changed(void) { g_mode_change_ms = to_ms_since_boot(get_absolute_time()); }
+static inline bool tx_mode_guard_active(void) {
+    return (to_ms_since_boot(get_absolute_time()) - g_mode_change_ms) < TX_MODE_GUARD_MS;
+}
+
 static inline bool tx_allowed(void) {
-    return gpsdo_is_ready() || !g_gps_gate;
+    return (gpsdo_is_ready() || !g_gps_gate) && !tx_mode_guard_active();
 }
 
 // --- Persistent config (last flash sector) ---
@@ -1778,7 +1787,7 @@ static void cdc_handle_line(char *line) {
     }
     // cwkey: enter CW mode and arm keyer (alias for mode cw, used by GUI keyer)
     if (streqi(argv[0], "cwkey")) {
-        if (g_tx_mode != 1) persist_mark_dirty();
+        if (g_tx_mode != 1) { persist_mark_dirty(); tx_mode_changed(); }
         g_tx_mode = 1;
         g_soft_ptt_key = 0;
         cdc_printf("OK cwkey mode=CW\r\n");
@@ -1793,11 +1802,11 @@ static void cdc_handle_line(char *line) {
     // Mode: mode usb|cw
     if (streqi(argv[0], "mode") && argc >= 2) {
         if (streqi(argv[1], "usb") || streqi(argv[1], "ssb")) {
-            if (g_tx_mode != 0) persist_mark_dirty();
+            if (g_tx_mode != 0) { persist_mark_dirty(); tx_mode_changed(); }
             g_tx_mode = 0;
             cdc_printf("OK mode=USB\r\n");
         } else if (streqi(argv[1], "cw")) {
-            if (g_tx_mode != 1) persist_mark_dirty();
+            if (g_tx_mode != 1) { persist_mark_dirty(); tx_mode_changed(); }
             g_tx_mode = 1;
             cdc_printf("OK mode=CW\r\n");
         } else {
@@ -2455,8 +2464,16 @@ static void __not_in_flash_func(sidetone_fill)(uint32_t *dst) {
         else     { if (s_st_env_pos > 0)               s_st_env_pos--; }
         const int32_t env = s_st_rc[(s_st_env_pos * 256u) / ST_RAMP_SAMPLES];
 
+        // Linear interpolation between table entries. Plain 8-bit phase
+        // truncation limits spurious tones to about -48 dBc, which is what
+        // made the tone sound grainy; interpolating puts them below the
+        // 10-bit output floor.
         s_st_phase += inc;
-        const int32_t s   = s_st_sin[s_st_phase >> 24];
+        const uint32_t si   = s_st_phase >> 24;                  // 0..255
+        const uint32_t sf   = (s_st_phase >> 8) & 0xFFFFu;       // fraction, Q16
+        const int32_t  s0   = s_st_sin[si];
+        const int32_t  s1   = s_st_sin[(si + 1u) & 255u];
+        const int32_t  s    = s0 + (((s1 - s0) * (int32_t)sf) >> 16);
         const int32_t amp = (env * gain) >> 15;              // Q15
         const int32_t v   = (s * amp) >> 15;                 // ±32767 full scale
 
@@ -2630,10 +2647,20 @@ static uint8_t  ok_was_pressed = 0;
 static uint32_t ok_debounce_ms = 0;
 static uint32_t ok_press_start_ms = 0;
 static uint8_t  ok_long_fired = 0;
-static uint32_t dit_debounce_ms = 0, dah_debounce_ms = 0;
-static uint8_t  dit_last_state = 0,  dah_last_state = 0;
 
-#define DEBOUNCE_MS         5
+// Paddle contact filter: raw level plus the time it last changed.
+static uint8_t  dit_raw_last = 0, dah_raw_last = 0;
+static uint32_t dit_raw_ms = 0,   dah_raw_ms = 0;
+
+#define DEBOUNCE_MS         5   // encoder push (lockout style is fine for a click)
+// A level is accepted only after it has been stable this long. The previous
+// lockout filter ("accept any change 5 ms after the last one") passed the
+// second half of a bounce train through as a fresh edge, which the keyer
+// latched as an extra element — audible above ~23 WPM, where one dit is only
+// ~50 ms. Kept symmetric and short on purpose: a longer release filter (as
+// upstream uses for its raw PTT) would still read "pressed" at element end
+// and trigger a spurious hold-to-repeat.
+#define KEY_DEBOUNCE_MS     4
 
 // Frequency step for encoder (Hz)
 #define ENC_FREQ_STEP_HZ   100.0
@@ -2711,6 +2738,7 @@ static void encoder_poll(void) {
                         idx = (idx + step + 3) % 3;
                         g_tx_mode   = (idx == 2) ? 1 : 0;
                         if (idx < 2) g_audio_src = (idx == 1) ? AUDIO_SRC_MIC : AUDIO_SRC_PC;
+                        tx_mode_changed();
                         persist_mark_dirty();
                     }
                     break;
@@ -2771,7 +2799,7 @@ static void encoder_poll(void) {
                     break;
                 case UI_PARAM_TONE:
                     {
-                        int t = (int)g_st_hz + 50 * step;
+                        int t = (int)g_st_hz + 10 * step;
                         if (t < 300)  t = 300;
                         if (t > 1200) t = 1200;
                         g_st_hz = (uint16_t)t;
@@ -2854,18 +2882,20 @@ static void button_poll(void) {
         else                             g_ui_state = UI_STATE_IDLE;
     }
 
-    // --- CW dit/dah paddles (GP9 / GP11, active LOW), debounced separately ---
+    // --- CW dit/dah paddles (GP9 / GP11, active LOW), stability-filtered ---
     uint8_t dit_raw = !gpio_get(PIN_KEY_DIT);
     uint8_t dah_raw = !gpio_get(PIN_KEY_DAH);
 
-    if (dit_raw != dit_last_state && (now_ms - dit_debounce_ms) >= DEBOUNCE_MS) {
-        dit_debounce_ms = now_ms;
-        dit_last_state  = dit_raw;
+    if (dit_raw != dit_raw_last) {
+        dit_raw_last = dit_raw;
+        dit_raw_ms   = now_ms;                    // bounce restarts the timer
+    } else if (dit_raw != g_key_dit && (now_ms - dit_raw_ms) >= KEY_DEBOUNCE_MS) {
         g_key_dit = dit_raw;
     }
-    if (dah_raw != dah_last_state && (now_ms - dah_debounce_ms) >= DEBOUNCE_MS) {
-        dah_debounce_ms = now_ms;
-        dah_last_state  = dah_raw;
+    if (dah_raw != dah_raw_last) {
+        dah_raw_last = dah_raw;
+        dah_raw_ms   = now_ms;
+    } else if (dah_raw != g_key_dah && (now_ms - dah_raw_ms) >= KEY_DEBOUNCE_MS) {
         g_key_dah = dah_raw;
     }
     g_ptt_key = g_key_dit | g_key_dah;

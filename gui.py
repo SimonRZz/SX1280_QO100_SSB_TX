@@ -1198,7 +1198,7 @@ class SX1280ControlApp(ttk.Frame):
 
         # Sidetone (PWM on GP12 → headphones)
         ttk.Label(df, text="Sidetone:").grid(row=1, column=0, sticky="w", pady=(6, 0))
-        sh = ttk.Spinbox(df, from_=300, to=1200, increment=50, width=5, textvariable=self.dev_sthz_var,
+        sh = ttk.Spinbox(df, from_=300, to=1200, increment=10, width=5, textvariable=self.dev_sthz_var,
                          command=lambda: self._dev_keyer_send("tone"))
         sh.grid(row=1, column=1, padx=4, pady=(6, 0))
         sh.bind("<Return>", lambda e: self._dev_keyer_send("tone"))
