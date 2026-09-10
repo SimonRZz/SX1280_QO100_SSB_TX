@@ -2075,23 +2075,22 @@ static void oled_prepare_frame(void) {
         ssd1306_draw_string_2x(x_start, 2, buf);
     }
 
-    // --- Separator line at y=32 ---
-    ssd1306_hline(0, 127, 32);
-
-    // --- Page 2: GPS / time (display only) ---
+    // --- Page 2: GPS / time (display only). No separator: the 2x clock uses y 32..47 ---
     if (g_ui_page == 2) {
         gpsdo_info_t gi;
         gpsdo_get_info(&gi);
         char line[24];
-        snprintf(line, sizeof(line), "%-10s    %6s", gi.date, gi.locator);
-        ssd1306_draw_string_bold_y(0, 34, line);
-        snprintf(line, sizeof(line), "%s UTC", gi.utc_hhmm);
-        ssd1306_draw_string_2x(0, 5, line);                       // y 40..55
-        snprintf(line, sizeof(line), "sat %u/%u %s %dm",
-                 (unsigned)gi.sats_used, (unsigned)gi.sats_vis, gi.fix ? "fix" : "nofix", (int)gi.alt_m);
-        ssd1306_draw_string_bold_y(0, 57, line);
+        ssd1306_draw_string_2x(0, 4, gi.utc_hhmm);        // "12:34"  x 0..59,  y 32..47
+        ssd1306_draw_string_bold_y(66, 34, gi.date);       // right column, 10 chars = 60 px
+        ssd1306_draw_string_bold_y(66, 43, gi.locator);
+        snprintf(line, sizeof(line), "UTC  sat %u/%u %s %dm",
+                 (unsigned)gi.sats_used, (unsigned)gi.sats_vis, gi.fix ? "fix" : "--", (int)gi.alt_m);
+        ssd1306_draw_string_bold_y(0, 55, line);
         return;
     }
+
+    // --- Separator line at y=32 (tile pages) ---
+    ssd1306_hline(0, 127, 32);
 
     // --- Pages 0/1: 2 columns × 3 rows, all navigable ---
     // Vertical divider at x=63
@@ -2424,7 +2423,11 @@ static void keyer_diag_print(void) {
 
 static int16_t           s_st_sin[256];
 static uint16_t          s_st_rc[257];            // raised cosine 0..32767
-static uint32_t          s_st_buf[2][ST_BUF];     // PWM CC values (channel A in the low half)
+// Each half is 512 bytes and 512-aligned so the DMA read address can wrap
+// in hardware (ring). The chain then restarts a half at its beginning even
+// when the refill IRQ is late — e.g. during a flash write with IRQs off —
+// instead of reading past the buffer into random RAM.
+static uint32_t __attribute__((aligned(512))) s_st_buf[2][ST_BUF];
 static int               s_st_dma[2] = { -1, -1 };
 static uint              s_st_slice;
 static volatile uint32_t s_st_inc  = 0;           // phase increment per sample
@@ -2473,8 +2476,8 @@ static void __not_in_flash_func(sidetone_dma_irq)(void) {
         if (s_st_dma[b] >= 0 && dma_channel_get_irq0_status((uint)s_st_dma[b])) {
             dma_channel_acknowledge_irq0((uint)s_st_dma[b]);
             sidetone_fill(s_st_buf[b]);
-            // Re-arm for the next chain trigger; TRANS_COUNT reloads automatically.
-            dma_channel_set_read_addr((uint)s_st_dma[b], s_st_buf[b], false);
+            // Nothing to re-arm: the read ring wrapped the address back to the
+            // buffer start and TRANS_COUNT reloads on the next chain trigger.
         }
     }
 }
@@ -2517,6 +2520,7 @@ static void sidetone_init(void) {
         channel_config_set_transfer_data_size(&dc, DMA_SIZE_32);
         channel_config_set_read_increment(&dc, true);
         channel_config_set_write_increment(&dc, false);
+        channel_config_set_ring(&dc, false, 9);              // read wraps every 512 B = one half
         channel_config_set_dreq(&dc, pwm_get_dreq(ST_TB_SLICE));
         channel_config_set_chain_to(&dc, (uint)s_st_dma[b ^ 1]);
         dma_channel_configure((uint)s_st_dma[b], &dc,
@@ -3114,7 +3118,7 @@ static void usb_audio_pump(void) {
 static void persist_maybe_autosave(void) {
     if (!g_persist_dirty) return;
     if (g_ui_state != UI_STATE_IDLE) return;                     // still in the menu
-    if (g_tune_active || g_ptt_key || g_soft_ptt_key) return;   // carrier / key down
+    if (g_tune_active || g_ptt_key || g_soft_ptt_key || g_st_test) return;   // on air or sounding
     uint32_t now = to_ms_since_boot(get_absolute_time());
     if ((now - g_persist_dirty_since) < 5000u) return;
     persist_save_now();
