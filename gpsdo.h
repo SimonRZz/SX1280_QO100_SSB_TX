@@ -48,3 +48,17 @@ int gpsdo_format_status(char *buf, size_t size);
 // Returns true once every GPSDO_PRINT_MS milliseconds (2 s default).
 // Use this to rate-limit periodic status output.
 bool gpsdo_status_due(void);
+
+// Snapshot of the GPS fields for the display. Strings are placeholders
+// ("--:--", "--.--.----", "------") while the value is unknown.
+typedef struct {
+    char    utc_hhmm[6];    // "HH:MM"
+    char    date[11];       // "DD.MM.YYYY" (from RMC)
+    char    locator[7];     // 6-char Maidenhead
+    bool    utc_valid;
+    bool    fix;            // position fix with >= 3 satellites
+    uint8_t sats_used;
+    uint8_t sats_vis;
+    int16_t alt_m;
+} gpsdo_info_t;
+void gpsdo_get_info(gpsdo_info_t *out);

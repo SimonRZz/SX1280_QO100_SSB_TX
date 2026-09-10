@@ -177,6 +177,7 @@ static bool si5351_init_52mhz(void)
 static int      s_fixQuality      = 0;
 static int      s_satsUsed        = 0;
 static char     s_utc[7]          = "------";
+static char     s_date[7]         = "------"; // ddmmyy from RMC
 static bool     s_clk1Ok          = false;   // I2C init succeeded
 static uint8_t  s_si5351_status   = 0xFFu;   // SI5351 reg 0; 0xFF = not yet read
 static uint32_t s_si5351_pollMs   = 0u;
@@ -411,7 +412,15 @@ static void parse_gga(const char *s)
     }
 }
 
-static void parse_rmc(const char *s) { parse_time(s, 1u); }
+static void parse_rmc(const char *s)
+{
+    parse_time(s, 1u);
+    const char *d = nmea_field(s, 9u);          // ddmmyy
+    if (d && is_digit6(d)) {
+        for (uint8_t i = 0u; i < 6u; i++) s_date[i] = d[i];
+        s_date[6] = '\0';
+    }
+}
 
 static void parse_gsv(const char *s)
 {
@@ -670,6 +679,23 @@ int gpsdo_format_status(char *buf, size_t size)
                     utc_str,
                     s_has_position ? s_locator : "------",
                     (int)s_alt_m);
+}
+
+void gpsdo_get_info(gpsdo_info_t *o)
+{
+    const bool utc_valid  = (s_utc[0] != '-');
+    const bool date_valid = (s_date[0] != '-');
+    if (utc_valid) snprintf(o->utc_hhmm, sizeof(o->utc_hhmm), "%c%c:%c%c", s_utc[0], s_utc[1], s_utc[2], s_utc[3]);
+    else           snprintf(o->utc_hhmm, sizeof(o->utc_hhmm), "--:--");
+    if (date_valid) snprintf(o->date, sizeof(o->date), "%c%c.%c%c.20%c%c",
+                             s_date[0], s_date[1], s_date[2], s_date[3], s_date[4], s_date[5]);
+    else            snprintf(o->date, sizeof(o->date), "--.--.----");
+    snprintf(o->locator, sizeof(o->locator), "%s", s_has_position ? s_locator : "------");
+    o->utc_valid   = utc_valid;
+    o->fix         = (s_fixQuality > 0 && s_satsUsed >= 3);
+    o->sats_used   = (uint8_t)(s_satsUsed < 0 ? 0 : (s_satsUsed > 255 ? 255 : s_satsUsed));
+    o->sats_vis    = (uint8_t)(get_visible_sats() > 255u ? 255u : get_visible_sats());
+    o->alt_m       = s_alt_m;
 }
 
 bool gpsdo_status_due(void)

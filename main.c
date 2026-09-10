@@ -213,28 +213,45 @@ static inline void persist_mark_dirty(void) {
 }
 
 // --- Encoder UI state ---
+// The frequency stays on top; the lower half shows one of three pages.
+// Pages 0 and 1 hold 2x3 tiles (short click = browse), page 2 is GPS info.
+// A long press (500 ms) switches to the next page.
 typedef enum {
-    UI_PARAM_MODE = 0,   // USB / CW        (col 0, row 0)
-    UI_PARAM_TUNE,       // TUNE on/off      (col 0, row 1)
-    UI_PARAM_WPM,        // keyer speed      (col 0, row 2)
-    UI_PARAM_TX,         // TX on/off        (col 1, row 0)
-    UI_PARAM_VOL,        // sidetone volume  (col 1, row 1) — PPM stays on CDC/GUI (moot with GPSDO)
-    UI_PARAM_PWR,        // TX power dBm     (col 1, row 2)
-    UI_PARAM_COUNT       // sentinel (= 6)
+    UI_PARAM_MODE = 0,   // USB PC / USB MIC / CW
+    UI_PARAM_TUNE,       // TUNE on/off
+    UI_PARAM_WPM,        // keyer speed
+    UI_PARAM_TX,         // TX on/off
+    UI_PARAM_VOL,        // sidetone volume
+    UI_PARAM_PWR,        // TX power dBm
+    UI_PARAM_KEYER,      // straight / iambic A / iambic B
+    UI_PARAM_RATIO,      // dah length in dits
+    UI_PARAM_TONE,       // sidetone pitch
+    UI_PARAM_MICGAIN,
+    UI_PARAM_MICGATE
 } ui_param_t;
 
 typedef enum {
-    UI_STATE_IDLE = 0,   // Default: encoder adjusts frequency
-    UI_STATE_BROWSE,     // Click opened menu: frame around item, rotate moves cursor
-    UI_STATE_EDITING     // Click confirmed item: inverted, rotate adjusts value
+    UI_STATE_IDLE = 0,   // encoder = frequency; click = browse tiles; hold = next page
+    UI_STATE_BROWSE,     // frame around a tile, rotate moves cursor; hold = back
+    UI_STATE_EDITING     // tile inverted, rotate adjusts value; hold = back
 } ui_state_t;
 
+#define UI_PAGES         3
+#define UI_TILES         6                    // 2 columns x 3 rows on tile pages
+#define UI_TIMEOUT_MS    5000                 // BROWSE/EDITING fall back to IDLE
+#define UI_LONG_PRESS_MS 500
+
+static const ui_param_t k_page_tiles[2][UI_TILES] = {
+    { UI_PARAM_MODE,  UI_PARAM_TUNE,  UI_PARAM_WPM, UI_PARAM_TX,   UI_PARAM_VOL,     UI_PARAM_PWR     },
+    { UI_PARAM_KEYER, UI_PARAM_RATIO, UI_PARAM_WPM, UI_PARAM_TONE, UI_PARAM_MICGAIN, UI_PARAM_MICGATE },
+};
+
 static volatile ui_state_t g_ui_state = UI_STATE_IDLE;
-static volatile ui_param_t g_ui_cursor = UI_PARAM_MODE;    // browse cursor position
+static volatile uint8_t    g_ui_page = 0;                  // 0 operating, 1 CW/audio, 2 GPS info
+static volatile uint8_t    g_ui_cursor_idx = 0;            // tile index on the current page
+static volatile ui_param_t g_ui_cursor = UI_PARAM_MODE;    // param under the cursor (derived)
 static volatile ui_param_t g_ui_editing = UI_PARAM_MODE;   // which param is being edited
 static volatile uint32_t   g_ui_last_activity_ms = 0;      // for auto-timeout
-
-#define UI_TIMEOUT_MS   5000    // Return to IDLE after 5s inactivity
 
 // --- Hilbert ---
 #define HILBERT_TAPS        247
@@ -2061,7 +2078,22 @@ static void oled_prepare_frame(void) {
     // --- Separator line at y=32 ---
     ssd1306_hline(0, 127, 32);
 
-    // --- Bottom half: 2 columns × 3 rows, all navigable ---
+    // --- Page 2: GPS / time (display only) ---
+    if (g_ui_page == 2) {
+        gpsdo_info_t gi;
+        gpsdo_get_info(&gi);
+        char line[24];
+        snprintf(line, sizeof(line), "%-10s    %6s", gi.date, gi.locator);
+        ssd1306_draw_string_bold_y(0, 34, line);
+        snprintf(line, sizeof(line), "%s UTC", gi.utc_hhmm);
+        ssd1306_draw_string_2x(0, 5, line);                       // y 40..55
+        snprintf(line, sizeof(line), "sat %u/%u %s %dm",
+                 (unsigned)gi.sats_used, (unsigned)gi.sats_vis, gi.fix ? "fix" : "nofix", (int)gi.alt_m);
+        ssd1306_draw_string_bold_y(0, 57, line);
+        return;
+    }
+
+    // --- Pages 0/1: 2 columns × 3 rows, all navigable ---
     // Vertical divider at x=63
     ssd1306_vline(63, 33, 63);
 
@@ -2099,23 +2131,15 @@ static void oled_prepare_frame(void) {
     #define DRAW_L(y, text, pid) DRAW_ITEM(COL0_X, COL0_W, 0,  COL0_R, y, text, pid)
     #define DRAW_R(y, text, pid) DRAW_ITEM(COL1_X, COL1_W, 64, COL1_R, y, text, pid)
 
-    // --- Column 0 (left) ---
-    // Row 0: Mode (USB / CW)
-    DRAW_L(ROW0_Y, g_tx_mode ? "CW" : (g_audio_src == AUDIO_SRC_MIC ? "USB MIC" : "USB PC"), UI_PARAM_MODE);
+    char wpm_buf[12];
+    snprintf(wpm_buf, sizeof(wpm_buf), "%u WPM", (unsigned)g_cw_wpm);
 
-    // Row 1: TUNE
-    DRAW_L(ROW1_Y, g_tune_active ? "TUNE *" : "TUNE", UI_PARAM_TUNE);
-
-    // Row 2: MENU (placeholder)
-    {
-        char wpm_buf[12];
-        snprintf(wpm_buf, sizeof(wpm_buf), "%u WPM", (unsigned)g_cw_wpm);
+    if (g_ui_page == 0) {
+        // --- Page 0: operating ---
+        DRAW_L(ROW0_Y, g_tx_mode ? "CW" : (g_audio_src == AUDIO_SRC_MIC ? "USB MIC" : "USB PC"), UI_PARAM_MODE);
+        DRAW_L(ROW1_Y, g_tune_active ? "TUNE *" : "TUNE", UI_PARAM_TUNE);
         DRAW_L(ROW2_Y, wpm_buf, UI_PARAM_WPM);
-    }
 
-    // --- Column 1 (right) ---
-    // Row 0: TX ON/OFF + radio icon
-    {
         const char *tx_label;
         if (!tx_allowed()) {
             tx_label = "WAIT GPS";
@@ -2125,20 +2149,35 @@ static void oled_prepare_frame(void) {
             tx_label = g_tx_enabled ? "TX ON" : "TX OFF";
         }
         DRAW_R(ROW0_Y, tx_label, UI_PARAM_TX);
-    }
 
-    // Row 1: sidetone volume
-    {
         char vol_buf[12];
         snprintf(vol_buf, sizeof(vol_buf), "VOL %u%%", (unsigned)g_st_vol);
         DRAW_R(ROW1_Y, vol_buf, UI_PARAM_VOL);
-    }
 
-    // Row 2: Power
-    {
         char pwr_buf[12];
         snprintf(pwr_buf, sizeof(pwr_buf), "%+ddBm", g_tx_power_max_dbm);
         DRAW_R(ROW2_Y, pwr_buf, UI_PARAM_PWR);
+    } else {
+        // --- Page 1: CW & audio ---
+        DRAW_L(ROW0_Y, g_cw_mode == KEYER_STRAIGHT ? "STRAIGHT" : g_cw_mode == KEYER_IAMBIC_A ? "IAMBIC A" : "IAMBIC B",
+               UI_PARAM_KEYER);
+
+        char ratio_buf[12];
+        snprintf(ratio_buf, sizeof(ratio_buf), "RATIO %.1f", (double)g_cw_ratio);
+        DRAW_L(ROW1_Y, ratio_buf, UI_PARAM_RATIO);
+        DRAW_L(ROW2_Y, wpm_buf, UI_PARAM_WPM);
+
+        char tone_buf[12];
+        snprintf(tone_buf, sizeof(tone_buf), "TONE %u", (unsigned)g_st_hz);
+        DRAW_R(ROW0_Y, tone_buf, UI_PARAM_TONE);
+
+        char gain_buf[12];
+        snprintf(gain_buf, sizeof(gain_buf), "MIC G %.0f", (double)g_mic_gain);
+        DRAW_R(ROW1_Y, gain_buf, UI_PARAM_MICGAIN);
+
+        char gate_buf[12];
+        snprintf(gate_buf, sizeof(gate_buf), "GATE %.3f", (double)g_mic_gate);
+        DRAW_R(ROW2_Y, gate_buf, UI_PARAM_MICGATE);
     }
 
     #undef DRAW_ITEM
@@ -2405,7 +2444,8 @@ static void __not_in_flash_func(sidetone_fill)(uint32_t *dst) {
     const int32_t  gain = s_st_gain;
     // Also sound while the volume is being edited on the OLED, so the level can be heard.
     const bool on = g_keyer_key || g_tune_active || g_st_test ||
-                    (g_ui_state == UI_STATE_EDITING && g_ui_editing == UI_PARAM_VOL);
+                    (g_ui_state == UI_STATE_EDITING &&
+                     (g_ui_editing == UI_PARAM_VOL || g_ui_editing == UI_PARAM_TONE));
 
     for (uint32_t i = 0; i < ST_BUF; i++) {
         if (on)  { if (s_st_env_pos < ST_RAMP_SAMPLES) s_st_env_pos++; }
@@ -2584,6 +2624,8 @@ static void mic_diag_print(void) {
 // Button debounce state
 static uint8_t  ok_was_pressed = 0;
 static uint32_t ok_debounce_ms = 0;
+static uint32_t ok_press_start_ms = 0;
+static uint8_t  ok_long_fired = 0;
 static uint32_t dit_debounce_ms = 0, dah_debounce_ms = 0;
 static uint8_t  dit_last_state = 0,  dah_last_state = 0;
 
@@ -2645,12 +2687,13 @@ static void encoder_poll(void) {
             break;
 
         case UI_STATE_BROWSE:
-            // Move cursor between params
+            // Move cursor between the tiles of the current page
             {
-                int c = (int)g_ui_cursor + step;
-                if (c < 0) c = UI_PARAM_COUNT - 1;
-                if (c >= (int)UI_PARAM_COUNT) c = 0;
-                g_ui_cursor = (ui_param_t)c;
+                int c = (int)g_ui_cursor_idx + step;
+                if (c < 0) c = UI_TILES - 1;
+                if (c >= UI_TILES) c = 0;
+                g_ui_cursor_idx = (uint8_t)c;
+                g_ui_cursor = k_page_tiles[g_ui_page < 2 ? g_ui_page : 0][c];
             }
             break;
 
@@ -2708,6 +2751,48 @@ static void encoder_poll(void) {
                         if (g_tune_active) tune_apply_settings();
                     }
                     break;
+                case UI_PARAM_KEYER:
+                    g_cw_mode = (uint8_t)(((int)g_cw_mode + step + 3) % 3);
+                    keyer_reset();
+                    persist_mark_dirty();
+                    break;
+                case UI_PARAM_RATIO:
+                    {
+                        float r = g_cw_ratio + 0.1f * (float)step;
+                        if (r < 2.0f) r = 2.0f;
+                        if (r > 5.0f) r = 5.0f;
+                        g_cw_ratio = r;
+                        persist_mark_dirty();
+                    }
+                    break;
+                case UI_PARAM_TONE:
+                    {
+                        int t = (int)g_st_hz + 50 * step;
+                        if (t < 300)  t = 300;
+                        if (t > 1200) t = 1200;
+                        g_st_hz = (uint16_t)t;
+                        sidetone_update_params();
+                        persist_mark_dirty();
+                    }
+                    break;
+                case UI_PARAM_MICGAIN:
+                    {
+                        float g = g_mic_gain + (float)step;
+                        if (g < 1.0f)  g = 1.0f;
+                        if (g > 50.0f) g = 50.0f;
+                        g_mic_gain = g;
+                        persist_mark_dirty();
+                    }
+                    break;
+                case UI_PARAM_MICGATE:
+                    {
+                        float t = g_mic_gate + 0.005f * (float)step;
+                        if (t < 0.0f) t = 0.0f;
+                        if (t > 0.5f) t = 0.5f;
+                        g_mic_gate = t;
+                        persist_mark_dirty();
+                    }
+                    break;
                 default: break;
             }
             break;
@@ -2724,7 +2809,7 @@ static void button_poll(void) {
         }
     }
 
-    // --- OK button (encoder push) ---
+    // --- OK button (encoder push): short click acts on release, long press fires while held ---
     uint8_t ok_raw = gpio_get(PIN_ENC_OK) ? 0 : 1;  // Active LOW
 
     if (ok_raw != ok_was_pressed && (now_ms - ok_debounce_ms) >= DEBOUNCE_MS) {
@@ -2732,28 +2817,37 @@ static void button_poll(void) {
         ok_was_pressed = ok_raw;
 
         if (ok_raw) {
-            // Button just pressed
+            ok_press_start_ms = now_ms;
+            ok_long_fired = 0;
+        } else if (!ok_long_fired) {
+            // Short click
             ui_touch();
-
             switch (g_ui_state) {
                 case UI_STATE_IDLE:
-                    // Enter browse mode
-                    g_ui_state = UI_STATE_BROWSE;
-                    g_ui_cursor = UI_PARAM_MODE;  // start at first item
+                    if (g_ui_page == 2) {
+                        g_ui_page = 0;            // GPS page has no tiles — click returns to page 0
+                    } else {
+                        g_ui_state = UI_STATE_BROWSE;
+                        g_ui_cursor_idx = 0;
+                        g_ui_cursor = k_page_tiles[g_ui_page][0];
+                    }
                     break;
-
                 case UI_STATE_BROWSE:
-                    // Confirm selection — enter editing mode
                     g_ui_editing = g_ui_cursor;
                     g_ui_state = UI_STATE_EDITING;
                     break;
-
                 case UI_STATE_EDITING:
-                    // Deselect — back to browse mode
                     g_ui_state = UI_STATE_BROWSE;
                     break;
             }
         }
+    }
+    if (ok_was_pressed && !ok_long_fired && (now_ms - ok_press_start_ms) >= UI_LONG_PRESS_MS) {
+        // Long press: next page from IDLE, otherwise back to IDLE
+        ok_long_fired = 1;
+        ui_touch();
+        if (g_ui_state == UI_STATE_IDLE) g_ui_page = (uint8_t)((g_ui_page + 1u) % UI_PAGES);
+        else                             g_ui_state = UI_STATE_IDLE;
     }
 
     // --- CW dit/dah paddles (GP9 / GP11, active LOW), debounced separately ---
