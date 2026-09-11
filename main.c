@@ -2207,7 +2207,9 @@ static int8_t  enc_accum = 0;
 // Port of the GUI's Keyer class (uSDX/WB4VVF behaviour):
 //  - pending latches are set only on rising edges of the debounced paddles
 //  - both latches are cleared at element START (uSDX KEYED_PREP)
-//  - same-paddle level is re-latched at element END (hold-to-repeat)
+//  - hold-to-repeat samples the paddle levels at the END OF THE SPACE, not
+//    at element end: a normal tap (60-100 ms) outlasts one element at
+//    20+ WPM, so sampling at element end produced double dits
 //  - Iambic B additionally latches the opposite paddle during an element
 //  - Iambic A drops latches for paddles already released at element end
 // ICH/IWD only serve the decoder (character / word gap detection); keying
@@ -2338,7 +2340,6 @@ static void keyer_poll(void) {
             s_kyr.was_dit = 1;
             g_keyer_key = 0;
             keyer_sym_push('.');
-            if (dit) s_kyr.pend_dit = 1;
             if (mode_a) { if (!dit) s_kyr.pend_dit = 0; if (!dah) s_kyr.pend_dah = 0; }
             s_kyr.state = KS_IEL; s_kyr.t0_us = now;
         } else if (!mode_a && dah) {
@@ -2351,7 +2352,6 @@ static void keyer_poll(void) {
             s_kyr.was_dit = 0;
             g_keyer_key = 0;
             keyer_sym_push('-');
-            if (dah) s_kyr.pend_dah = 1;
             if (mode_a) { if (!dit) s_kyr.pend_dit = 0; if (!dah) s_kyr.pend_dah = 0; }
             s_kyr.state = KS_IEL; s_kyr.t0_us = now;
         } else if (!mode_a && dit) {
@@ -2361,6 +2361,9 @@ static void keyer_poll(void) {
 
     case KS_IEL:
         if (el >= dit_us) {
+            // Hold-to-repeat: whatever is still pressed at the end of the space
+            if (dit) s_kyr.pend_dit = 1;
+            if (dah) s_kyr.pend_dah = 1;
             if (s_kyr.pend_dit && s_kyr.pend_dah) {
                 if (s_kyr.was_dit) keyer_send_dah(now); else keyer_send_dit(now);
             } else if (s_kyr.pend_dah) keyer_send_dah(now);

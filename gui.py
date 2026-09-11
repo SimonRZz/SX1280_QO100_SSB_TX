@@ -452,11 +452,9 @@ class Keyer:
                 self._sym_buf += '.'
                 self._was_dit = True
                 if self.cb_key_off: self.cb_key_off()
-                # Capture same-paddle level at element end for hold-to-repeat.
-                # This mirrors the WB4VVF/uSDX sticky-latch approach: latch is
-                # cleared at element START (_send_dit clears _pend_dit), then
-                # re-latched here if the paddle is still held.
-                if dit: self._pend_dit = True
+                # Hold-to-repeat is decided at the end of the SPACE (see IEL),
+                # not here: a normal tap outlasts one element at 20+ WPM and
+                # sampling at element end produced double dits.
                 if self.mode == self.IAMBIC_A:
                     # A: clear memory for any paddle released at element end
                     if not dit: self._pend_dit = False
@@ -472,8 +470,6 @@ class Keyer:
                 self._sym_buf += '-'
                 self._was_dit = False
                 if self.cb_key_off: self.cb_key_off()
-                # Capture same-paddle level at element end for hold-to-repeat
-                if dah: self._pend_dah = True
                 if self.mode == self.IAMBIC_A:
                     if not dit: self._pend_dit = False
                     if not dah: self._pend_dah = False
@@ -485,6 +481,9 @@ class Keyer:
 
         elif self._state == 'IEL':
             if el >= self.iel_ms:
+                # Hold-to-repeat: whatever is still pressed at the end of the space
+                if dit: self._pend_dit = True
+                if dah: self._pend_dah = True
                 have_dit = self._pend_dit
                 have_dah = self._pend_dah
                 if have_dit and have_dah:
