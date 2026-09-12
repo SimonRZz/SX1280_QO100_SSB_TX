@@ -40,7 +40,8 @@
 #define GPSDO_NMEA_STALE_MS 3000u
 #define GPSDO_GGA_STALE_MS  5000u
 #define GPSDO_GSV_FRESH_MS  10000u
-#define GPSDO_SI5351_POLL_MS 30000u   // SI5351 reg-0 re-read interval
+#define GPSDO_SI5351_POLL_MS 30000u   // SI5351 reg-0 re-read interval once locked
+#define GPSDO_SI5351_FAST_POLL_MS 500u // ... while still waiting for PLL lock at boot
 #define GPSDO_NMEA_BUF      128u
 #define GPSDO_BOOT_DELAY_MS 300u      // wait before sending UBX commands
 
@@ -176,6 +177,7 @@ static bool si5351_init_52mhz(void)
 static int      s_fixQuality      = 0;
 static int      s_satsUsed        = 0;
 static char     s_utc[7]          = "------";
+static char     s_date[7]         = "------"; // ddmmyy from RMC
 static bool     s_clk1Ok          = false;   // I2C init succeeded
 static uint8_t  s_si5351_status   = 0xFFu;   // SI5351 reg 0; 0xFF = not yet read
 static uint32_t s_si5351_pollMs   = 0u;
@@ -410,7 +412,15 @@ static void parse_gga(const char *s)
     }
 }
 
-static void parse_rmc(const char *s) { parse_time(s, 1u); }
+static void parse_rmc(const char *s)
+{
+    parse_time(s, 1u);
+    const char *d = nmea_field(s, 9u);          // ddmmyy
+    if (d && is_digit6(d)) {
+        for (uint8_t i = 0u; i < 6u; i++) s_date[i] = d[i];
+        s_date[6] = '\0';
+    }
+}
 
 static void parse_gsv(const char *s)
 {
@@ -577,31 +587,44 @@ void gpsdo_init(void)
     printf("[GPSDO] UBX config sent — waiting for GPS lock...\n");
 }
 
+static bool si_locked_now(void)
+{
+    return s_clk1Ok &&
+           !(s_si5351_status & SI_STATUS_LOS_XTAL) &&
+           !(s_si5351_status & SI_STATUS_LOL_A);
+}
+
 void gpsdo_task(void)
 {
     process_incoming_gps();
 
-    // Re-read SI5351 status register every 30 s (infrequent to avoid I2C noise during TX).
+    // Re-read the SI5351 status register. Fast while waiting for the PLL at
+    // boot (the GPS TIMEPULSE may appear a moment after UBX config); slow once
+    // locked, to keep I2C traffic away from an active transmission.
     if (s_clk1Ok) {
         uint32_t now_ms = to_ms_since_boot(get_absolute_time());
-        if ((now_ms - s_si5351_pollMs) >= GPSDO_SI5351_POLL_MS) {
+        uint32_t interval = si_locked_now() ? GPSDO_SI5351_POLL_MS
+                                            : GPSDO_SI5351_FAST_POLL_MS;
+        if ((now_ms - s_si5351_pollMs) >= interval) {
             s_si5351_pollMs = now_ms;
             si_read_reg(SI_REG_STATUS, &s_si5351_status);
         }
     }
 
-    const bool si_locked = s_clk1Ok &&
-                           !(s_si5351_status & SI_STATUS_LOS_XTAL) &&
-                           !(s_si5351_status & SI_STATUS_LOL_A);
     // READY when SI5351 is locked AND GPS has provided at least one UTC timestamp.
     // UTC appearing means the GPS module has disciplined its oscillator to at least
     // one satellite — the TIMEPULSE 24 MHz is now frequency-accurate.
     // Without UTC the GPS runs on its free-running TCXO (±2.5 ppm = ±6 kHz at 2.4 GHz).
     const bool utc_valid = (s_utc[0] != '-');
-    if (!s_gpsdoReady && si_locked && utc_valid) {
+    if (!s_gpsdoReady && si_locked_now() && utc_valid) {
         s_gpsdoReady = true;
-        printf("[GPSDO] READY — SI5351 locked + GPS UTC received, starting SX1280\n");
+        printf("[GPSDO] READY — SI5351 locked + GPS UTC received, TX enabled\n");
     }
+}
+
+bool gpsdo_clock_ok(void)
+{
+    return si_locked_now();
 }
 
 bool gpsdo_is_ready(void)
@@ -656,6 +679,23 @@ int gpsdo_format_status(char *buf, size_t size)
                     utc_str,
                     s_has_position ? s_locator : "------",
                     (int)s_alt_m);
+}
+
+void gpsdo_get_info(gpsdo_info_t *o)
+{
+    const bool utc_valid  = (s_utc[0] != '-');
+    const bool date_valid = (s_date[0] != '-');
+    if (utc_valid) snprintf(o->utc_hhmm, sizeof(o->utc_hhmm), "%c%c:%c%c", s_utc[0], s_utc[1], s_utc[2], s_utc[3]);
+    else           snprintf(o->utc_hhmm, sizeof(o->utc_hhmm), "--:--");
+    if (date_valid) snprintf(o->date, sizeof(o->date), "%c%c.%c%c.20%c%c",
+                             s_date[0], s_date[1], s_date[2], s_date[3], s_date[4], s_date[5]);
+    else            snprintf(o->date, sizeof(o->date), "--.--.----");
+    snprintf(o->locator, sizeof(o->locator), "%s", s_has_position ? s_locator : "------");
+    o->utc_valid   = utc_valid;
+    o->fix         = (s_fixQuality > 0 && s_satsUsed >= 3);
+    o->sats_used   = (uint8_t)(s_satsUsed < 0 ? 0 : (s_satsUsed > 255 ? 255 : s_satsUsed));
+    o->sats_vis    = (uint8_t)(get_visible_sats() > 255u ? 255u : get_visible_sats());
+    o->alt_m       = s_alt_m;
 }
 
 bool gpsdo_status_due(void)

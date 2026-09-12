@@ -8,11 +8,18 @@
 
 #include "pico/stdlib.h"
 #include "pico/multicore.h"
+#include "pico/flash.h"
+#include "hardware/flash.h"
+#include <stddef.h>
 
 #include "hardware/spi.h"
 #include "hardware/gpio.h"
 #include "hardware/clocks.h"
 #include "hardware/i2c.h"
+#include "hardware/pwm.h"
+#include "hardware/dma.h"
+#include "hardware/irq.h"
+#include "hardware/adc.h"
 
 // TinyUSB
 #include "bsp/board_api.h"
@@ -85,6 +92,11 @@
 #define COMP_OUTPUT_LIMIT           (0.940f)
 // ===============================================
 
+// ================== FIRMWARE VERSION ==================
+#define FW_VERSION      "2.2.0-dev"
+#define FW_BUILD        __DATE__ " " __TIME__
+// ======================================================
+
 // ================== MODULE VARIANT ==================
 // Set to 1 if using LoRa1280F27-TCXO module
 // Set to 0 if using SX1280 V1.0 (no PA) with SI5351 52 MHz on XTA
@@ -154,31 +166,101 @@ static volatile uint8_t g_tx_enabled = 1;  // TX enable flag (for GUI TX button)
 static volatile uint8_t g_tx_mode = 0;     // 0 = USB (SSB), 1 = CW
 static volatile uint8_t g_tune_active = 0; // 1 = TUNE carrier active
 static volatile uint8_t g_ptt_key = 0;     // 1 = dit or dah paddle pressed (live)
+static volatile uint8_t g_key_dit = 0;     // dit paddle (GP9), debounced
+static volatile uint8_t g_key_dah = 0;     // dah paddle (GP11), debounced
 static volatile uint8_t g_soft_ptt_key = 0; // Software PTT/KEY via CDC "key 0|1" (GUI CW keyer)
 
+// --- On-device CW keyer (paddles GP9/GP11 → element timing in firmware) ---
+enum { KEYER_STRAIGHT = 0, KEYER_IAMBIC_A = 1, KEYER_IAMBIC_B = 2 };
+static volatile uint8_t g_cw_mode   = KEYER_IAMBIC_B;
+static volatile uint8_t g_cw_wpm    = 18;      // 5..60
+static volatile float   g_cw_ratio  = 3.0f;    // dah length in dits, 2.0..5.0
+static volatile uint8_t g_keyer_key = 0;       // keyer output: 1 = key down
+static void keyer_reset(void);
+static const char *keyer_mode_name(uint8_t m);
+static void keyer_diag_print(void);
+
+// --- Sidetone (PWM audio on GP12, follows keyer output and TUNE) ---
+static volatile uint16_t g_st_hz   = 700;    // 300..1200
+static volatile uint8_t  g_st_vol  = 30;     // 0..100
+static volatile uint8_t  g_st_test = 0;      // 1 = continuous test tone (not persisted)
+static void sidetone_update_params(void);
+
+// --- Audio source: USB from the PC, or the MAX4466 microphone on GP26 (ADC0) ---
+enum { AUDIO_SRC_PC = 0, AUDIO_SRC_MIC = 1 };
+static volatile uint8_t g_audio_src = AUDIO_SRC_PC;
+static volatile float   g_mic_gain  = 10.0f;   // 1..50, applied after DC removal
+static volatile float   g_mic_gate  = 0.02f;   // 0..0.5, noise gate threshold on the gained signal
+static const char *audio_src_name(uint8_t s);
+static void mic_diag_print(void);
+// GPS gate: 1 = TX only when gpsdo_is_ready() (default), 0 = override for bench tests.
+// Deliberately not persisted — resets to enforced on every boot.
+static volatile uint8_t g_gps_gate = 1;
+
+// Blank the TX for a moment after a mode change, so scrolling through the
+// modes on the encoder (or a burst of "mode" commands) cannot emit a stub.
+#define TX_MODE_GUARD_MS 120
+static volatile uint32_t g_mode_change_ms = 0;
+static inline void tx_mode_changed(void) { g_mode_change_ms = to_ms_since_boot(get_absolute_time()); }
+static inline bool tx_mode_guard_active(void) {
+    return (to_ms_since_boot(get_absolute_time()) - g_mode_change_ms) < TX_MODE_GUARD_MS;
+}
+
+static inline bool tx_allowed(void) {
+    return (gpsdo_is_ready() || !g_gps_gate) && !tx_mode_guard_active();
+}
+
+// --- Persistent config (last flash sector) ---
+static volatile uint8_t  g_persist_dirty       = 0;  // something worth saving changed
+static volatile uint32_t g_persist_dirty_since = 0;  // ms of last change
+static uint8_t           g_persist_loaded      = 0;  // 1 = boot config came from flash
+
+// The main loop autosaves after an idle period, so knob turns don't erase flash repeatedly.
+static inline void persist_mark_dirty(void) {
+    g_persist_dirty = 1;
+    g_persist_dirty_since = to_ms_since_boot(get_absolute_time());
+}
+
 // --- Encoder UI state ---
+// The frequency stays on top; the lower half shows one of three pages.
+// Pages 0 and 1 hold 2x3 tiles (short click = browse), page 2 is GPS info.
+// A long press (500 ms) switches to the next page.
 typedef enum {
-    UI_PARAM_MODE = 0,   // USB / CW        (col 0, row 0)
-    UI_PARAM_TUNE,       // TUNE on/off      (col 0, row 1)
-    UI_PARAM_MENU,       // MENU placeholder  (col 0, row 2)
-    UI_PARAM_TX,         // TX on/off        (col 1, row 0)
-    UI_PARAM_PPM,        // PPM correction   (col 1, row 1)
-    UI_PARAM_PWR,        // TX power dBm     (col 1, row 2)
-    UI_PARAM_COUNT       // sentinel (= 6)
+    UI_PARAM_MODE = 0,   // USB PC / USB MIC / CW
+    UI_PARAM_TUNE,       // TUNE on/off
+    UI_PARAM_WPM,        // keyer speed
+    UI_PARAM_TX,         // TX on/off
+    UI_PARAM_VOL,        // sidetone volume
+    UI_PARAM_PWR,        // TX power dBm
+    UI_PARAM_KEYER,      // straight / iambic A / iambic B
+    UI_PARAM_RATIO,      // dah length in dits
+    UI_PARAM_TONE,       // sidetone pitch
+    UI_PARAM_MICGAIN,
+    UI_PARAM_MICGATE
 } ui_param_t;
 
 typedef enum {
-    UI_STATE_IDLE = 0,   // Default: encoder adjusts frequency
-    UI_STATE_BROWSE,     // Click opened menu: frame around item, rotate moves cursor
-    UI_STATE_EDITING     // Click confirmed item: inverted, rotate adjusts value
+    UI_STATE_IDLE = 0,   // encoder = frequency; click = browse tiles; hold = next page
+    UI_STATE_BROWSE,     // frame around a tile, rotate moves cursor; hold = back
+    UI_STATE_EDITING     // tile inverted, rotate adjusts value; hold = back
 } ui_state_t;
 
+#define UI_PAGES         3
+#define UI_TILES         6                    // 2 columns x 3 rows on tile pages
+#define UI_TIMEOUT_MS    5000                 // BROWSE/EDITING fall back to IDLE
+#define UI_LONG_PRESS_MS 500
+
+static const ui_param_t k_page_tiles[2][UI_TILES] = {
+    { UI_PARAM_MODE,  UI_PARAM_TUNE,  UI_PARAM_WPM, UI_PARAM_TX,   UI_PARAM_VOL,     UI_PARAM_PWR     },
+    { UI_PARAM_KEYER, UI_PARAM_RATIO, UI_PARAM_WPM, UI_PARAM_TONE, UI_PARAM_MICGAIN, UI_PARAM_MICGATE },
+};
+
 static volatile ui_state_t g_ui_state = UI_STATE_IDLE;
-static volatile ui_param_t g_ui_cursor = UI_PARAM_MODE;    // browse cursor position
+static volatile uint8_t    g_ui_page = 0;                  // 0 operating, 1 CW/audio, 2 GPS info
+static volatile uint8_t    g_ui_cursor_idx = 0;            // tile index on the current page
+static volatile ui_param_t g_ui_cursor = UI_PARAM_MODE;    // param under the cursor (derived)
 static volatile ui_param_t g_ui_editing = UI_PARAM_MODE;   // which param is being edited
 static volatile uint32_t   g_ui_last_activity_ms = 0;      // for auto-timeout
-
-#define UI_TIMEOUT_MS   5000    // Return to IDLE after 5s inactivity
 
 // --- Hilbert ---
 #define HILBERT_TAPS        247
@@ -628,6 +710,7 @@ static void sx_print_diag(void) {
     uint32_t usb_r = g_usb_r;
     uint32_t usb_fill = (usb_w >= usb_r) ? (usb_w - usb_r) : (USB_RB_FRAMES - usb_r + usb_w);
     cdc_printf("USB ringbuf: %lu/%lu frames\r\n", (unsigned long)usb_fill, (unsigned long)USB_RB_FRAMES);
+    keyer_diag_print();
     cdc_printf("==========================\r\n");
 #endif
 }
@@ -636,6 +719,7 @@ static void sx_print_diag(void) {
 // Uses fractional-step dithering for sub-PLL-step precision (same as SSB).
 // Call repeatedly from carrier_poll() — each call advances the dither accumulator.
 static float g_cw_freq_acc = 0.0f;  // Fractional step accumulator for CW dithering
+static int8_t g_cr_pwr = PWR_MIN_DBM; // Power currently applied to the carrier (ramped by carrier_poll)
 
 static void tune_apply_settings(void) {
     uint32_t base = get_base_steps();
@@ -654,7 +738,7 @@ static void tune_apply_settings(void) {
     }
 
     sx_set_rf_frequency_steps((uint32_t)((int32_t)base + chosen));
-    sx_set_tx_params_dbm(g_tx_power_max_dbm);
+    sx_set_tx_params_dbm(g_cr_pwr);
 }
 
 // Pump USB while waiting (keep USB alive during short delays)
@@ -685,7 +769,9 @@ static void sx_start_carrier(void) {
 
     uint32_t steps = get_base_steps();
     sx_set_rf_frequency_steps(steps);
-    sx_set_tx_params_dbm(g_tx_power_max_dbm);
+    // Start at minimum power; carrier_poll() ramps up in 1 dB steps (click-free keying).
+    g_cr_pwr = PWR_MIN_DBM;
+    sx_set_tx_params_dbm(g_cr_pwr);
 
     gpio_put(PIN_TX_EN, 1);
     gpio_put(PIN_RX_EN, 0);
@@ -719,6 +805,8 @@ static void sx_stop_carrier(void) {
 }
 
 #define CW_ARM_WAIT_MS  35  // Time to wait for Core1 to finish SPI (> 1 block = 32ms)
+// Key-click suppression: power ramps 1 dB per step, 31 steps (-18..+13 dBm) ≈ 5 ms.
+#define CW_RAMP_STEP_US 160
 
 // Start CW/TUNE transmission (legacy wrapper with CDC logging)
 // This is a blocking call (used by CDC "cw" command and TUNE encoder action).
@@ -776,14 +864,16 @@ typedef enum {
 
 static carrier_state_t g_cr_state = CR_ST_IDLE;
 static uint32_t        g_cr_arm_start_ms = 0;
+static uint64_t        g_cr_ramp_next_us = 0;
 
 static void carrier_poll(void) {
     bool mode_cw     = (g_tx_mode == 1);
     bool tune        = (bool)g_tune_active;
-    bool key         = (bool)(g_ptt_key | g_soft_ptt_key);
+    if (!mode_cw && g_keyer_key) keyer_reset();   // never leave a key hanging after a mode switch
+    bool key         = (bool)(g_keyer_key | g_soft_ptt_key);
 
     bool need_idle    = mode_cw || tune;
-    bool need_carrier = tune || (mode_cw && key);
+    bool need_carrier = tx_allowed() && (tune || (mode_cw && key));
 
     uint32_t now = to_ms_since_boot(get_absolute_time());
 
@@ -828,36 +918,47 @@ static void carrier_poll(void) {
         }
         if (need_carrier) {
             g_cw_freq_acc = 0.0f;  // Reset dither accumulator
-            sx_start_carrier();
+            sx_start_carrier();    // starts at PWR_MIN_DBM
+            g_cr_ramp_next_us = 0; // first ramp step immediately
             g_cr_state = CR_ST_CARRIER_ON;
         }
         break;
 
-    case CR_ST_CARRIER_ON:
+    case CR_ST_CARRIER_ON: {
         if (!need_idle) {
             // Leaving CW/TUNE entirely — full stop + restore SSB
             sx_stop_carrier();   // clears g_cw_test_mode
             g_cr_state = CR_ST_IDLE;
             break;
         }
-        if (!need_carrier) {
-            // Carrier off but stay armed (e.g. CW key released, or TUNE off but still CW mode)
+        uint64_t now_us = time_us_64();
+
+        // Power envelope: ramp toward max while keyed, toward min on key-up.
+        // A key-down during the tail simply reverses direction — no re-init.
+        int8_t target = need_carrier ? g_tx_power_max_dbm : (int8_t)PWR_MIN_DBM;
+        if (g_cr_pwr != target && now_us >= g_cr_ramp_next_us) {
+            g_cr_pwr += (target > g_cr_pwr) ? 1 : -1;
+            sx_set_tx_params_dbm(g_cr_pwr);
+            g_cr_ramp_next_us = now_us + CW_RAMP_STEP_US;
+        }
+        if (!need_carrier && g_cr_pwr <= PWR_MIN_DBM) {
+            // Tail finished — carrier off but stay armed (key released, or TUNE off in CW mode)
 #if USE_TCXO_MODULE
             sx_set_standby_xosc();
 #else
             sx_set_standby_rc();
 #endif
             g_cr_state = CR_ST_ARMED;
-        } else {
-            // Carrier on — dither freq at ~8 kHz (125 µs), same rate as SSB
-            static uint64_t next_dither_us = 0;
-            uint64_t now_us = time_us_64();
-            if (now_us >= next_dither_us) {
-                tune_apply_settings();
-                next_dither_us = now_us + 125;  // 125 µs = 8 kHz
-            }
+            break;
+        }
+        // Carrier on — dither freq at ~8 kHz (125 µs), same rate as SSB
+        static uint64_t next_dither_us = 0;
+        if (now_us >= next_dither_us) {
+            tune_apply_settings();
+            next_dither_us = now_us + 125;  // 125 µs = 8 kHz
         }
         break;
+    }
     }
 }
 
@@ -1024,31 +1125,30 @@ typedef struct {
     float amp_min_a;
 } audio_cfg_t;
 
-static volatile audio_cfg_t g_cfg = {
-    .enable_bandpass = AUDIO_ENABLE_BANDPASS,
-    .enable_eq       = AUDIO_ENABLE_EQ,
-    .enable_comp     = AUDIO_ENABLE_COMPRESSOR,
+#define AUDIO_CFG_DEFAULTS { \
+    .enable_bandpass = AUDIO_ENABLE_BANDPASS, \
+    .enable_eq       = AUDIO_ENABLE_EQ, \
+    .enable_comp     = AUDIO_ENABLE_COMPRESSOR, \
+    .bp_lo_hz  = AUDIO_BP_LO_HZ, \
+    .bp_hi_hz  = AUDIO_BP_HI_HZ, \
+    .bp_stages = AUDIO_BP_DEFAULT_STAGES, \
+    .eq_low_hz  = EQ_LOW_SHELF_HZ, \
+    .eq_low_db  = EQ_LOW_SHELF_DB, \
+    .eq_high_hz = EQ_HIGH_SHELF_HZ, \
+    .eq_high_db = EQ_HIGH_SHELF_DB, \
+    .comp_thr_db     = COMP_THRESHOLD_DB, \
+    .comp_ratio      = COMP_RATIO, \
+    .comp_attack_ms  = COMP_ATTACK_MS, \
+    .comp_release_ms = COMP_RELEASE_MS, \
+    .comp_makeup_db  = COMP_MAKEUP_DB, \
+    .comp_knee_db    = COMP_KNEE_DB, \
+    .comp_out_limit  = COMP_OUTPUT_LIMIT, \
+    .amp_gain  = AMP_GAIN, \
+    .amp_min_a = AMP_MIN_A, \
+}
 
-    .bp_lo_hz  = AUDIO_BP_LO_HZ,
-    .bp_hi_hz  = AUDIO_BP_HI_HZ,
-    .bp_stages = AUDIO_BP_DEFAULT_STAGES,
-
-    .eq_low_hz  = EQ_LOW_SHELF_HZ,
-    .eq_low_db  = EQ_LOW_SHELF_DB,
-    .eq_high_hz = EQ_HIGH_SHELF_HZ,
-    .eq_high_db = EQ_HIGH_SHELF_DB,
-
-    .comp_thr_db     = COMP_THRESHOLD_DB,
-    .comp_ratio      = COMP_RATIO,
-    .comp_attack_ms  = COMP_ATTACK_MS,
-    .comp_release_ms = COMP_RELEASE_MS,
-    .comp_makeup_db  = COMP_MAKEUP_DB,
-    .comp_knee_db    = COMP_KNEE_DB,
-    .comp_out_limit  = COMP_OUTPUT_LIMIT,
-
-    .amp_gain  = AMP_GAIN,
-    .amp_min_a = AMP_MIN_A,
-};
+static const audio_cfg_t k_cfg_defaults = AUDIO_CFG_DEFAULTS;
+static volatile audio_cfg_t g_cfg = AUDIO_CFG_DEFAULTS;
 static volatile uint8_t g_cfg_dirty = 1;
 
 static void compressor_reconfig(compressor_t *c, float fs, const audio_cfg_t *cfg) {
@@ -1206,11 +1306,19 @@ static void cfg_print(void) {
 
     cdc_printf(
         "CFG:\r\n"
+        "  fw=" FW_VERSION "  built=" FW_BUILD "\r\n"
         "  freq=%s Hz (target)  ppm=%.3f  tx=%s  txpwr=%d dBm\r\n"
-        "  mode=%s  tune=%s\r\n"
+        "  mode=%s  tune=%s  gps=%s  gpsgate=%s  config=%s\r\n"
+        "  keyer=%s  wpm=%u  ratio=%.1f  sidetone=%u Hz  vol=%u%%\r\n"
+        "  src=%s  mic_gain=%.1f  mic_gate=%.3f\r\n"
         "  corrected=%s Hz  base_steps=%lu  fine=%.1f Hz (auto)\r\n",
         freq_str, g_ppm_correction, g_tx_enabled ? "ON" : "OFF", g_tx_power_max_dbm,
         g_tx_mode ? "CW" : "USB", g_tune_active ? "ON" : "OFF",
+        gpsdo_is_ready() ? "ready" : "wait", g_gps_gate ? "ON" : "OFF",
+        g_persist_dirty ? "unsaved" : (g_persist_loaded ? "flash" : "defaults"),
+        keyer_mode_name(g_cw_mode), (unsigned)g_cw_wpm, (double)g_cw_ratio,
+        (unsigned)g_st_hz, (unsigned)g_st_vol,
+        audio_src_name(g_audio_src), (double)g_mic_gain, (double)g_mic_gate,
         corr_str, (unsigned long)get_base_steps(), fine);
     cdc_printf(
         "  enable bp=%u eq=%u comp=%u\r\n"
@@ -1233,7 +1341,17 @@ static void cmd_help(void) {
         "Commands:\r\n"
         "  help\r\n"
         "  get\r\n"
+        "  version       - firmware version and build date\r\n"
         "  diag          - show SX1280 status\r\n"
+        "  gpsdo         - GPSDO status line\r\n"
+        "  gpsgate 0|1   - 1: TX only with GPS UTC (default); 0: override for bench tests\r\n"
+        "  save          - write freq/ppm/txpwr/mode/DSP to flash now (autosaves 5 s after idle)\r\n"
+        "  defaults      - restore compile-time defaults and save\r\n"
+        "  src pc|mic    - audio source: USB from PC, or MAX4466 mic on GP26\r\n"
+        "  mic [gain <1..50> | gate <0..0.5>] - mic gain and noise-gate threshold\r\n"
+        "  keyer [wpm <5..60> | mode <straight|a|b> | ratio <2..5>] - on-device paddle keyer\r\n"
+        "        [tone <300..1200> | vol <0..100> | test 0|1]      - sidetone on GP12 (PWM)\r\n"
+        "                  decoder events: !K e=.|-  !K c=<char>  !K w\r\n"
         "  tx 0|1        - enable/disable TX (SSB modulation)\r\n"
         "  mode usb|cw   - set modulation mode\r\n"
         "  tune 0|1      - toggle TUNE carrier\r\n"
@@ -1272,6 +1390,149 @@ static void cfg_commit(const audio_cfg_t *c) {
     memcpy((void*)&g_cfg, c, sizeof(*c));
     g_cfg_dirty = 1;
     __compiler_memory_barrier();
+    persist_mark_dirty();
+}
+
+// ==========================================================
+// Persistent configuration in the last 4 KB flash sector
+// ==========================================================
+// Layout: one flash page. Anything not listed here (TX enable, TUNE,
+// GPS gate, soft key) is deliberately volatile and resets at boot.
+#define CFG_FLASH_OFFSET   (PICO_FLASH_SIZE_BYTES - FLASH_SECTOR_SIZE)
+#define CFG_MAGIC          0x51303130u   // 'Q010'
+#define CFG_VERSION        3u            // bump whenever persist_cfg_t layout changes
+
+typedef struct __attribute__((packed)) {
+    uint32_t    magic;
+    uint32_t    version;
+    double      freq_hz;
+    float       ppm_correction;
+    int8_t      tx_power_dbm;
+    uint8_t     tx_mode;         // 0 = USB, 1 = CW
+    uint8_t     cw_mode;         // KEYER_*
+    uint8_t     cw_wpm;
+    float       cw_ratio;
+    uint16_t    st_hz;           // sidetone
+    uint8_t     st_vol;
+    uint8_t     audio_src;       // AUDIO_SRC_*
+    float       mic_gain;
+    float       mic_gate;
+    audio_cfg_t dsp;
+    uint32_t    crc32;           // over everything above
+} persist_cfg_t;
+
+_Static_assert(sizeof(persist_cfg_t) <= FLASH_PAGE_SIZE,
+               "persist_cfg_t must fit in one flash page");
+
+static uint32_t crc32_update(uint32_t crc, const uint8_t *data, size_t len) {
+    crc ^= 0xFFFFFFFFu;
+    for (size_t i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (int k = 0; k < 8; k++) {
+            uint32_t mask = -(int32_t)(crc & 1u);
+            crc = (crc >> 1) ^ (0xEDB88320u & mask);
+        }
+    }
+    return crc ^ 0xFFFFFFFFu;
+}
+
+static inline uint32_t persist_cfg_crc(const persist_cfg_t *c) {
+    return crc32_update(0, (const uint8_t *)c, offsetof(persist_cfg_t, crc32));
+}
+
+static void persist_collect(persist_cfg_t *c) {
+    memset(c, 0, sizeof(*c));
+    c->magic          = CFG_MAGIC;
+    c->version        = CFG_VERSION;
+    c->freq_hz        = g_target_freq_hz;
+    c->ppm_correction = g_ppm_correction;
+    c->tx_power_dbm   = g_tx_power_max_dbm;
+    c->tx_mode        = g_tx_mode;
+    c->cw_mode        = g_cw_mode;
+    c->cw_wpm         = g_cw_wpm;
+    c->cw_ratio       = g_cw_ratio;
+    c->st_hz          = g_st_hz;
+    c->st_vol         = g_st_vol;
+    c->audio_src      = g_audio_src;
+    c->mic_gain       = g_mic_gain;
+    c->mic_gate       = g_mic_gate;
+    __compiler_memory_barrier();
+    memcpy(&c->dsp, (const void *)&g_cfg, sizeof(c->dsp));
+    __compiler_memory_barrier();
+    c->crc32          = persist_cfg_crc(c);
+}
+
+static void persist_apply(const persist_cfg_t *c) {
+    double f = c->freq_hz;
+    if (!(f >= 2400000000.0 && f <= 2500000000.0)) f = (double)BASE_FREQ_HZ;  // also rejects NaN
+    g_target_freq_hz = f;
+
+    float ppm = c->ppm_correction;
+    if (!(ppm >= -100.0f && ppm <= 100.0f)) ppm = 0.0f;
+    g_ppm_correction = ppm;
+
+    int8_t p = c->tx_power_dbm;
+    if (p < PWR_MIN_DBM) p = PWR_MIN_DBM;
+    if (p > PWR_MAX_DBM) p = PWR_MAX_DBM;
+    g_tx_power_max_dbm = p;
+
+    g_tx_mode = (c->tx_mode == 1) ? 1 : 0;
+
+    g_cw_mode = (c->cw_mode <= KEYER_IAMBIC_B) ? c->cw_mode : KEYER_IAMBIC_B;
+    g_cw_wpm  = (c->cw_wpm >= 5 && c->cw_wpm <= 60) ? c->cw_wpm : 18;
+    float r = c->cw_ratio;
+    g_cw_ratio = (r >= 2.0f && r <= 5.0f) ? r : 3.0f;   // also rejects NaN
+
+    g_st_hz  = (c->st_hz >= 300 && c->st_hz <= 1200) ? c->st_hz : 700;
+    g_st_vol = (c->st_vol <= 100) ? c->st_vol : 30;
+    sidetone_update_params();
+
+    g_audio_src = (c->audio_src == AUDIO_SRC_MIC) ? AUDIO_SRC_MIC : AUDIO_SRC_PC;
+    float mg = c->mic_gain, mt = c->mic_gate;
+    g_mic_gain = (mg >= 1.0f && mg <= 50.0f) ? mg : 10.0f;
+    g_mic_gate = (mt >= 0.0f && mt <= 0.5f)  ? mt : 0.02f;
+
+    audio_cfg_t d = c->dsp;
+    cfg_sanitize(&d, (float)WAV_SAMPLE_RATE);
+    cfg_commit(&d);
+}
+
+static bool persist_load(void) {
+    const persist_cfg_t *p = (const persist_cfg_t *)(XIP_BASE + CFG_FLASH_OFFSET);
+    if (p->magic != CFG_MAGIC)          return false;
+    if (p->version != CFG_VERSION)      return false;
+    if (persist_cfg_crc(p) != p->crc32) return false;
+    persist_apply(p);
+    g_persist_dirty  = 0;   // cfg_commit() marked dirty; a fresh load is clean by definition
+    g_persist_loaded = 1;
+    return true;
+}
+
+// Runs with IRQs off on Core0 and Core1 parked by flash_safe_execute().
+// Must stay in RAM: XIP is unavailable while flash is being erased.
+static void __not_in_flash_func(persist_flash_op)(void *param) {
+    flash_range_erase(CFG_FLASH_OFFSET, FLASH_SECTOR_SIZE);
+    flash_range_program(CFG_FLASH_OFFSET, (const uint8_t *)param, FLASH_PAGE_SIZE);
+}
+
+// ~20 ms erase + ~1 ms program. Core1's SPI loop is stalled meanwhile, so the
+// SX1280 holds its last state for that long — hence autosave only when idle.
+static bool persist_save_now(void) {
+    persist_cfg_t c;
+    persist_collect(&c);
+
+    static uint8_t page[FLASH_PAGE_SIZE];
+    memset(page, 0xFF, sizeof(page));
+    memcpy(page, &c, sizeof(c));
+
+    int r = flash_safe_execute(persist_flash_op, page, 100);
+    if (r == PICO_OK) {
+        g_persist_dirty = 0;
+        return true;
+    }
+    // Don't retry back-to-back: each failed attempt costs up to 100 ms.
+    g_persist_dirty_since = to_ms_since_boot(get_absolute_time());
+    return false;
 }
 
 // Periodic status push to CDC for GUI synchronization.
@@ -1286,6 +1547,16 @@ static void cdc_status_push_ex(bool force) {
     static int8_t   last_pwr  = 127;
     static float    last_ppm  = 9999.0f;
     static double   last_freq = 0.0;
+    static uint8_t  last_gps  = 0xFF;
+    static uint8_t  last_gate = 0xFF;
+    static uint8_t  last_dirty = 0xFF;
+    static uint8_t  last_kwpm  = 0;
+    static uint8_t  last_kmode = 0xFF;
+    static uint8_t  last_key   = 0xFF;
+    static uint8_t  last_pdl   = 0xFF;
+    static uint16_t last_sthz  = 0;
+    static uint8_t  last_stvol = 0xFF;
+    static uint8_t  last_src   = 0xFF;
 
     if (!tud_cdc_connected()) return;
 
@@ -1295,12 +1566,28 @@ static void cdc_status_push_ex(bool force) {
     int8_t   cur_pwr  = g_tx_power_max_dbm;
     float    cur_ppm  = g_ppm_correction;
     double   cur_freq = (double)g_target_freq_hz;
+    uint8_t  cur_gps  = gpsdo_is_ready() ? 1 : 0;
+    uint8_t  cur_gate = g_gps_gate;
+    uint8_t  cur_dirty = g_persist_dirty;
+    uint8_t  cur_kwpm  = g_cw_wpm;
+    uint8_t  cur_kmode = g_cw_mode;
+    uint8_t  cur_key   = (g_keyer_key | g_soft_ptt_key) ? 1 : 0;
+    uint8_t  cur_pdl   = (uint8_t)(g_key_dit | (g_key_dah << 1));
+    uint16_t cur_sthz  = g_st_hz;
+    uint8_t  cur_stvol = g_st_vol;
+    uint8_t  cur_src   = g_audio_src;
 
     if (!force) {
         // Check if anything changed
         bool changed = (cur_mode != last_mode) || (cur_tune != last_tune) ||
                        (cur_tx != last_tx) || (cur_pwr != last_pwr) ||
-                       (cur_ppm != last_ppm) || (cur_freq != last_freq);
+                       (cur_ppm != last_ppm) || (cur_freq != last_freq) ||
+                       (cur_gps != last_gps) || (cur_gate != last_gate) ||
+                       (cur_dirty != last_dirty) ||
+                       (cur_kwpm != last_kwpm) || (cur_kmode != last_kmode) ||
+                       (cur_key != last_key) || (cur_pdl != last_pdl) ||
+                       (cur_sthz != last_sthz) || (cur_stvol != last_stvol) ||
+                       (cur_src != last_src);
 
         if (!changed) return;
 
@@ -1319,12 +1606,13 @@ static void cdc_status_push_ex(bool force) {
     uint32_t ppm_frac = (uint32_t)((ppm_abs - (float)ppm_int) * 10000.0f + 0.5f);
     if (ppm_frac >= 10000) { ppm_int++; ppm_frac = 0; }
 
-    char status_buf[128];
+    char status_buf[160];
     snprintf(status_buf, sizeof(status_buf),
-             "!S mode=%u tune=%u tx=%u pwr=%d ppm=%s%lu.%04lu freq=%s\r\n",
+             "!S mode=%u tune=%u tx=%u pwr=%d ppm=%s%lu.%04lu freq=%s gps=%u gate=%u dirty=%u kwpm=%u kmode=%u key=%u pdl=%u sthz=%u stvol=%u src=%u\r\n",
              cur_mode, cur_tune, cur_tx, cur_pwr,
              ppm_neg ? "-" : "", (unsigned long)ppm_int, (unsigned long)ppm_frac,
-             freq_str);
+             freq_str, cur_gps, cur_gate, cur_dirty, cur_kwpm, cur_kmode, cur_key, cur_pdl,
+             (unsigned)cur_sthz, (unsigned)cur_stvol, (unsigned)cur_src);
     cdc_write_str(status_buf);
 
     last_mode = cur_mode;
@@ -1333,6 +1621,16 @@ static void cdc_status_push_ex(bool force) {
     last_pwr  = cur_pwr;
     last_ppm  = cur_ppm;
     last_freq = cur_freq;
+    last_gps  = cur_gps;
+    last_gate = cur_gate;
+    last_dirty = cur_dirty;
+    last_kwpm  = cur_kwpm;
+    last_kmode = cur_kmode;
+    last_key   = cur_key;
+    last_pdl   = cur_pdl;
+    last_sthz  = cur_sthz;
+    last_stvol = cur_stvol;
+    last_src   = cur_src;
     last_push_ms = to_ms_since_boot(get_absolute_time());
 }
 
@@ -1358,8 +1656,128 @@ static void cdc_handle_line(char *line) {
         cdc_write_str(gbuf);
         return;
     }
-    if (streqi(argv[0], "cw"))   { g_tune_active = 1; cdc_printf("OK tune=ON (carrier_poll handles SPI)\r\n"); return; }
-    if (streqi(argv[0], "stop")) { g_tune_active = 0; g_soft_ptt_key = 0; cdc_printf("OK tune=OFF\r\n"); return; }
+    if (streqi(argv[0], "save")) {
+        if (persist_save_now()) cdc_write_str("OK saved to flash\r\n");
+        else                    cdc_write_str("ERR: flash save failed (core lockout timeout?)\r\n");
+        return;
+    }
+    if (streqi(argv[0], "defaults")) {
+        g_target_freq_hz   = (double)BASE_FREQ_HZ;
+        g_ppm_correction   = 0.0f;
+        g_tx_power_max_dbm = PWR_MAX_DBM;
+        g_tx_mode          = 0;
+        g_cw_mode          = KEYER_IAMBIC_B;
+        g_cw_wpm           = 18;
+        g_cw_ratio         = 3.0f;
+        g_st_hz            = 700;
+        g_st_vol           = 30;
+        sidetone_update_params();
+        g_audio_src        = AUDIO_SRC_PC;
+        g_mic_gain         = 10.0f;
+        g_mic_gate         = 0.02f;
+        keyer_reset();
+        cfg_commit(&k_cfg_defaults);
+        if (g_tune_active) tune_apply_settings();
+        if (persist_save_now()) cdc_write_str("OK defaults restored and saved\r\n");
+        else                    cdc_write_str("ERR: defaults restored in RAM, flash save failed\r\n");
+        cfg_print();
+        return;
+    }
+    // Audio source: src pc|mic
+    if (streqi(argv[0], "src")) {
+        if (argc >= 2) {
+            uint8_t s;
+            if      (streqi(argv[1], "pc") || streqi(argv[1], "usb")) s = AUDIO_SRC_PC;
+            else if (streqi(argv[1], "mic") || streqi(argv[1], "adc")) s = AUDIO_SRC_MIC;
+            else { cdc_write_str("ERR: src pc|mic\r\n"); return; }
+            if (s != g_audio_src) { g_audio_src = s; persist_mark_dirty(); }
+        }
+        cdc_printf("OK src=%s\r\n", audio_src_name(g_audio_src));
+        return;
+    }
+    // Microphone: mic [gain <1..50> | gate <0..0.5>]
+    if (streqi(argv[0], "mic")) {
+        if (argc >= 3 && streqi(argv[1], "gain")) {
+            float v;
+            if (!parse_f(argv[2], &v) || v < 1.0f || v > 50.0f) { cdc_write_str("ERR: mic gain 1..50\r\n"); return; }
+            g_mic_gain = v; persist_mark_dirty();
+        } else if (argc >= 3 && streqi(argv[1], "gate")) {
+            float v;
+            if (!parse_f(argv[2], &v) || v < 0.0f || v > 0.5f) { cdc_write_str("ERR: mic gate 0..0.5\r\n"); return; }
+            g_mic_gate = v; persist_mark_dirty();
+        } else if (argc >= 2) {
+            cdc_write_str("ERR: mic [gain <1..50> | gate <0..0.5>]\r\n");
+            return;
+        }
+        cdc_printf("OK mic gain=%.1f gate=%.3f\r\n", (double)g_mic_gain, (double)g_mic_gate);
+        mic_diag_print();
+        return;
+    }
+    if (streqi(argv[0], "version") || streqi(argv[0], "ver")) {
+        cdc_write_str("FW: " FW_VERSION " built " FW_BUILD "\r\n");
+        return;
+    }
+    if (streqi(argv[0], "gpsgate") && argc >= 2) {
+        uint8_t v;
+        if (!parse_bool(argv[1], &v)) { cdc_write_str("ERR: gpsgate 0|1\r\n"); return; }
+        g_gps_gate = v;
+        if (v) cdc_write_str("OK gpsgate=ON (TX requires GPS UTC)\r\n");
+        else   cdc_write_str("OK gpsgate=OFF — WARNING: TX without GPS discipline, "
+                             "up to +/-6 kHz error at 2.4 GHz. Not persisted.\r\n");
+        return;
+    }
+    if (streqi(argv[0], "cw")) {
+        g_tune_active = 1;
+        cdc_printf("OK tune=ON (carrier_poll handles SPI)\r\n");
+        if (!tx_allowed()) cdc_write_str("WARN: carrier blocked until GPS UTC valid (gpsgate 0 to override)\r\n");
+        return;
+    }
+    if (streqi(argv[0], "stop")) { g_tune_active = 0; g_soft_ptt_key = 0; keyer_reset(); cdc_printf("OK tune=OFF\r\n"); return; }
+
+    // On-device keyer: keyer [wpm <5..60> | mode <straight|a|b> | ratio <2.0..5.0>]
+    if (streqi(argv[0], "keyer")) {
+        if (argc >= 3 && streqi(argv[1], "wpm")) {
+            float v;
+            if (!parse_f(argv[2], &v) || v < 5.0f || v > 60.0f) { cdc_write_str("ERR: keyer wpm 5..60\r\n"); return; }
+            g_cw_wpm = (uint8_t)v;
+            persist_mark_dirty();
+        } else if (argc >= 3 && streqi(argv[1], "mode")) {
+            uint8_t m;
+            if      (streqi(argv[2], "straight") || streqi(argv[2], "0")) m = KEYER_STRAIGHT;
+            else if (streqi(argv[2], "a")        || streqi(argv[2], "1")) m = KEYER_IAMBIC_A;
+            else if (streqi(argv[2], "b")        || streqi(argv[2], "2")) m = KEYER_IAMBIC_B;
+            else { cdc_write_str("ERR: keyer mode straight|a|b\r\n"); return; }
+            if (m != g_cw_mode) { g_cw_mode = m; keyer_reset(); persist_mark_dirty(); }
+        } else if (argc >= 3 && streqi(argv[1], "ratio")) {
+            float v;
+            if (!parse_f(argv[2], &v) || v < 2.0f || v > 5.0f) { cdc_write_str("ERR: keyer ratio 2.0..5.0\r\n"); return; }
+            g_cw_ratio = v;
+            persist_mark_dirty();
+        } else if (argc >= 3 && streqi(argv[1], "tone")) {
+            float v;
+            if (!parse_f(argv[2], &v) || v < 300.0f || v > 1200.0f) { cdc_write_str("ERR: keyer tone 300..1200 Hz\r\n"); return; }
+            g_st_hz = (uint16_t)v;
+            sidetone_update_params();
+            persist_mark_dirty();
+        } else if (argc >= 3 && streqi(argv[1], "vol")) {
+            float v;
+            if (!parse_f(argv[2], &v) || v < 0.0f || v > 100.0f) { cdc_write_str("ERR: keyer vol 0..100\r\n"); return; }
+            g_st_vol = (uint8_t)v;
+            sidetone_update_params();
+            persist_mark_dirty();
+        } else if (argc >= 3 && streqi(argv[1], "test")) {
+            uint8_t v;
+            if (!parse_bool(argv[2], &v)) { cdc_write_str("ERR: keyer test 0|1\r\n"); return; }
+            g_st_test = v;   // continuous sidetone for checking the headphone wiring
+        } else if (argc >= 2) {
+            cdc_write_str("ERR: keyer [wpm <n> | mode <straight|a|b> | ratio <r> | tone <Hz> | vol <0..100> | test 0|1]\r\n");
+            return;
+        }
+        cdc_printf("OK keyer mode=%s wpm=%u ratio=%.1f tone=%u vol=%u%s\r\n",
+                   keyer_mode_name(g_cw_mode), (unsigned)g_cw_wpm, (double)g_cw_ratio,
+                   (unsigned)g_st_hz, (unsigned)g_st_vol, g_st_test ? " test=ON" : "");
+        return;
+    }
 
     // Software PTT/KEY for GUI CW keyer: key 0|1
     if (streqi(argv[0], "key") && argc >= 2) {
@@ -1369,6 +1787,7 @@ static void cdc_handle_line(char *line) {
     }
     // cwkey: enter CW mode and arm keyer (alias for mode cw, used by GUI keyer)
     if (streqi(argv[0], "cwkey")) {
+        if (g_tx_mode != 1) { persist_mark_dirty(); tx_mode_changed(); }
         g_tx_mode = 1;
         g_soft_ptt_key = 0;
         cdc_printf("OK cwkey mode=CW\r\n");
@@ -1383,9 +1802,11 @@ static void cdc_handle_line(char *line) {
     // Mode: mode usb|cw
     if (streqi(argv[0], "mode") && argc >= 2) {
         if (streqi(argv[1], "usb") || streqi(argv[1], "ssb")) {
+            if (g_tx_mode != 0) { persist_mark_dirty(); tx_mode_changed(); }
             g_tx_mode = 0;
             cdc_printf("OK mode=USB\r\n");
         } else if (streqi(argv[1], "cw")) {
+            if (g_tx_mode != 1) { persist_mark_dirty(); tx_mode_changed(); }
             g_tx_mode = 1;
             cdc_printf("OK mode=CW\r\n");
         } else {
@@ -1404,6 +1825,7 @@ static void cdc_handle_line(char *line) {
         g_tune_active = v;
         // carrier_poll() will handle SPI transitions
         cdc_printf("OK tune=%s\r\n", g_tune_active ? "ON" : "OFF");
+        if (v && !tx_allowed()) cdc_write_str("WARN: carrier blocked until GPS UTC valid (gpsgate 0 to override)\r\n");
         return;
     }
 
@@ -1416,6 +1838,7 @@ static void cdc_handle_line(char *line) {
         }
         g_tx_enabled = v;
         cdc_printf("OK tx=%s\r\n", g_tx_enabled ? "ON" : "OFF");
+        if (v && !tx_allowed()) cdc_write_str("WARN: TX blocked until GPS UTC valid (gpsgate 0 to override)\r\n");
         return;
     }
 
@@ -1428,6 +1851,7 @@ static void cdc_handle_line(char *line) {
             return;
         }
         g_target_freq_hz = f;
+        persist_mark_dirty();
         double corrected = get_corrected_freq_hz();
         float fine = get_fine_tune_hz();
         cdc_printf("OK freq=%.1f Hz (corrected=%.1f, steps=%lu, fine=%.1f Hz)\r\n", 
@@ -1449,6 +1873,7 @@ static void cdc_handle_line(char *line) {
             return;
         }
         g_ppm_correction = ppm;
+        persist_mark_dirty();
         double corrected = get_corrected_freq_hz();
         float fine = get_fine_tune_hz();
         cdc_printf("OK ppm=%.3f (corrected=%.1f Hz, steps=%lu, fine=%.1f Hz)\r\n", 
@@ -1468,6 +1893,7 @@ static void cdc_handle_line(char *line) {
         if (pwr < (float)PWR_MIN_DBM) pwr = (float)PWR_MIN_DBM;
         if (pwr > (float)PWR_MAX_DBM) pwr = (float)PWR_MAX_DBM;
         g_tx_power_max_dbm = (int8_t)pwr;
+        persist_mark_dirty();
         cdc_printf("OK txpwr=%d dBm\r\n", g_tx_power_max_dbm);
         if (g_tune_active) tune_apply_settings();
         return;
@@ -1658,10 +2084,24 @@ static void oled_prepare_frame(void) {
         ssd1306_draw_string_2x(x_start, 2, buf);
     }
 
-    // --- Separator line at y=32 ---
+    // --- Page 2: GPS / time (display only). No separator: the 2x clock uses y 32..47 ---
+    if (g_ui_page == 2) {
+        gpsdo_info_t gi;
+        gpsdo_get_info(&gi);
+        char line[24];
+        ssd1306_draw_string_2x(0, 4, gi.utc_hhmm);        // "12:34"  x 0..59,  y 32..47
+        ssd1306_draw_string_bold_y(66, 34, gi.date);       // right column, 10 chars = 60 px
+        ssd1306_draw_string_bold_y(66, 43, gi.locator);
+        snprintf(line, sizeof(line), "UTC  sat %u/%u %s %dm",
+                 (unsigned)gi.sats_used, (unsigned)gi.sats_vis, gi.fix ? "fix" : "--", (int)gi.alt_m);
+        ssd1306_draw_string_bold_y(0, 55, line);
+        return;
+    }
+
+    // --- Separator line at y=32 (tile pages) ---
     ssd1306_hline(0, 127, 32);
 
-    // --- Bottom half: 2 columns × 3 rows, all navigable ---
+    // --- Pages 0/1: 2 columns × 3 rows, all navigable ---
     // Vertical divider at x=63
     ssd1306_vline(63, 33, 63);
 
@@ -1699,40 +2139,53 @@ static void oled_prepare_frame(void) {
     #define DRAW_L(y, text, pid) DRAW_ITEM(COL0_X, COL0_W, 0,  COL0_R, y, text, pid)
     #define DRAW_R(y, text, pid) DRAW_ITEM(COL1_X, COL1_W, 64, COL1_R, y, text, pid)
 
-    // --- Column 0 (left) ---
-    // Row 0: Mode (USB / CW)
-    DRAW_L(ROW0_Y, g_tx_mode ? "CW" : "USB", UI_PARAM_MODE);
+    char wpm_buf[12];
+    snprintf(wpm_buf, sizeof(wpm_buf), "%u WPM", (unsigned)g_cw_wpm);
 
-    // Row 1: TUNE
-    DRAW_L(ROW1_Y, g_tune_active ? "TUNE *" : "TUNE", UI_PARAM_TUNE);
+    if (g_ui_page == 0) {
+        // --- Page 0: operating ---
+        DRAW_L(ROW0_Y, g_tx_mode ? "CW" : (g_audio_src == AUDIO_SRC_MIC ? "USB MIC" : "USB PC"), UI_PARAM_MODE);
+        DRAW_L(ROW1_Y, g_tune_active ? "TUNE *" : "TUNE", UI_PARAM_TUNE);
+        DRAW_L(ROW2_Y, wpm_buf, UI_PARAM_WPM);
 
-    // Row 2: MENU (placeholder)
-    DRAW_L(ROW2_Y, "MENU", UI_PARAM_MENU);
-
-    // --- Column 1 (right) ---
-    // Row 0: TX ON/OFF + radio icon
-    {
         const char *tx_label;
-        if (g_tx_mode == 1 && g_ptt_key) {
+        if (!tx_allowed()) {
+            tx_label = "WAIT GPS";
+        } else if (g_tx_mode == 1 && (g_keyer_key | g_soft_ptt_key)) {
             tx_label = "KEY";
         } else {
             tx_label = g_tx_enabled ? "TX ON" : "TX OFF";
         }
         DRAW_R(ROW0_Y, tx_label, UI_PARAM_TX);
-    }
 
-    // Row 1: PPM
-    {
-        char ppm_buf[12];
-        snprintf(ppm_buf, sizeof(ppm_buf), "%+.2f", (double)g_ppm_correction);
-        DRAW_R(ROW1_Y, ppm_buf, UI_PARAM_PPM);
-    }
+        char vol_buf[12];
+        snprintf(vol_buf, sizeof(vol_buf), "VOL %u%%", (unsigned)g_st_vol);
+        DRAW_R(ROW1_Y, vol_buf, UI_PARAM_VOL);
 
-    // Row 2: Power
-    {
         char pwr_buf[12];
         snprintf(pwr_buf, sizeof(pwr_buf), "%+ddBm", g_tx_power_max_dbm);
         DRAW_R(ROW2_Y, pwr_buf, UI_PARAM_PWR);
+    } else {
+        // --- Page 1: CW & audio ---
+        DRAW_L(ROW0_Y, g_cw_mode == KEYER_STRAIGHT ? "STRAIGHT" : g_cw_mode == KEYER_IAMBIC_A ? "IAMBIC A" : "IAMBIC B",
+               UI_PARAM_KEYER);
+
+        char ratio_buf[12];
+        snprintf(ratio_buf, sizeof(ratio_buf), "RATIO %.1f", (double)g_cw_ratio);
+        DRAW_L(ROW1_Y, ratio_buf, UI_PARAM_RATIO);
+        DRAW_L(ROW2_Y, wpm_buf, UI_PARAM_WPM);
+
+        char tone_buf[12];
+        snprintf(tone_buf, sizeof(tone_buf), "TONE %u", (unsigned)g_st_hz);
+        DRAW_R(ROW0_Y, tone_buf, UI_PARAM_TONE);
+
+        char gain_buf[12];
+        snprintf(gain_buf, sizeof(gain_buf), "MIC G %.0f", (double)g_mic_gain);
+        DRAW_R(ROW1_Y, gain_buf, UI_PARAM_MICGAIN);
+
+        char gate_buf[12];
+        snprintf(gate_buf, sizeof(gate_buf), "GATE %.3f", (double)g_mic_gate);
+        DRAW_R(ROW2_Y, gate_buf, UI_PARAM_MICGATE);
     }
 
     #undef DRAW_ITEM
@@ -1748,13 +2201,469 @@ static void oled_prepare_frame(void) {
 static uint8_t enc_last_ab = 0;
 static int8_t  enc_accum = 0;
 
+// ==========================================================
+// On-device iambic keyer
+// ==========================================================
+// Port of the GUI's Keyer class (uSDX/WB4VVF behaviour):
+//  - pending latches are set only on rising edges of the debounced paddles
+//  - both latches are cleared at element START (uSDX KEYED_PREP)
+//  - hold-to-repeat samples the paddle levels at the END OF THE SPACE, not
+//    at element end: a normal tap (60-100 ms) outlasts one element at
+//    20+ WPM, so sampling at element end produced double dits
+//  - Iambic B additionally latches the opposite paddle during an element
+//  - Iambic A drops latches for paddles already released at element end
+// ICH/IWD only serve the decoder (character / word gap detection); keying
+// itself is finished once IEL has elapsed.
+typedef enum { KS_IDLE = 0, KS_DIT, KS_DAH, KS_IEL, KS_ICH, KS_IWD } keyer_state_t;
+
+static struct {
+    keyer_state_t state;
+    uint64_t      t0_us;
+    uint8_t       pend_dit, pend_dah, was_dit;
+    uint8_t       dit_prev, dah_prev;
+    char          sym[8];        // elements of the character being keyed
+    uint8_t       sym_len;
+} s_kyr;
+
+static const struct { const char *code; char ch; } k_morse[] = {
+    {".-",'A'},   {"-...",'B'}, {"-.-.",'C'}, {"-..",'D'},  {".",'E'},    {"..-.",'F'},
+    {"--.",'G'},  {"....",'H'}, {"..",'I'},   {".---",'J'}, {"-.-",'K'},  {".-..",'L'},
+    {"--",'M'},   {"-.",'N'},   {"---",'O'},  {".--.",'P'}, {"--.-",'Q'}, {".-.",'R'},
+    {"...",'S'},  {"-",'T'},    {"..-",'U'},  {"...-",'V'}, {".--",'W'},  {"-..-",'X'},
+    {"-.--",'Y'}, {"--..",'Z'},
+    {".----",'1'},{"..---",'2'},{"...--",'3'},{"....-",'4'},{".....",'5'},
+    {"-....",'6'},{"--...",'7'},{"---..",'8'},{"----.",'9'},{"-----",'0'},
+    {".-.-.-",'.'},{"--..--",','},{"..--..",'?'},{".----.",'\''},{"-..-.",'/'},
+    {"---...",':'},{"-.--.",'('},{"-.--.-",')'},{".-...",'&'},{"-...-",'='},
+    {".-.-.",'+'},{"-....-",'-'},{".-..-.",'"'},{".--.-.",'@'},
+};
+
+// Decoder events for the GUI: "!K e=." / "!K e=-" per element,
+// "!K c=<char>" per decoded character, "!K w" per word gap.
+static inline void keyer_emit(const char *s) { cdc_write_str(s); }
+
+static void keyer_sym_push(char c) {
+    if (s_kyr.sym_len < sizeof(s_kyr.sym) - 1) s_kyr.sym[s_kyr.sym_len++] = c;
+    keyer_emit(c == '.' ? "!K e=.\r\n" : "!K e=-\r\n");
+}
+
+static void keyer_decode_char(void) {
+    if (!s_kyr.sym_len) return;
+    s_kyr.sym[s_kyr.sym_len] = '\0';
+    char ch = '?';
+    for (size_t i = 0; i < sizeof(k_morse) / sizeof(k_morse[0]); i++) {
+        if (strcmp(k_morse[i].code, s_kyr.sym) == 0) { ch = k_morse[i].ch; break; }
+    }
+    s_kyr.sym_len = 0;
+    char line[12];
+    snprintf(line, sizeof(line), "!K c=%c\r\n", ch);
+    keyer_emit(line);
+}
+
+static const char *keyer_mode_name(uint8_t m) {
+    return (m == KEYER_STRAIGHT) ? "straight" : (m == KEYER_IAMBIC_A) ? "iambic-a" : "iambic-b";
+}
+
+static void keyer_reset(void) {
+    s_kyr.state = KS_IDLE;
+    s_kyr.pend_dit = s_kyr.pend_dah = 0;
+    s_kyr.sym_len = 0;
+    g_keyer_key = 0;
+}
+
+static inline void keyer_send_dit(uint64_t now) {
+    s_kyr.pend_dit = s_kyr.pend_dah = 0;
+    s_kyr.state = KS_DIT; s_kyr.t0_us = now;
+    g_keyer_key = 1;
+}
+
+static inline void keyer_send_dah(uint64_t now) {
+    s_kyr.pend_dit = s_kyr.pend_dah = 0;
+    s_kyr.state = KS_DAH; s_kyr.t0_us = now;
+    g_keyer_key = 1;
+}
+
+// Called from button_poll() with the debounced paddle levels.
+static void keyer_poll(void) {
+    uint8_t dit = g_key_dit, dah = g_key_dah;
+    if (g_tx_mode != 1) {
+        // Keyer is only live in CW mode; track levels so no stale edge fires on entry.
+        s_kyr.dit_prev = dit; s_kyr.dah_prev = dah;
+        if (g_keyer_key || s_kyr.state != KS_IDLE || s_kyr.pend_dit || s_kyr.pend_dah) keyer_reset();
+        return;
+    }
+    if (dit && !s_kyr.dit_prev) s_kyr.pend_dit = 1;
+    if (dah && !s_kyr.dah_prev) s_kyr.pend_dah = 1;
+    s_kyr.dit_prev = dit;
+    s_kyr.dah_prev = dah;
+
+    const uint64_t now    = time_us_64();
+    const uint64_t el     = now - s_kyr.t0_us;
+    const uint32_t dit_us = 1200000u / (g_cw_wpm ? g_cw_wpm : 18u);
+    const uint32_t dah_us = (uint32_t)((float)dit_us * g_cw_ratio);
+    const bool     mode_a = (g_cw_mode == KEYER_IAMBIC_A);
+
+    if (g_cw_mode == KEYER_STRAIGHT) {
+        // Either contact is the key: works for a straight key on tip and for paddles alike.
+        // Elements are classified by hold time for the decoder only.
+        const uint8_t k = dit | dah;
+        s_kyr.pend_dit = s_kyr.pend_dah = 0;
+        if (k && !g_keyer_key) {
+            g_keyer_key = 1; s_kyr.t0_us = now; s_kyr.state = KS_DIT;
+        } else if (!k && g_keyer_key) {
+            g_keyer_key = 0;
+            keyer_sym_push(el < (uint64_t)dit_us * 2u ? '.' : '-');
+            s_kyr.t0_us = now; s_kyr.state = KS_ICH;
+        } else if (!k) {
+            if (s_kyr.state == KS_ICH && el >= (uint64_t)dit_us * 3u) {
+                keyer_decode_char();
+                s_kyr.state = KS_IWD; s_kyr.t0_us = now;
+            } else if (s_kyr.state == KS_IWD && el >= (uint64_t)dit_us * 4u) {
+                keyer_emit("!K w\r\n");
+                s_kyr.state = KS_IDLE;
+            }
+        }
+        return;
+    }
+
+    switch (s_kyr.state) {
+    case KS_IDLE:
+        if (s_kyr.pend_dit && !s_kyr.pend_dah)      keyer_send_dit(now);
+        else if (s_kyr.pend_dah && !s_kyr.pend_dit) keyer_send_dah(now);
+        else if (s_kyr.pend_dit && s_kyr.pend_dah) {
+            if (s_kyr.was_dit) keyer_send_dah(now); else keyer_send_dit(now);
+        }
+        break;
+
+    case KS_DIT:
+        if (el >= dit_us) {
+            s_kyr.was_dit = 1;
+            g_keyer_key = 0;
+            keyer_sym_push('.');
+            if (mode_a) { if (!dit) s_kyr.pend_dit = 0; if (!dah) s_kyr.pend_dah = 0; }
+            s_kyr.state = KS_IEL; s_kyr.t0_us = now;
+        } else if (!mode_a && dah) {
+            s_kyr.pend_dah = 1;   // Iambic B squeeze latch
+        }
+        break;
+
+    case KS_DAH:
+        if (el >= dah_us) {
+            s_kyr.was_dit = 0;
+            g_keyer_key = 0;
+            keyer_sym_push('-');
+            if (mode_a) { if (!dit) s_kyr.pend_dit = 0; if (!dah) s_kyr.pend_dah = 0; }
+            s_kyr.state = KS_IEL; s_kyr.t0_us = now;
+        } else if (!mode_a && dit) {
+            s_kyr.pend_dit = 1;   // Iambic B squeeze latch
+        }
+        break;
+
+    case KS_IEL:
+        if (el >= dit_us) {
+            // Hold-to-repeat: whatever is still pressed at the end of the space
+            if (dit) s_kyr.pend_dit = 1;
+            if (dah) s_kyr.pend_dah = 1;
+            if (s_kyr.pend_dit && s_kyr.pend_dah) {
+                if (s_kyr.was_dit) keyer_send_dah(now); else keyer_send_dit(now);
+            } else if (s_kyr.pend_dah) keyer_send_dah(now);
+            else if (s_kyr.pend_dit)   keyer_send_dit(now);
+            else { s_kyr.state = KS_ICH; s_kyr.t0_us = now; }
+        }
+        break;
+
+    case KS_ICH:
+        // Character gap running (decoder only). A new element continues the same character.
+        if (s_kyr.pend_dit || s_kyr.pend_dah) {
+            if (s_kyr.pend_dah) keyer_send_dah(now); else keyer_send_dit(now);
+        } else if (el >= (uint64_t)dit_us * 3u) {
+            keyer_decode_char();
+            s_kyr.state = KS_IWD; s_kyr.t0_us = now;
+        }
+        break;
+
+    case KS_IWD:
+        if (s_kyr.pend_dit || s_kyr.pend_dah) {
+            s_kyr.state = KS_IDLE;   // IDLE sends it on the next poll
+        } else if (el >= (uint64_t)dit_us * 4u) {
+            keyer_emit("!K w\r\n");
+            s_kyr.state = KS_IDLE;
+        }
+        break;
+    }
+}
+
+static void keyer_diag_print(void) {
+    static const char *cr_names[] = { "IDLE", "ARMING", "ARMED", "CARRIER_ON" };
+    static const char *ks_names[] = { "IDLE", "DIT", "DAH", "IEL", "ICH", "IWD", "?", "?" };
+    static const char *ui_names[] = { "IDLE", "BROWSE", "EDITING", "?" };
+    cdc_printf("Encoder: GP2(A)=%u GP3(B)=%u GP10(SW)=%u  ui=%s cursor=%u  (1 = pin at GND)\r\n",
+               (unsigned)!gpio_get(PIN_ENC_A), (unsigned)!gpio_get(PIN_ENC_B), (unsigned)!gpio_get(PIN_ENC_OK),
+               ui_names[g_ui_state & 3], (unsigned)g_ui_cursor);
+    cdc_printf("Paddles: GP9(dit) raw=%u db=%u  GP11(dah) raw=%u db=%u  (1 = pressed, pin at GND)\r\n",
+               (unsigned)!gpio_get(PIN_KEY_DIT), (unsigned)g_key_dit,
+               (unsigned)!gpio_get(PIN_KEY_DAH), (unsigned)g_key_dah);
+    cdc_printf("Keyer: mode=%s wpm=%u ratio=%.1f state=%s pend=%u/%u out=%u softkey=%u\r\n",
+               keyer_mode_name(g_cw_mode), (unsigned)g_cw_wpm, (double)g_cw_ratio,
+               ks_names[s_kyr.state & 7], (unsigned)s_kyr.pend_dit, (unsigned)s_kyr.pend_dah,
+               (unsigned)g_keyer_key, (unsigned)g_soft_ptt_key);
+    cdc_printf("Sidetone: GP12 PWM  tone=%u Hz vol=%u%% test=%u  (audible while keyer out=1 or tune=1)\r\n",
+               (unsigned)g_st_hz, (unsigned)g_st_vol, (unsigned)g_st_test);
+    mic_diag_print();
+    cdc_printf("Carrier: txmode=%s tune=%u state=%s cw_test_mode=%u pwr_now=%d dBm  tx_allowed=%u (gps=%u gate=%u)\r\n",
+               g_tx_mode ? "CW" : "USB", (unsigned)g_tune_active,
+               cr_names[g_cr_state & 3], (unsigned)g_cw_test_mode, (int)g_cr_pwr,
+               (unsigned)tx_allowed(), (unsigned)gpsdo_is_ready(), (unsigned)g_gps_gate);
+}
+
+// ==========================================================
+// Sidetone: PWM audio on GP12 → RC low-pass → headphones
+// ==========================================================
+// 10-bit PWM at sysclk/1024 (244 kHz @ 250 MHz). Samples are delivered
+// by DMA at 48 kHz, paced by the wrap DREQ of a spare PWM slice used as a
+// timebase — no per-sample interrupt, no jitter from USB IRQs. Two
+// ping-pong buffers of 2.7 ms are refilled from the DMA completion IRQ.
+// Pure sine, 5 ms raised-cosine envelope on each key edge (same rise
+// time as the RF power ramp), first-order error feedback so the 10-bit
+// PWM does not hiss at low volume.
+#define PIN_AUDIO_OUT    12
+#define ST_PWM_WRAP      1023u
+#define ST_FS_HZ         48000u
+#define ST_TB_SLICE      7        // timebase slice; GP14/15 are plain GPIO, so its counter is free
+#define ST_BUF           128      // samples per half-buffer (2.7 ms → key latency ≤ 5.3 ms)
+#define ST_RAMP_SAMPLES  240      // 5 ms
+
+static int16_t           s_st_sin[256];
+static uint16_t          s_st_rc[257];            // raised cosine 0..32767
+// Each half is 512 bytes and 512-aligned so the DMA read address can wrap
+// in hardware (ring). The chain then restarts a half at its beginning even
+// when the refill IRQ is late — e.g. during a flash write with IRQs off —
+// instead of reading past the buffer into random RAM.
+static uint32_t __attribute__((aligned(512))) s_st_buf[2][ST_BUF];
+static int               s_st_dma[2] = { -1, -1 };
+static uint              s_st_slice;
+static volatile uint32_t s_st_inc  = 0;           // phase increment per sample
+static volatile int32_t  s_st_gain = 0;           // Q15 volume
+static uint32_t          s_st_phase   = 0;
+static uint32_t          s_st_env_pos = 0;        // 0..ST_RAMP_SAMPLES on the envelope
+static int32_t           s_st_err     = 0;        // quantisation error carried to the next sample
+static uint32_t          s_st_fs      = ST_FS_HZ;
+
+static void sidetone_update_params(void) {
+    s_st_inc  = (uint32_t)((double)g_st_hz * 4294967296.0 / (double)s_st_fs);
+    s_st_gain = (int32_t)g_st_vol * 32767 / 100;
+}
+
+static void __not_in_flash_func(sidetone_fill)(uint32_t *dst) {
+    const uint32_t inc  = s_st_inc;
+    const int32_t  gain = s_st_gain;
+    // Also sound while the volume is being edited on the OLED, so the level can be heard.
+    const bool on = g_keyer_key || g_tune_active || g_st_test ||
+                    (g_ui_state == UI_STATE_EDITING &&
+                     (g_ui_editing == UI_PARAM_VOL || g_ui_editing == UI_PARAM_TONE));
+
+    for (uint32_t i = 0; i < ST_BUF; i++) {
+        if (on)  { if (s_st_env_pos < ST_RAMP_SAMPLES) s_st_env_pos++; }
+        else     { if (s_st_env_pos > 0)               s_st_env_pos--; }
+        const int32_t env = s_st_rc[(s_st_env_pos * 256u) / ST_RAMP_SAMPLES];
+
+        // Linear interpolation between table entries. Plain 8-bit phase
+        // truncation limits spurious tones to about -48 dBc, which is what
+        // made the tone sound grainy; interpolating puts them below the
+        // 10-bit output floor.
+        s_st_phase += inc;
+        const uint32_t si   = s_st_phase >> 24;                  // 0..255
+        const uint32_t sf   = (s_st_phase >> 8) & 0xFFFFu;       // fraction, Q16
+        const int32_t  s0   = s_st_sin[si];
+        const int32_t  s1   = s_st_sin[(si + 1u) & 255u];
+        const int32_t  s    = s0 + (((s1 - s0) * (int32_t)sf) >> 16);
+        const int32_t amp = (env * gain) >> 15;              // Q15
+        const int32_t v   = (s * amp) >> 15;                 // ±32767 full scale
+
+        // 16-bit sample → 10-bit PWM level with the rounding error fed back
+        // into the next sample (pushes quantisation noise above the RC corner).
+        const int32_t want = (v + 32768) * (int32_t)(ST_PWM_WRAP + 1u) + s_st_err;
+        int32_t lvl = want >> 16;
+        s_st_err = want - (lvl << 16);
+        if (lvl < 0) lvl = 0;
+        if (lvl > (int32_t)ST_PWM_WRAP) lvl = (int32_t)ST_PWM_WRAP;
+        dst[i] = (uint32_t)lvl;
+    }
+}
+
+static void __not_in_flash_func(sidetone_dma_irq)(void) {
+    for (int b = 0; b < 2; b++) {
+        if (s_st_dma[b] >= 0 && dma_channel_get_irq0_status((uint)s_st_dma[b])) {
+            dma_channel_acknowledge_irq0((uint)s_st_dma[b]);
+            sidetone_fill(s_st_buf[b]);
+            // Nothing to re-arm: the read ring wrapped the address back to the
+            // buffer start and TRANS_COUNT reloads on the next chain trigger.
+        }
+    }
+}
+
+static void sidetone_init(void) {
+    for (int i = 0; i < 256; i++) {
+        s_st_sin[i] = (int16_t)lrintf(sinf(2.0f * (float)M_PI * (float)i / 256.0f) * 32767.0f);
+    }
+    for (int i = 0; i <= 256; i++) {
+        s_st_rc[i] = (uint16_t)lrintf((1.0f - cosf((float)M_PI * (float)i / 256.0f)) * 0.5f * 32767.0f);
+    }
+
+    // Audio PWM on GP12
+    gpio_set_function(PIN_AUDIO_OUT, GPIO_FUNC_PWM);
+    s_st_slice = pwm_gpio_to_slice_num(PIN_AUDIO_OUT);
+    pwm_config c = pwm_get_default_config();
+    pwm_config_set_clkdiv(&c, 1.0f);
+    pwm_config_set_wrap(&c, ST_PWM_WRAP);
+    pwm_init(s_st_slice, &c, true);
+    pwm_set_gpio_level(PIN_AUDIO_OUT, 512);   // silence = mid-scale (DC blocked by the output cap)
+
+    // Timebase: spare slice wrapping at the sample rate; its DREQ paces the DMA.
+    const uint32_t sys_hz = clock_get_hz(clk_sys);
+    const uint32_t tb_wrap = sys_hz / ST_FS_HZ - 1u;
+    s_st_fs = sys_hz / (tb_wrap + 1u);
+    pwm_config tb = pwm_get_default_config();
+    pwm_config_set_clkdiv(&tb, 1.0f);
+    pwm_config_set_wrap(&tb, (uint16_t)tb_wrap);
+    pwm_init(ST_TB_SLICE, &tb, true);
+
+    sidetone_update_params();
+    sidetone_fill(s_st_buf[0]);
+    sidetone_fill(s_st_buf[1]);
+
+    // Two channels chained to each other; each raises IRQ0 when its half is done.
+    s_st_dma[0] = dma_claim_unused_channel(true);
+    s_st_dma[1] = dma_claim_unused_channel(true);
+    for (int b = 0; b < 2; b++) {
+        dma_channel_config dc = dma_channel_get_default_config((uint)s_st_dma[b]);
+        channel_config_set_transfer_data_size(&dc, DMA_SIZE_32);
+        channel_config_set_read_increment(&dc, true);
+        channel_config_set_write_increment(&dc, false);
+        channel_config_set_ring(&dc, false, 9);              // read wraps every 512 B = one half
+        channel_config_set_dreq(&dc, pwm_get_dreq(ST_TB_SLICE));
+        channel_config_set_chain_to(&dc, (uint)s_st_dma[b ^ 1]);
+        dma_channel_configure((uint)s_st_dma[b], &dc,
+                              &pwm_hw->slice[s_st_slice].cc,   // write: CC register (A = low 16 bits)
+                              s_st_buf[b], ST_BUF, false);
+        dma_channel_set_irq0_enabled((uint)s_st_dma[b], true);
+    }
+    irq_add_shared_handler(DMA_IRQ_0, sidetone_dma_irq, PICO_SHARED_IRQ_HANDLER_DEFAULT_ORDER_PRIORITY);
+    irq_set_enabled(DMA_IRQ_0, true);
+    dma_channel_start((uint)s_st_dma[0]);
+}
+
+// ==========================================================
+// Microphone: MAX4466 on GP26 (ADC0), free-running 8 kHz → DMA ring
+// ==========================================================
+// The ADC samples continuously at exactly WAV_SAMPLE_RATE (48 MHz ADC
+// clock / 6000) and DMA drops the 12-bit values into a 4 KB ring with
+// address wrap. Core0 reads behind the DMA write pointer, so the mic
+// paces the producer at the same rate Core1 consumes — both clocks come
+// from the same crystal, no resampler needed.
+#define PIN_MIC          26
+#define MIC_RB_SAMPLES   2048u
+#define MIC_RB_MASK      (MIC_RB_SAMPLES - 1u)
+#define MIC_DMA_COUNT    0x0FFFFFFFu          // ~9 h at 8 kHz, then re-armed
+
+static uint16_t __attribute__((aligned(4096))) s_mic_rb[MIC_RB_SAMPLES];
+static int      s_mic_dma  = -1;
+static uint32_t s_mic_rd   = 0;
+static float    s_mic_dc   = 0.0f;   // DC estimate (MAX4466 idles at VCC/2)
+static float    s_mic_env  = 0.0f;   // gate envelope
+static float    s_mic_ggain = 0.0f;  // smoothed gate gain 0..1
+static uint32_t s_mic_hold = 0;
+
+static inline uint32_t mic_wr_index(void) {
+    uint32_t addr = dma_channel_hw_addr((uint)s_mic_dma)->write_addr;
+    return ((addr - (uint32_t)(uintptr_t)s_mic_rb) / 2u) & MIC_RB_MASK;
+}
+static inline uint32_t mic_available(void) { return (mic_wr_index() - s_mic_rd) & MIC_RB_MASK; }
+static inline void     mic_flush(void)     { s_mic_rd = mic_wr_index(); }
+
+static void mic_dma_rearm_if_done(void) {
+    if (s_mic_dma >= 0 && !dma_channel_is_busy((uint)s_mic_dma)) {
+        dma_channel_set_trans_count((uint)s_mic_dma, MIC_DMA_COUNT, true);
+    }
+}
+
+// One sample, normalised to ±1: DC removal → gain → noise gate (hysteresis,
+// 300 ms hold, smoothed so it does not click). Caller checks availability.
+static float mic_get_sample(void) {
+    uint16_t raw = s_mic_rb[s_mic_rd];
+    s_mic_rd = (s_mic_rd + 1u) & MIC_RB_MASK;
+
+    float x = ((float)(raw & 0x0FFFu) - 2048.0f) / 2048.0f;
+    s_mic_dc += 0.005f * (x - s_mic_dc);           // one-pole HPF, fc ≈ 6 Hz
+    x = (x - s_mic_dc) * g_mic_gain;
+
+    float ax = fabsf(x);
+    s_mic_env += (ax > s_mic_env ? 0.2f : 0.002f) * (ax - s_mic_env);
+    const float thr = g_mic_gate;
+    bool open;
+    if (s_mic_env > thr)             { open = true;  s_mic_hold = 2400u; }
+    else if (s_mic_hold)             { open = true;  s_mic_hold--; }
+    else                             { open = (s_mic_env > thr * 0.5f) && (s_mic_ggain > 0.5f); }
+    s_mic_ggain += open ? 0.05f : -0.002f;
+    if (s_mic_ggain > 1.0f) s_mic_ggain = 1.0f;
+    if (s_mic_ggain < 0.0f) s_mic_ggain = 0.0f;
+    x *= s_mic_ggain;
+
+    if (x >  1.0f) x =  1.0f;
+    if (x < -1.0f) x = -1.0f;
+    return x;
+}
+
+static void mic_init(void) {
+    adc_init();
+    adc_gpio_init(PIN_MIC);
+    adc_select_input(0);
+    adc_set_clkdiv(48000000.0f / (float)WAV_SAMPLE_RATE - 1.0f);   // one conversion per 1/8000 s
+    adc_fifo_setup(true, true, 1, false, false);
+
+    s_mic_dma = dma_claim_unused_channel(true);
+    dma_channel_config c = dma_channel_get_default_config((uint)s_mic_dma);
+    channel_config_set_transfer_data_size(&c, DMA_SIZE_16);
+    channel_config_set_read_increment(&c, false);
+    channel_config_set_write_increment(&c, true);
+    channel_config_set_ring(&c, true, 12);          // wrap the write address every 4 KB
+    channel_config_set_dreq(&c, DREQ_ADC);
+    dma_channel_configure((uint)s_mic_dma, &c, s_mic_rb, &adc_hw->fifo, MIC_DMA_COUNT, true);
+
+    adc_run(true);
+    mic_flush();
+}
+
+static const char *audio_src_name(uint8_t s) { return s == AUDIO_SRC_MIC ? "mic" : "pc"; }
+
+static void mic_diag_print(void) {
+    uint32_t wi  = mic_wr_index();
+    uint32_t raw = s_mic_rb[wi ? wi - 1u : MIC_RB_MASK] & 0x0FFFu;   // newest ADC value (2048 = idle)
+    cdc_printf("Audio: src=%s  mic GP26: ring=%lu/%u raw=%lu gain=%.1f gate=%.3f env=%.3f gate=%s\r\n",
+               audio_src_name(g_audio_src), (unsigned long)mic_available(), (unsigned)MIC_RB_SAMPLES,
+               (unsigned long)raw, (double)g_mic_gain, (double)g_mic_gate, (double)s_mic_env,
+               s_mic_ggain > 0.5f ? "open" : "closed");
+}
+
 // Button debounce state
 static uint8_t  ok_was_pressed = 0;
 static uint32_t ok_debounce_ms = 0;
-static uint32_t ptt_debounce_ms = 0;
-static uint8_t  ptt_last_state = 0;
+static uint32_t ok_press_start_ms = 0;
+static uint8_t  ok_long_fired = 0;
 
-#define DEBOUNCE_MS         5
+// Paddle contact filter: raw level plus the time it last changed.
+static uint8_t  dit_raw_last = 0, dah_raw_last = 0;
+static uint32_t dit_raw_ms = 0,   dah_raw_ms = 0;
+
+#define DEBOUNCE_MS         5   // encoder push (lockout style is fine for a click)
+// A level is accepted only after it has been stable this long. The previous
+// lockout filter ("accept any change 5 ms after the last one") passed the
+// second half of a bounce train through as a fresh edge, which the keyer
+// latched as an extra element — audible above ~23 WPM, where one dit is only
+// ~50 ms. Kept symmetric and short on purpose: a longer release filter (as
+// upstream uses for its raw PTT) would still read "pressed" at element end
+// and trigger a spurious hold-to-repeat.
+#define KEY_DEBOUNCE_MS     4
 
 // Frequency step for encoder (Hz)
 #define ENC_FREQ_STEP_HZ   100.0
@@ -1806,17 +2715,19 @@ static void encoder_poll(void) {
                 if (f < 2400000000.0) f = 2400000000.0;
                 if (f > 2500000000.0) f = 2500000000.0;
                 g_target_freq_hz = f;
+                persist_mark_dirty();
                 if (g_tune_active) tune_apply_settings();
             }
             break;
 
         case UI_STATE_BROWSE:
-            // Move cursor between params
+            // Move cursor between the tiles of the current page
             {
-                int c = (int)g_ui_cursor + step;
-                if (c < 0) c = UI_PARAM_COUNT - 1;
-                if (c >= (int)UI_PARAM_COUNT) c = 0;
-                g_ui_cursor = (ui_param_t)c;
+                int c = (int)g_ui_cursor_idx + step;
+                if (c < 0) c = UI_TILES - 1;
+                if (c >= UI_TILES) c = 0;
+                g_ui_cursor_idx = (uint8_t)c;
+                g_ui_cursor = k_page_tiles[g_ui_page < 2 ? g_ui_page : 0][c];
             }
             break;
 
@@ -1824,7 +2735,15 @@ static void encoder_poll(void) {
             // Adjust value of selected param
             switch (g_ui_editing) {
                 case UI_PARAM_MODE:
-                    g_tx_mode = g_tx_mode ? 0 : 1;
+                    {
+                        // Cycle USB PC → USB MIC → CW (both directions)
+                        int idx = g_tx_mode ? 2 : (g_audio_src == AUDIO_SRC_MIC ? 1 : 0);
+                        idx = (idx + step + 3) % 3;
+                        g_tx_mode   = (idx == 2) ? 1 : 0;
+                        if (idx < 2) g_audio_src = (idx == 1) ? AUDIO_SRC_MIC : AUDIO_SRC_PC;
+                        tx_mode_changed();
+                        persist_mark_dirty();
+                    }
                     break;
                 case UI_PARAM_TUNE:
                     if (step > 0 && !g_tune_active) {
@@ -1835,19 +2754,26 @@ static void encoder_poll(void) {
                         // carrier_poll() will stop carrier (or keep idle if CW mode)
                     }
                     break;
-                case UI_PARAM_MENU:
-                    // Placeholder — no action yet
+                case UI_PARAM_WPM:
+                    {
+                        int w = (int)g_cw_wpm + step;
+                        if (w < 5)  w = 5;
+                        if (w > 60) w = 60;
+                        g_cw_wpm = (uint8_t)w;
+                        persist_mark_dirty();
+                    }
                     break;
                 case UI_PARAM_TX:
                     g_tx_enabled = g_tx_enabled ? 0 : 1;
                     break;
-                case UI_PARAM_PPM:
+                case UI_PARAM_VOL:
                     {
-                        float ppm = g_ppm_correction + (float)step * 0.01f;
-                        if (ppm < -50.0f) ppm = -50.0f;
-                        if (ppm >  50.0f) ppm =  50.0f;
-                        g_ppm_correction = ppm;
-                        if (g_tune_active) tune_apply_settings();
+                        int v = (int)g_st_vol + step * 5;
+                        if (v < 0)   v = 0;
+                        if (v > 100) v = 100;
+                        g_st_vol = (uint8_t)v;
+                        sidetone_update_params();
+                        persist_mark_dirty();
                     }
                     break;
                 case UI_PARAM_PWR:
@@ -1856,7 +2782,50 @@ static void encoder_poll(void) {
                         if (p < PWR_MIN_DBM) p = PWR_MIN_DBM;
                         if (p > PWR_MAX_DBM) p = PWR_MAX_DBM;
                         g_tx_power_max_dbm = p;
+                        persist_mark_dirty();
                         if (g_tune_active) tune_apply_settings();
+                    }
+                    break;
+                case UI_PARAM_KEYER:
+                    g_cw_mode = (uint8_t)(((int)g_cw_mode + step + 3) % 3);
+                    keyer_reset();
+                    persist_mark_dirty();
+                    break;
+                case UI_PARAM_RATIO:
+                    {
+                        float r = g_cw_ratio + 0.1f * (float)step;
+                        if (r < 2.0f) r = 2.0f;
+                        if (r > 5.0f) r = 5.0f;
+                        g_cw_ratio = r;
+                        persist_mark_dirty();
+                    }
+                    break;
+                case UI_PARAM_TONE:
+                    {
+                        int t = (int)g_st_hz + 10 * step;
+                        if (t < 300)  t = 300;
+                        if (t > 1200) t = 1200;
+                        g_st_hz = (uint16_t)t;
+                        sidetone_update_params();
+                        persist_mark_dirty();
+                    }
+                    break;
+                case UI_PARAM_MICGAIN:
+                    {
+                        float g = g_mic_gain + (float)step;
+                        if (g < 1.0f)  g = 1.0f;
+                        if (g > 50.0f) g = 50.0f;
+                        g_mic_gain = g;
+                        persist_mark_dirty();
+                    }
+                    break;
+                case UI_PARAM_MICGATE:
+                    {
+                        float t = g_mic_gate + 0.005f * (float)step;
+                        if (t < 0.0f) t = 0.0f;
+                        if (t > 0.5f) t = 0.5f;
+                        g_mic_gate = t;
+                        persist_mark_dirty();
                     }
                     break;
                 default: break;
@@ -1875,7 +2844,7 @@ static void button_poll(void) {
         }
     }
 
-    // --- OK button (encoder push) ---
+    // --- OK button (encoder push): short click acts on release, long press fires while held ---
     uint8_t ok_raw = gpio_get(PIN_ENC_OK) ? 0 : 1;  // Active LOW
 
     if (ok_raw != ok_was_pressed && (now_ms - ok_debounce_ms) >= DEBOUNCE_MS) {
@@ -1883,38 +2852,58 @@ static void button_poll(void) {
         ok_was_pressed = ok_raw;
 
         if (ok_raw) {
-            // Button just pressed
+            ok_press_start_ms = now_ms;
+            ok_long_fired = 0;
+        } else if (!ok_long_fired) {
+            // Short click
             ui_touch();
-
             switch (g_ui_state) {
                 case UI_STATE_IDLE:
-                    // Enter browse mode
-                    g_ui_state = UI_STATE_BROWSE;
-                    g_ui_cursor = UI_PARAM_MODE;  // start at first item
+                    if (g_ui_page == 2) {
+                        g_ui_page = 0;            // GPS page has no tiles — click returns to page 0
+                    } else {
+                        g_ui_state = UI_STATE_BROWSE;
+                        g_ui_cursor_idx = 0;
+                        g_ui_cursor = k_page_tiles[g_ui_page][0];
+                    }
                     break;
-
                 case UI_STATE_BROWSE:
-                    // Confirm selection — enter editing mode
                     g_ui_editing = g_ui_cursor;
                     g_ui_state = UI_STATE_EDITING;
                     break;
-
                 case UI_STATE_EDITING:
-                    // Deselect — back to browse mode
                     g_ui_state = UI_STATE_BROWSE;
                     break;
             }
         }
     }
-
-    // --- CW dit/dah paddles (GP9 / GP11, active LOW) ---
-    uint8_t ptt_raw = (!gpio_get(PIN_KEY_DIT)) | (!gpio_get(PIN_KEY_DAH));
-
-    if (ptt_raw != ptt_last_state && (now_ms - ptt_debounce_ms) >= DEBOUNCE_MS) {
-        ptt_debounce_ms = now_ms;
-        ptt_last_state = ptt_raw;
-        g_ptt_key = ptt_raw;
+    if (ok_was_pressed && !ok_long_fired && (now_ms - ok_press_start_ms) >= UI_LONG_PRESS_MS) {
+        // Long press: next page from IDLE, otherwise back to IDLE
+        ok_long_fired = 1;
+        ui_touch();
+        if (g_ui_state == UI_STATE_IDLE) g_ui_page = (uint8_t)((g_ui_page + 1u) % UI_PAGES);
+        else                             g_ui_state = UI_STATE_IDLE;
     }
+
+    // --- CW dit/dah paddles (GP9 / GP11, active LOW), stability-filtered ---
+    uint8_t dit_raw = !gpio_get(PIN_KEY_DIT);
+    uint8_t dah_raw = !gpio_get(PIN_KEY_DAH);
+
+    if (dit_raw != dit_raw_last) {
+        dit_raw_last = dit_raw;
+        dit_raw_ms   = now_ms;                    // bounce restarts the timer
+    } else if (dit_raw != g_key_dit && (now_ms - dit_raw_ms) >= KEY_DEBOUNCE_MS) {
+        g_key_dit = dit_raw;
+    }
+    if (dah_raw != dah_raw_last) {
+        dah_raw_last = dah_raw;
+        dah_raw_ms   = now_ms;
+    } else if (dah_raw != g_key_dah && (now_ms - dah_raw_ms) >= KEY_DEBOUNCE_MS) {
+        g_key_dah = dah_raw;
+    }
+    g_ptt_key = g_key_dit | g_key_dah;
+
+    keyer_poll();
 }
 
 // ==========================================================
@@ -1984,6 +2973,9 @@ static inline float duty_from_A(float A) {
 // CORE1: timed radio apply loop
 // ==========================================================
 static void core1_radio_apply_loop(void) {
+    // Lets Core0's flash_safe_execute() park this core during flash writes.
+    flash_safe_execute_core_init();
+
     const uint32_t sample_period_us = 1000000u / WAV_SAMPLE_RATE;
     const uint32_t substeps = (DITHER_SUBSTEPS <= 1) ? 1u : (uint32_t)DITHER_SUBSTEPS;
     const uint32_t sub_period_us = (substeps == 1) ? sample_period_us : (sample_period_us / substeps);
@@ -2154,18 +3146,42 @@ static void usb_audio_pump(void) {
     }
 }
 
-// ==========================================================
-// PIO Frequency Counter for TCXO on GP26
-// Uses PIO state machine to count edges in 1-second window
-// ==========================================================
+// Autosave 5 s after the last change, but only while nothing is on the air:
+// the ~20 ms flash erase parks Core1, which would freeze the SX1280 mid-word.
+static void persist_maybe_autosave(void) {
+    if (!g_persist_dirty) return;
+    if (g_ui_state != UI_STATE_IDLE) return;                     // still in the menu
+    if (g_tune_active || g_ptt_key || g_soft_ptt_key || g_st_test) return;   // on air or sounding
+    uint32_t now = to_ms_since_boot(get_absolute_time());
+    if ((now - g_persist_dirty_since) < 5000u) return;
+    persist_save_now();
+}
 
 // ==========================================================
+// Boot screen while waiting for the SI5351 clock
+// ==========================================================
+static void oled_draw_boot_wait(uint32_t elapsed_ms) {
+    char line[22];
+    ssd1306_clear();
+    ssd1306_draw_string(0, 0, "QO-100 TX " FW_VERSION);
+    ssd1306_draw_string(0, 1, FW_BUILD);
+    ssd1306_draw_string(0, 3, "Waiting for clock");
+    ssd1306_draw_string(0, 4, gpsdo_si5351_ok() ? "SI5351: PLL unlocked"
+                                                : "SI5351: NOT FOUND");
+    snprintf(line, sizeof(line), "%lus", (unsigned long)(elapsed_ms / 1000u));
+    ssd1306_draw_string(0, 6, line);
+    ssd1306_display(OLED_I2C);
+}
+
 // ==========================================================
 // MAIN (CORE0): init + DSP producer
 // ==========================================================
 int main(void) {
     bool ok = set_sys_clock_khz(250000, false);
     if (!ok) set_sys_clock_khz(200000, true);
+
+    // Restore saved config before anything displays or uses it.
+    persist_load();
 
     // ---- USB device init ----
     board_init();
@@ -2202,6 +3218,11 @@ int main(void) {
     // Initialize encoder last state
     enc_last_ab = ((gpio_get(PIN_ENC_A) ? 0 : 1) << 1) | (gpio_get(PIN_ENC_B) ? 0 : 1);
 
+    // --- Sidetone PWM (GP12) — starts silent at mid-scale ---
+    sidetone_init();
+    // --- Microphone ADC (GP26) — runs continuously, used only when src=mic ---
+    mic_init();
+
     spi_init(SX_SPI, SX_SPI_BAUD);
     gpio_set_function(PIN_MISO, GPIO_FUNC_SPI);
     gpio_set_function(PIN_MOSI, GPIO_FUNC_SPI);
@@ -2215,27 +3236,35 @@ int main(void) {
     gpio_pull_up(PIN_OLED_SDA);
     gpio_pull_up(PIN_OLED_SCL);
     ssd1306_init(OLED_I2C);
-    ssd1306_clear();
-    ssd1306_draw_string(0, 0, "SX1280 SSB TX");
-    ssd1306_draw_string(0, 2, "Waiting GPSDO..");
-    ssd1306_display(OLED_I2C);
+    oled_draw_boot_wait(0u);
 
     // ---- GPSDO: SI5351 52 MHz (I2C0, GP0/GP1) + NEO-7M GPS (UART1, GP4/GP5) ----
-    // SX1280 NRESET is held LOW above. Released only after GPSDO is ready.
+    // Stage 1 (blocking): wait for a locked 52 MHz clock from the SI5351. The
+    // SX1280 has no other clock source, so NRESET stays LOW until then.
+    // Stage 2 (non-blocking): GPS discipline (UTC) only gates TX via
+    // tx_allowed() — the UI, CDC and OLED run normally while GPS acquires.
     gpsdo_init();
     {
+        const uint32_t boot_ms = to_ms_since_boot(get_absolute_time());
         uint32_t last_status_ms  = 0u;
+        uint32_t last_oled_ms    = 0u;
         uint8_t  si_warn_printed = 0u;
-        while (!gpsdo_is_ready()) {
+        while (!gpsdo_clock_ok()) {
             gpsdo_task();
             tud_task();
-            cdc_task();   // allow 'gpsdo' command while waiting
+            cdc_task();   // allow 'gpsdo' / 'version' while waiting
             uint32_t now_ms = to_ms_since_boot(get_absolute_time());
+            // 1 s cadence: ssd1306_display() blocks ~100 ms on I2C at 100 kHz,
+            // and only the seconds counter changes anyway.
+            if ((now_ms - last_oled_ms) >= 1000u) {
+                last_oled_ms = now_ms;
+                oled_draw_boot_wait(now_ms - boot_ms);
+            }
             if (tud_cdc_connected()) {
                 if (!si_warn_printed && !gpsdo_si5351_ok()) {
                     si_warn_printed = 1u;
                     cdc_write_str("GPSDO: WARNING — SI5351 not found (GP0/GP1).\r\n"
-                                  "GPSDO: SX1280 will NOT start until SI5351 is connected.\r\n");
+                                  "GPSDO: SX1280 has no clock and will NOT start until SI5351 is connected.\r\n");
                 }
                 if ((now_ms - last_status_ms) >= 2000u) {
                     last_status_ms = now_ms;
@@ -2247,7 +3276,8 @@ int main(void) {
             }
         }
         if (tud_cdc_connected()) {
-            cdc_write_str("GPSDO: READY — 52 MHz locked, GPS time valid. Starting SX1280.\r\n");
+            cdc_write_str("GPSDO: 52 MHz clock locked — starting SX1280. "
+                          "TX stays blocked until GPS UTC is valid (see 'gpsgate').\r\n");
         }
     }
 
@@ -2294,12 +3324,20 @@ int main(void) {
     {
         printf("[BOOT] Waiting for USB connection (encoder+CW active)...\n");
         absolute_time_t oled_next = {0};
+        // Powerbank / standalone: no host within 3 s → carry on without one.
+        // TinyUSB keeps running, so a PC plugged in later still enumerates.
+        absolute_time_t usb_deadline = make_timeout_time_ms(3000);
 
         while (!tud_ready()) {
+            if (absolute_time_diff_us(get_absolute_time(), usb_deadline) <= 0) {
+                printf("[BOOT] No USB host — standalone operation\n");
+                break;
+            }
             tud_task();
             encoder_poll();
             button_poll();
             carrier_poll();
+            gpsdo_task();
 
             // OLED refresh during wait
             if (!ssd1306_dma_busy() &&
@@ -2395,6 +3433,16 @@ int main(void) {
             encoder_poll();
             button_poll();
             carrier_poll();
+            persist_maybe_autosave();
+
+            // GPS UART must be drained here too: with the mode persisted the
+            // device can boot straight into CW and never reach the SSB path.
+            gpsdo_task();
+            if (gpsdo_status_due()) {
+                char gbuf[128];
+                gpsdo_format_status(gbuf, sizeof(gbuf));
+                cdc_write_str(gbuf);
+            }
 
 #if CFG_TUD_CDC
             cdc_task();
@@ -2425,6 +3473,8 @@ int main(void) {
             encoder_poll();
             button_poll();
             carrier_poll();
+            persist_maybe_autosave();
+            gpsdo_task();   // 32-byte UART FIFO fills in ~33 ms at 9600 baud — keep draining
 
 #if CFG_TUD_CDC
             cdc_status_push();
@@ -2436,7 +3486,9 @@ int main(void) {
 #if CFG_TUD_CDC
         if (!greeted && tud_cdc_connected()) {
             greeted = 1;
-            cdc_write_str("\r\nSX1280_SDR control ready. Type 'help'.\r\n");
+            cdc_write_str("\r\nSX1280_SDR control ready. FW " FW_VERSION " built " FW_BUILD ". Type 'help'.\r\n");
+            cdc_write_str(g_persist_loaded ? "Config: restored from flash.\r\n"
+                                           : "Config: compile-time defaults (nothing valid in flash).\r\n");
             cfg_print();
         }
 
@@ -2480,6 +3532,33 @@ int main(void) {
         // Get current base steps (with freq and PPM correction) at block boundary
         int32_t base_steps = (int32_t)get_base_steps();
 
+        // --- Audio source for this block ---
+        const uint8_t src = g_audio_src;
+        {
+            static uint8_t last_src = AUDIO_SRC_PC;
+            if (src != last_src) {
+                if (src == AUDIO_SRC_MIC) mic_flush();   // drop whatever piled up while unused
+                last_src = src;
+            }
+        }
+        if (src == AUDIO_SRC_MIC) {
+            // Paced by the ADC: wait for a full block of mic samples, keeping
+            // USB/UI/keyer alive meanwhile. Bail out if the mode or source changes.
+            mic_dma_rearm_if_done();
+            bool bail = false;
+            while (mic_available() < BLOCK_SAMPLES) {
+                usb_audio_pump();
+                encoder_poll();
+                button_poll();
+                carrier_poll();
+                persist_maybe_autosave();
+                gpsdo_task();
+                if (g_cw_test_mode || g_audio_src != AUDIO_SRC_MIC) { bail = true; break; }
+                tight_loop_contents();
+            }
+            if (bail) continue;
+        }
+
         sample_cmd_t *blk = g_blocks[b];
 
         for (uint32_t n = 0; n < BLOCK_SAMPLES; n++) {
@@ -2501,8 +3580,12 @@ int main(void) {
             if (sine_phase1 > 2.0f * (float)M_PI) sine_phase1 -= 2.0f * (float)M_PI;
 #endif
 #else
-            int16_t s = usb_audio_get_mono_8k();
-            x = (float)s / 32768.0f;
+            if (src == AUDIO_SRC_MIC) {
+                x = mic_get_sample();
+            } else {
+                int16_t s = usb_audio_get_mono_8k();
+                x = (float)s / 32768.0f;
+            }
 
             if (fabsf(x) < 1e-5f) {
                 if (silence_ctr < silence_samples) silence_ctr++;
@@ -2644,8 +3727,8 @@ int main(void) {
                 if (p_acc >= 1.0f && p_high != p_low) { p_chosen = p_high; p_acc -= 1.0f; }
             }
 
-            // Check global TX enable flag (from GUI TX button)
-            if (!g_tx_enabled) {
+            // Global TX enable (GUI TX button) and GPS gate
+            if (!g_tx_enabled || !tx_allowed()) {
                 tx_on = 0;
             }
 
