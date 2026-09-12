@@ -42,6 +42,7 @@
 #define GPSDO_GSV_FRESH_MS  10000u
 #define GPSDO_SI5351_POLL_MS 30000u   // SI5351 reg-0 re-read interval once locked
 #define GPSDO_SI5351_FAST_POLL_MS 500u // ... while still waiting for PLL lock at boot
+#define GPSDO_LOST_MS       10000u    // no fix for this long after having had one = signal lost
 #define GPSDO_NMEA_BUF      128u
 #define GPSDO_BOOT_DELAY_MS 300u      // wait before sending UBX commands
 
@@ -212,6 +213,7 @@ static bool     s_nmeaOverflow    = false;
 static uint32_t s_lastNmeaMs      = 0;
 static uint32_t s_lastTimeMs      = 0;
 static uint32_t s_lastGgaMs       = 0;
+static uint32_t s_lastGoodMs      = 0;       // last moment with SI5351 lock AND a position fix
 static uint32_t s_lastPrintMs     = 0;
 static uint32_t s_uartBytesRx     = 0;   // raw bytes received from GPS UART
 static uint32_t s_nmeaCount       = 0;   // valid NMEA sentences parsed
@@ -616,6 +618,13 @@ void gpsdo_task(void)
     // one satellite — the TIMEPULSE 24 MHz is now frequency-accurate.
     // Without UTC the GPS runs on its free-running TCXO (±2.5 ppm = ±6 kHz at 2.4 GHz).
     const bool utc_valid = (s_utc[0] != '-');
+    // Remember the last moment everything was actually good, so a lock that
+    // is lost later can be reported (s_gpsdoReady itself never falls back:
+    // the SX1280 keeps running on the free-wheeling TIMEPULSE).
+    if (si_locked_now() && s_fixQuality > 0 && s_satsUsed >= 3) {
+        s_lastGoodMs = gpsdo_ms();
+    }
+
     if (!s_gpsdoReady && si_locked_now() && utc_valid) {
         s_gpsdoReady = true;
         printf("[GPSDO] READY — SI5351 locked + GPS UTC received, TX enabled\n");
@@ -625,6 +634,12 @@ void gpsdo_task(void)
 bool gpsdo_clock_ok(void)
 {
     return si_locked_now();
+}
+
+bool gpsdo_signal_lost(void)
+{
+    if (s_lastGoodMs == 0u) return false;                     // never had a fix — not "lost"
+    return (gpsdo_ms() - s_lastGoodMs) >= GPSDO_LOST_MS;
 }
 
 bool gpsdo_is_ready(void)

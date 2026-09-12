@@ -36,6 +36,12 @@ bool gpsdo_clock_ok(void);
 // This is the condition for allowing transmission.
 bool gpsdo_is_ready(void);
 
+// True when a position fix existed earlier but has been gone for a while.
+// gpsdo_is_ready() deliberately stays true in that case — the SX1280 keeps
+// running on the now free-wheeling TIMEPULSE — so this is what the display
+// uses to warn that the reference is drifting.
+bool gpsdo_signal_lost(void);
+
 // Returns true if the SI5351 was found and CLK1 is running.
 // False means SI5351 is not connected or not responding.
 bool gpsdo_si5351_ok(void);

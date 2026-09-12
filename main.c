@@ -215,6 +215,14 @@ static volatile uint8_t  g_persist_dirty       = 0;  // something worth saving c
 static volatile uint32_t g_persist_dirty_since = 0;  // ms of last change
 static uint8_t           g_persist_loaded      = 0;  // 1 = boot config came from flash
 
+// Last moment the PA was actually driven — SSB block, CW element or TUNE.
+// A flash write parks Core1 for ~20 ms, so autosave waits until the radio
+// has been quiet for a while.
+static volatile uint32_t g_tx_activity_ms = 0;
+static inline void tx_activity_mark(void) {
+    g_tx_activity_ms = to_ms_since_boot(get_absolute_time());
+}
+
 // The main loop autosaves after an idle period, so knob turns don't erase flash repeatedly.
 static inline void persist_mark_dirty(void) {
     g_persist_dirty = 1;
@@ -261,6 +269,12 @@ static volatile uint8_t    g_ui_cursor_idx = 0;            // tile index on the 
 static volatile ui_param_t g_ui_cursor = UI_PARAM_MODE;    // param under the cursor (derived)
 static volatile ui_param_t g_ui_editing = UI_PARAM_MODE;   // which param is being edited
 static volatile uint32_t   g_ui_last_activity_ms = 0;      // for auto-timeout
+static volatile uint8_t    g_oled_flip = 0;                // 180 degree rotation
+
+// Blink phase for warnings on the display (2 Hz; the panel refreshes at 5 fps)
+static inline bool ui_blink(void) {
+    return ((to_ms_since_boot(get_absolute_time()) / 500u) & 1u) != 0u;
+}
 
 // --- Hilbert ---
 #define HILBERT_TAPS        247
@@ -874,6 +888,7 @@ static void carrier_poll(void) {
 
     bool need_idle    = mode_cw || tune;
     bool need_carrier = tx_allowed() && (tune || (mode_cw && key));
+    if (need_carrier) tx_activity_mark();
 
     uint32_t now = to_ms_since_boot(get_absolute_time());
 
@@ -1347,6 +1362,7 @@ static void cmd_help(void) {
         "  gpsgate 0|1   - 1: TX only with GPS UTC (default); 0: override for bench tests\r\n"
         "  save          - write freq/ppm/txpwr/mode/DSP to flash now (autosaves 5 s after idle)\r\n"
         "  defaults      - restore compile-time defaults and save\r\n"
+        "  oled flip 0|1 - rotate the display by 180 degrees\r\n"
         "  src pc|mic    - audio source: USB from PC, or MAX4466 mic on GP26\r\n"
         "  mic [gain <1..50> | gate <0..0.5>] - mic gain and noise-gate threshold\r\n"
         "  keyer [wpm <5..60> | mode <straight|a|b> | ratio <2..5>] - on-device paddle keyer\r\n"
@@ -1400,7 +1416,7 @@ static void cfg_commit(const audio_cfg_t *c) {
 // GPS gate, soft key) is deliberately volatile and resets at boot.
 #define CFG_FLASH_OFFSET   (PICO_FLASH_SIZE_BYTES - FLASH_SECTOR_SIZE)
 #define CFG_MAGIC          0x51303130u   // 'Q010'
-#define CFG_VERSION        3u            // bump whenever persist_cfg_t layout changes
+#define CFG_VERSION        4u            // bump whenever persist_cfg_t layout changes
 
 typedef struct __attribute__((packed)) {
     uint32_t    magic;
@@ -1417,6 +1433,8 @@ typedef struct __attribute__((packed)) {
     uint8_t     audio_src;       // AUDIO_SRC_*
     float       mic_gain;
     float       mic_gate;
+    uint8_t     oled_flip;
+    uint8_t     _reserved[7];    // future fields fit here without a version bump
     audio_cfg_t dsp;
     uint32_t    crc32;           // over everything above
 } persist_cfg_t;
@@ -1456,6 +1474,7 @@ static void persist_collect(persist_cfg_t *c) {
     c->audio_src      = g_audio_src;
     c->mic_gain       = g_mic_gain;
     c->mic_gate       = g_mic_gate;
+    c->oled_flip      = g_oled_flip;
     __compiler_memory_barrier();
     memcpy(&c->dsp, (const void *)&g_cfg, sizeof(c->dsp));
     __compiler_memory_barrier();
@@ -1491,6 +1510,7 @@ static void persist_apply(const persist_cfg_t *c) {
     float mg = c->mic_gain, mt = c->mic_gate;
     g_mic_gain = (mg >= 1.0f && mg <= 50.0f) ? mg : 10.0f;
     g_mic_gate = (mt >= 0.0f && mt <= 0.5f)  ? mt : 0.02f;
+    g_oled_flip = c->oled_flip ? 1 : 0;
 
     audio_cfg_t d = c->dsp;
     cfg_sanitize(&d, (float)WAV_SAMPLE_RATE);
@@ -1675,6 +1695,7 @@ static void cdc_handle_line(char *line) {
         g_audio_src        = AUDIO_SRC_PC;
         g_mic_gain         = 10.0f;
         g_mic_gate         = 0.02f;
+        if (g_oled_flip) { g_oled_flip = 0; ssd1306_set_flip(OLED_I2C, false); }
         keyer_reset();
         cfg_commit(&k_cfg_defaults);
         if (g_tune_active) tune_apply_settings();
@@ -1711,6 +1732,23 @@ static void cdc_handle_line(char *line) {
         }
         cdc_printf("OK mic gain=%.1f gate=%.3f\r\n", (double)g_mic_gain, (double)g_mic_gate);
         mic_diag_print();
+        return;
+    }
+    // Display orientation: oled flip 0|1
+    if (streqi(argv[0], "oled")) {
+        if (argc >= 3 && streqi(argv[1], "flip")) {
+            uint8_t v;
+            if (!parse_bool(argv[2], &v)) { cdc_write_str("ERR: oled flip 0|1\r\n"); return; }
+            if (v != g_oled_flip) {
+                g_oled_flip = v;
+                ssd1306_set_flip(OLED_I2C, v != 0);
+                persist_mark_dirty();
+            }
+        } else if (argc >= 2) {
+            cdc_write_str("ERR: oled flip 0|1\r\n");
+            return;
+        }
+        cdc_printf("OK oled flip=%u\r\n", (unsigned)g_oled_flip);
         return;
     }
     if (streqi(argv[0], "version") || streqi(argv[0], "ver")) {
@@ -2092,14 +2130,19 @@ static void oled_prepare_frame(void) {
         ssd1306_draw_string_2x(0, 4, gi.utc_hhmm);        // "12:34"  x 0..59,  y 32..47
         ssd1306_draw_string_bold_y(66, 34, gi.date);       // right column, 10 chars = 60 px
         ssd1306_draw_string_bold_y(66, 43, gi.locator);
-        snprintf(line, sizeof(line), "UTC  sat %u/%u %s %dm",
-                 (unsigned)gi.sats_used, (unsigned)gi.sats_vis, gi.fix ? "fix" : "--", (int)gi.alt_m);
+        if (gpsdo_signal_lost() && ui_blink()) {
+            snprintf(line, sizeof(line), "UTC  GPS SIGNAL LOST");
+        } else {
+            snprintf(line, sizeof(line), "UTC  sat %u/%u %s %dm",
+                     (unsigned)gi.sats_used, (unsigned)gi.sats_vis, gi.fix ? "fix" : "--", (int)gi.alt_m);
+        }
         ssd1306_draw_string_bold_y(0, 55, line);
         return;
     }
 
-    // --- Separator line at y=32 (tile pages) ---
-    ssd1306_hline(0, 127, 32);
+    // --- Separator at y=32; flashes as a bar while the GPS fix is lost ---
+    if (gpsdo_signal_lost() && ui_blink()) ssd1306_fill_rect(0, 31, 127, 33);
+    else                                   ssd1306_hline(0, 127, 32);
 
     // --- Pages 0/1: 2 columns × 3 rows, all navigable ---
     // Vertical divider at x=63
@@ -2149,7 +2192,9 @@ static void oled_prepare_frame(void) {
         DRAW_L(ROW2_Y, wpm_buf, UI_PARAM_WPM);
 
         const char *tx_label;
-        if (!tx_allowed()) {
+        if (gpsdo_signal_lost() && ui_blink()) {
+            tx_label = "GPS LOST";
+        } else if (!tx_allowed()) {
             tx_label = "WAIT GPS";
         } else if (g_tx_mode == 1 && (g_keyer_key | g_soft_ptt_key)) {
             tx_label = "KEY";
@@ -3148,11 +3193,17 @@ static void usb_audio_pump(void) {
 
 // Autosave 5 s after the last change, but only while nothing is on the air:
 // the ~20 ms flash erase parks Core1, which would freeze the SX1280 mid-word.
+#define TX_QUIET_BEFORE_SAVE_MS 2000u
+
 static void persist_maybe_autosave(void) {
     if (!g_persist_dirty) return;
     if (g_ui_state != UI_STATE_IDLE) return;                     // still in the menu
     if (g_tune_active || g_ptt_key || g_soft_ptt_key || g_st_test) return;   // on air or sounding
     uint32_t now = to_ms_since_boot(get_absolute_time());
+    // Never write flash during a transmission — the ~20 ms erase parks Core1
+    // and would freeze the SX1280 mid-word. Covers SSB, CW and TUNE alike:
+    // between two CW elements the key is up, but tx_activity_ms is not stale yet.
+    if ((now - g_tx_activity_ms) < TX_QUIET_BEFORE_SAVE_MS) return;
     if ((now - g_persist_dirty_since) < 5000u) return;
     persist_save_now();
 }
@@ -3236,6 +3287,7 @@ int main(void) {
     gpio_pull_up(PIN_OLED_SDA);
     gpio_pull_up(PIN_OLED_SCL);
     ssd1306_init(OLED_I2C);
+    if (g_oled_flip) ssd1306_set_flip(OLED_I2C, true);   // persist_load() ran before this
     oled_draw_boot_wait(0u);
 
     // ---- GPSDO: SI5351 52 MHz (I2C0, GP0/GP1) + NEO-7M GPS (UART1, GP4/GP5) ----
@@ -3560,6 +3612,7 @@ int main(void) {
         }
 
         sample_cmd_t *blk = g_blocks[b];
+        uint8_t blk_tx = 0;   // did this block actually drive the PA?
 
         for (uint32_t n = 0; n < BLOCK_SAMPLES; n++) {
             if ((n & 0x07u) == 0u) usb_audio_pump();
@@ -3735,7 +3788,9 @@ int main(void) {
             blk[n].freq_steps = cur_steps;
             blk[n].p_dbm      = (int8_t)p_chosen;
             blk[n].tx_on      = tx_on;
+            blk_tx |= tx_on;
         }
+        if (blk_tx) tx_activity_mark();
 
         __compiler_memory_barrier();
         g_block_ready[b] = 1;

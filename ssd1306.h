@@ -51,6 +51,10 @@ void ssd1306_draw_string_bold_y_inv(int x, int y, const char *str, int field_w);
 void ssd1306_draw_string_2x(int x, int page, const char *str);
 
 // Set a pixel in the buffer
+// Rotate the panel by 180 degrees (segment remap + COM scan direction).
+// Waits for any pending DMA transfer so the command does not collide with it.
+void ssd1306_set_flip(i2c_inst_t *i2c, bool flip);
+
 void ssd1306_set_pixel(int x, int y, bool on);
 
 // Draw a horizontal line
