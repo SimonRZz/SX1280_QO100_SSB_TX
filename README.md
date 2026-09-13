@@ -9,7 +9,6 @@ A 2.4 GHz uplink transmitter for the QO-100 geostationary amateur radio satellit
 built around the Semtech SX1280 LoRa chip and a Raspberry Pi Pico 2.
 
 This is a fork of [SP8ESA's SX1280_QO100_SSB_TX](https://github.com/SP8ESA/SX1280_QO100_SSB_TX).
-The README has not yet been fully updated — the relevant work is in the code.
 
 ---
 
@@ -17,14 +16,19 @@ The README has not yet been fully updated — the relevant work is in the code.
 
 - **GPS-disciplined oscillator (GPSDO)** integrated directly into the Pico firmware —
   no separate Arduino Nano required
-- **Transmit lock on GPS fix**: the transmitter does not start until the NEO-7M has
-  acquired enough satellites and the timepulse is stable
 - **Rock-stable frequency**: GPS-locked reference eliminates the thermal drift of the
-  SX1280's internal TCXO, making SSB fully usable
-- **CW keyer** with iambic A/B and straight key support — connect a key via a
-  TTL-to-USB adapter and operate directly from the GUI
-- **GPSDO status tab** in the Python GUI showing satellite count, lock status and
-  timepulse frequency
+  SX1280's internal TCXO, making SSB and narrow digital modes fully usable
+- **Two-stage transmit lock**: the radio starts as soon as the 52 MHz reference is
+  locked, but transmission stays blocked until GPS delivers UTC
+- **CW keyer in the firmware** — iambic A/B and straight key, keyed from a paddle
+  plugged straight into the Pico. No PC involved.
+- **Sidetone on headphones**, generated on the Pico
+- **Microphone input** for SSB without a computer
+- **OLED display and rotary encoder** — frequency, mode, keyer and audio settings,
+  GPS time and locator, all on the device
+- **Settings survive a power cycle**, stored in flash
+- **Runs without a computer** — or with the Python GUI, which adds a GPSDO tab,
+  a CW keyer tab and a debugging console
 
 ---
 
@@ -67,34 +71,91 @@ NEO-7M TIMEPULSE pin: 24 MHz  →  SI5351 XA pin  →  CLK1: 52 MHz  →  100 Ω
    replacing the crystal.
 3. The SI5351 synthesizes **52 MHz** from this GPS-locked reference via its PLL.
 4. The 52 MHz signal is fed via a **100 Ω series resistor** into the **XTA pin of the
-   SX1280**, replacing its internal TCXO (which must also be desoldered; TCXO mode is
-   kept permanently enabled via GP22 HIGH). No external coupling capacitor is needed —
-   the SX1280 has one internally behind the XTA pin.
+   SX1280**, replacing its internal TCXO (which must also be desoldered). No external
+   coupling capacitor is needed — the SX1280 has one internally behind the XTA pin.
 
 The GPSDO logic (UBX configuration, satellite count polling, timepulse validation) runs
 directly on the Pico — the Arduino Nano from the original CT2GQV design is not needed.
 
-**The transmitter will not activate until the GPS module reports a valid fix with
-sufficient satellites.** The GPSDO tab in the GUI shows live lock status.
+### Two-stage startup
+
+The SX1280 has **no clock of its own** in this build, so the firmware separates two
+conditions that are easy to confuse:
+
+| Stage | Condition | Effect |
+|---|---|---|
+| Clock present | SI5351 locked, 52 MHz running | SX1280 released from reset, device fully operable |
+| GPS disciplined | GPS has delivered UTC | **Transmission released** |
+
+This matters because the NEO-7M keeps emitting its 24 MHz timepulse even without a
+satellite fix — from its own free-running oscillator, at ±2.5 ppm, which is roughly
+**±6 kHz at 2.4 GHz**. On the QO-100 narrowband transponder that would land on someone
+else, so transmission waits for real GPS time. The display shows `WAIT GPS` until then.
+
+If the fix is acquired and later lost, the display blinks a warning and the GUI reports
+it — the reference is then drifting again, even though the transmitter keeps working.
+
+For bench testing into a dummy load, `gpsgate 0` overrides the transmit lock. It is
+deliberately not saved and resets to enabled on every boot.
 
 ![GPSDO Tab](img/GPSDO%20Tab.jpg)
 
 ---
 
-## CW Keyer
+## CW
 
-A CW keyer is built into the firmware and exposed in the Python GUI. To use it:
+### Keyer in the firmware
 
-1. Connect a straight key or iambic paddle to a **TTL-to-USB serial adapter**
-   (e.g. CH340, CP2102). The key contacts connect to the DTR/RTS lines of the adapter.
-2. Plug the adapter into the PC running the GUI.
-3. Open the **CW Keyer tab**, select the correct serial port, and choose keyer mode
-   (Straight / Iambic A / Iambic B) and speed (WPM).
-4. The GUI reads the key state and controls the SX1280 carrier accordingly via the Pico.
+A paddle or straight key plugs **directly into the Pico** (3.5 mm jack: tip = dit,
+ring = dah, sleeve = ground). Element timing runs on the device, so CW works with no
+computer attached.
 
-Sidetone is generated in software through the PC audio output.
+- Modes: **Straight / Iambic A / Iambic B**
+- Speed 5–60 WPM, adjustable dah ratio (2.0–5.0)
+- Contact-bounce filtering and hold-to-repeat that behaves like a Curtis or K1EL keyer
+- **Click-free keying**: the carrier ramps 1 dB per 160 µs rather than switching hard
+- A **sidetone on the headphone output**, with adjustable pitch and volume
+- The firmware also decodes what it keys and reports it to the GUI — useful for
+  checking your own timing
+
+Speed, mode and sidetone are reachable from the OLED menu or over the serial console
+(`keyer wpm 22`, `keyer mode b`, `keyer tone 700`, `keyer vol 20`).
+
+### Keyer on the PC
+
+The original approach still works alongside: connect a key to a **TTL-to-USB serial
+adapter** (CH340, CP2102), open the **CW Keyer tab** in the GUI, select the port,
+mode and speed. Sidetone then comes from the PC audio output. Useful if you prefer to
+operate from the computer, or want to send text from the GUI.
 
 ![Keyer Tab](img/CW%20Keyer%20Tab.jpg)
+
+---
+
+## Standalone operation
+
+With display, encoder, paddle, microphone and headphones connected, the transmitter
+needs no computer at all. It also boots without a USB host.
+
+**Encoder:**
+- **Turn** — frequency, 100 Hz per step
+- **Short press** — browse the six tiles of the current page; press again to edit a
+  value, turn to change it, press to leave
+- **Long press (½ s)** — next page
+
+**Pages:**
+
+| Page | Contents |
+|---|---|
+| Operating | Mode (USB PC / USB MIC / CW), TUNE, WPM, TX state, sidetone volume, power |
+| CW & audio | Keyer mode, dah ratio, WPM, sidetone pitch, microphone gain, noise gate |
+| GPS & time | UTC, date, Maidenhead locator, satellites, fix state, altitude |
+
+The frequency stays visible on all pages. Sidetone pitch and volume are audible while
+being edited. Settings are written to flash a few seconds after the last change —
+never while transmitting, since a flash write briefly stalls the core driving the SX1280.
+
+`oled flip 1` rotates the display by 180° if it is mounted upside down.
 
 ---
 
@@ -110,6 +171,16 @@ Sidetone is generated in software through the PC audio output.
 | SI5351 breakout board | Crystal will be removed |
 | Helix antenna (3D printed) | See below; or use a dish or Yagi |
 | External PA (optional) | Needed without a large dish for CW and SSB |
+
+### Optional, for standalone operation
+
+| Part | Notes |
+|---|---|
+| SSD1306 OLED 128×64 | **0.96"** — the common 1.3" panels usually carry an SH1106 controller and will not work with this driver |
+| Rotary encoder | KY-040 or similar, with push button. Supply from 3V3, never 5 V |
+| CW paddle or straight key | 3.5 mm stereo jack |
+| MAX4466 microphone module | Electret mic with amplifier, for SSB without a PC |
+| Headphones | 3.5 mm jack plus three passive parts — no amplifier needed |
 
 **Why the NEO-7M specifically?** Cheap GPS modules output only NMEA sentences and do
 not support the UBX binary protocol. The NEO-7M supports `UBX-CFG-TP5`, which allows
@@ -129,7 +200,7 @@ GP18 (SPI0 SCK)    ───────── SCK
 GP19 (SPI0 MOSI)   ───────── MOSI
 GP20               ───────── NRESET
 GP21               ───────── BUSY
-GP22               ───────── TCXO_EN (permanently HIGH)
+GP22               ───────── TCXO_EN  (see note)
 GP14               ───────── RX_EN
 GP15               ───────── TX_EN
 3V3                ───────── VCC
@@ -147,6 +218,28 @@ Crystal: DESOLDER
 NEO-7M TIMEPULSE pin  ──────── SI5351 XA pin
 (24 MHz GPS reference; replaces SI5351 crystal)
 
+OLED SSD1306 (I2C1)          Rotary encoder (KY-040)
+===================          =======================
+GP6  (I2C1 SDA)    ── SDA   GP2   ── CLK
+GP7  (I2C1 SCL)    ── SCL   GP3   ── DT
+3V3                ── VCC   GP10  ── SW
+GND                ── GND   3V3   ── +     (NOT 5 V)
+                            GND   ── GND
+
+CW key jack (3.5 mm)         Microphone (MAX4466)
+====================         ====================
+GP9   ── Tip   (dit)         GP26 (ADC0) ── OUT
+GP11  ── Ring  (dah)         3V3         ── VCC
+GND   ── Sleeve              GND         ── GND
+
+Headphone output (3.5 mm)
+=========================
+GP12 ──[ 100 Ω ]──┬──[ 10 µF ]──[ 220 Ω ]──► Tip + Ring
+                  │   + towards GP12
+               [ 100 nF ]
+                  │
+                 GND ──────────────────────► Sleeve
+
 Optional: Decoupling
 ====================
 SI5351  VCC:   100 nF ceramic directly at VCC pin
@@ -155,6 +248,18 @@ SPI lines:     33 Ω series resistors on SCK/MOSI (reduce ringing)
 I2C lines:     4.7 kΩ pull-up resistors on SDA/SCL (if not on breakout)
 CLK1 → XTA:   100 Ω series resistor; shield wire or short coax run recommended
 ```
+
+> **Do not connect DIO1.** The upstream project wires it to GP5; here GP5 is the GPS
+> UART receive line. The firmware never uses DIO1 — the SX1280 is polled via BUSY.
+
+> **About GP22 / TCXO_EN.** The firmware is built with `USE_TCXO_MODULE 0`, because the
+> reference comes from the SI5351 rather than the module TCXO. In that configuration the
+> firmware does not drive GP22 at all. If your board still needs TCXO_EN high, tie it
+> high in hardware.
+
+> **Headphone levels.** 0.7 mW into 32 Ω is already around 98 dB — start at
+> `keyer vol 15`. The 10 µF capacitor is an electrolytic: plus towards the Pico, where
+> the output idles at 1.65 V.
 
 ---
 
@@ -179,8 +284,7 @@ The design used here is based on
 
 <img src="img/si5351.JPG" width="300">
 
-- **Desolder the TCXO from the SX1280 module.** Keep GP22 permanently HIGH to hold
-  the SX1280 in TCXO mode. Never issue a `tcxo 0` command.
+- **Desolder the TCXO from the SX1280 module.**
 
 <img src="img/SX1280f27_TCXO_removal.JPG" width="300">
 
@@ -228,6 +332,9 @@ This produces a `.uf2` file in the `build/` directory.
 2. Copy the `.uf2` file from the `/build/` directory onto it.
 3. The Pico reboots and starts running immediately.
 
+The running build identifies itself on the OLED boot screen, in the serial greeting and
+via the `version` command — handy when several builds are in circulation.
+
 ### Start the GUI
 
 ```bash
@@ -240,12 +347,33 @@ python3 gui.py
 
 The GUI provides:
 
-- **Frequency tuning**
-- **SSB transmit** via PC microphone
-- **GPSDO tab**: live satellite count, lock status, timepulse frequency.
-  Transmit is blocked until a valid GPS fix is confirmed.
-- **CW keyer tab**: select serial port, keyer mode (Straight / Iambic A / Iambic B),
-  speed in WPM. Connect a paddle or straight key via any TTL-to-USB adapter.
+- **Frequency tuning** — uplink and downlink sliders, linked through the transponder LO
+- **SSB transmit** via PC audio, with the full DSP chain (bandpass, equalizer, compressor)
+- **GPSDO tab**: live satellite count, lock status, UTC, locator. Transmit is blocked
+  until a valid GPS fix is confirmed, and a lost fix is reported.
+- **CW keyer tab**: PC-side keyer via TTL-to-USB adapter, plus settings and a live view
+  of the on-device keyer — paddle contacts, key state and decoded text
+- **Console**: timestamped send/receive log with colour coding, filters, command history
+  and log export — the first place to look when something misbehaves
+
+---
+
+## Serial commands
+
+Everything the GUI does is also available over the USB serial port. `help` lists all
+commands; the most useful ones:
+
+| Command | Description |
+|---|---|
+| `get` / `version` / `diag` | Configuration, firmware build, full diagnostics |
+| `gpsdo` | GPS status line |
+| `gpsgate 0/1` | Transmit lock override for bench tests (not saved) |
+| `freq <Hz>` / `ppm <v>` / `txpwr <dBm>` | Frequency, correction, power |
+| `mode usb/cw` / `tx 0/1` / `tune 0/1` | Mode and transmit control |
+| `keyer mode/wpm/ratio/tone/vol/test` | On-device keyer and sidetone |
+| `src pc/mic` / `mic gain/gate` | Audio source and microphone |
+| `oled flip 0/1` | Rotate the display |
+| `save` / `defaults` | Write settings now / restore factory defaults |
 
 ---
 
@@ -254,12 +382,25 @@ The GUI provides:
 The QO-100 narrowband transponder LO is not exactly at its nominal value.
 Measure your signal on the [WebSDR](https://eshail.batc.org.uk/nb/) and adjust
 the LO calibration value in the GUI. The value used in this build:
-**8089.4972 MHz** (nominal is 8089.5 MHz).
+**8089.5001 MHz** (nominal is 8089.5 MHz).
+
+---
+
+## Known issues
+
+- Above about 32 WPM the CW element timing becomes uneven — the keyer runs from the
+  main polling loop rather than a hardware timer.
+- A carrier at 2400.4 MHz sits at the lower edge of WLAN channel 1 and will disrupt
+  2.4 GHz WiFi and Bluetooth nearby. Use a dummy load for bench testing.
 
 ---
 
 ## Planned / maybe someday
 
+- **Headphone mixer**: sidetone, local microphone monitoring for SSB, and received audio
+- **Receive path**: feed QO-100 audio (LNB → downconverter → handheld) into ADC1.
+  Needs a level-shifting network — a handheld's audio output swings negative and would
+  destroy the ADC input.
 - **WiFi remote operation** using the Pico 2W's CYW43439 radio:
   cwdaemon-compatible UDP server on port 6789, web interface for frequency/speed/power,
   WiFi client or AP mode with onboarding page.

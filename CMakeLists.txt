@@ -68,6 +68,9 @@ target_link_libraries(SX1280SDR
         pico_multicore
         hardware_pio
         hardware_pwm
+        hardware_flash
+        hardware_adc
+        pico_flash
         m
 
 )

@@ -3,6 +3,7 @@
 
 #include "ssd1306.h"
 #include <string.h>
+#include "pico/stdlib.h"     // tight_loop_contents()
 #include "hardware/dma.h"
 #include "hardware/i2c.h"
 #include "hardware/regs/dreq.h"
@@ -164,6 +165,16 @@ void ssd1306_init(i2c_inst_t *i2c) {
 
     ssd1306_clear();
     ssd1306_display(i2c);
+}
+
+// ============================================================
+// 180 degree rotation
+// ============================================================
+void ssd1306_set_flip(i2c_inst_t *i2c, bool flip) {
+    while (ssd1306_dma_busy()) tight_loop_contents();
+    // Init uses 0xA1 + 0xC8; flipping means the opposite of both.
+    ssd1306_write_cmd(i2c, flip ? 0xA0 : 0xA1);   // segment remap
+    ssd1306_write_cmd(i2c, flip ? 0xC0 : 0xC8);   // COM scan direction
 }
 
 // ============================================================
