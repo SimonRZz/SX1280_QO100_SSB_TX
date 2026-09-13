@@ -790,6 +790,7 @@ class SX1280ControlApp(ttk.Frame):
         self.gps_gate_var   = tk.BooleanVar(value=True)
         self._gps_ready     = None   # None = unknown, else bool from !S gps=
         self._gps_gate      = None   # None = unknown, else bool from !S gate=
+        self._gps_lost      = False  # from GPSDO lost= — had a fix, lost it
 
         # On-device keyer (firmware), synced from !S kwpm= / kmode=
         self.dev_kmode_var  = tk.StringVar(value="Iambic B")
@@ -1728,6 +1729,13 @@ class SX1280ControlApp(ttk.Frame):
             self._status_updating = False
             self._log(f"[STATUS PARSE ERROR] {e}: {line!r}", "error")
 
+    def _update_txgate_gps_lost(self, lost):
+        """Keep the connection-bar banner in sync with the GPSDO tab."""
+        if lost == self._gps_lost:
+            return
+        self._gps_lost = lost
+        self._update_txgate(None, None)
+
     def _update_txgate(self, gps, gate):
         if gps is not None:
             self._gps_ready = (gps == "1")
@@ -1737,7 +1745,9 @@ class SX1280ControlApp(ttk.Frame):
                 self.gps_gate_var.set(self._gps_gate)
         if self._gps_ready is None:
             return
-        if self._gps_ready:
+        if self._gps_lost:
+            text, color = "GPS SIGNAL LOST — TX frequency is drifting", "#cc0000"
+        elif self._gps_ready:
             text, color = "TX allowed — GPS disciplined", "#007700"
         elif self._gps_gate is False:
             text, color = "TX allowed — GPS GATE OVERRIDE, no GPS discipline!", "#cc6600"
@@ -2100,7 +2110,8 @@ class SX1280ControlApp(ttk.Frame):
             r'sig=(\S+)\s+fix=(\S+)\s+sats=(\d+)\s+vis=(\d+)\s+clk1=(\S+)'
             r'(?:\s+utc=(\S+))?'
             r'(?:\s+loc=(\S+))?'
-            r'(?:\s+alt=(-?\d+)m)?',
+            r'(?:\s+alt=(-?\d+)m)?'
+            r'(?:\s+lost=(\d))?',
             line)
         if not m:
             return
@@ -2112,6 +2123,7 @@ class SX1280ControlApp(ttk.Frame):
         utc  = m.group(6) or "--:--:--"
         loc  = m.group(7) or "------"
         alt  = (m.group(8) + " m") if m.group(8) else "--"
+        lost = (m.group(9) == "1") or sig == "lost"
 
         if clk1 == "fail":
             self.gpsdo_sig_var.set("SI5351 not found")
@@ -2119,11 +2131,16 @@ class SX1280ControlApp(ttk.Frame):
         elif clk1 in ("lol", "los"):
             self.gpsdo_sig_var.set(f"CLK1 error: {clk1.upper()}")
             self.gpsdo_sig_label.config(foreground="#cc0000")
+        elif lost:
+            # Had a fix, lost it: the 24 MHz reference is free-wheeling on the
+            # NEO-7M's own oscillator, so the TX frequency is drifting.
+            self.gpsdo_sig_var.set("GPS SIGNAL LOST — reference drifting")
+            self.gpsdo_sig_label.config(foreground="#cc0000")
         elif sig == "stable":
             self.gpsdo_sig_var.set("GPS signal stable")
             self.gpsdo_sig_label.config(foreground="#007700")
         elif sig == "stale":
-            self.gpsdo_sig_var.set("GPS signal lost (stale)")
+            self.gpsdo_sig_var.set("No data from receiver")
             self.gpsdo_sig_label.config(foreground="#cc4400")
         else:
             self.gpsdo_sig_var.set("Waiting for satellite...")
@@ -2134,7 +2151,9 @@ class SX1280ControlApp(ttk.Frame):
             self.gpsdo_fix_label.config(foreground="#007700")
         else:
             self.gpsdo_fix_var.set("No position fix")
-            self.gpsdo_fix_label.config(foreground="#888888")
+            self.gpsdo_fix_label.config(foreground="#cc0000" if lost else "#888888")
+
+        self._update_txgate_gps_lost(lost)
 
         self.gpsdo_sats_var.set(sats)
         self.gpsdo_vis_var.set(vis)

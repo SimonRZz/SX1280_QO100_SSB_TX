@@ -657,14 +657,19 @@ int gpsdo_format_status(char *buf, size_t size)
     const uint32_t now = gpsdo_ms();
 
     // sig: GPS time-discipline status
-    //   "stable" – UTC received, GGA fresh (<60 s)  → 24 MHz disciplined
-    //   "stale"  – had UTC but no GGA for >60 s     → keep last values, signal briefly lost
-    //   "wait"   – no UTC ever received              → cold start / no satellite yet
+    //   "stable" – UTC received, GGA fresh, satellites tracked → 24 MHz disciplined
+    //   "lost"   – had a fix, none for GPSDO_LOST_MS           → drifting on the GPS TCXO
+    //   "stale"  – had UTC but no GGA for >60 s                → receiver silent
+    //   "wait"   – no UTC ever received                        → cold start
+    // NOTE: the NEO-7M keeps emitting GGA without a fix, so sentence arrival
+    // alone does not mean the reference is disciplined — hence the "lost" case.
     const bool utc_valid  = (s_utc[0] != '-');
     const bool gga_recent = (s_lastGgaMs != 0u) && ((now - s_lastGgaMs) <= 60000u);
+    const bool lost       = gpsdo_signal_lost();
     const char *sig = !utc_valid       ? "wait"
-                    : gga_recent       ? "stable"
-                    :                    "stale";
+                    : !gga_recent      ? "stale"
+                    : lost             ? "lost"
+                    :                    "stable";
 
     // fix: position fix (needs ≥3 sats — consistent with Arduino "LCK" = sats≥3)
     //   "locked" – position fix active, locator valid
@@ -686,14 +691,15 @@ int gpsdo_format_status(char *buf, size_t size)
 
     return snprintf(buf, size,
                     "GPSDO: sig=%s fix=%s sats=%d vis=%d clk1=%s"
-                    " utc=%s loc=%s alt=%dm\r\n",
+                    " utc=%s loc=%s alt=%dm lost=%d\r\n",
                     sig, fix,
                     s_satsUsed,   // last known — not zeroed on stale
                     (int)vis,
                     si5351_clk_status(),
                     utc_str,
                     s_has_position ? s_locator : "------",
-                    (int)s_alt_m);
+                    (int)s_alt_m,
+                    lost ? 1 : 0);
 }
 
 void gpsdo_get_info(gpsdo_info_t *o)
