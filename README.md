@@ -332,6 +332,13 @@ This produces a `.uf2` file in the `build/` directory.
 2. Copy the `.uf2` file from the `/build/` directory onto it.
 3. The Pico reboots and starts running immediately.
 
+> **Flashing clears the saved settings.** The configuration lives in the last
+> flash sector, which the bootloader erases along with the rest. After every
+> update the transmitter starts on compile-time defaults — frequency, power,
+> keyer speed and DSP values have to be set again. A normal power cycle keeps
+> them; only reflashing does not. `diag` reports what is in the sector
+> (`magic`, `crc`, `VALID`/`INVALID`) if settings ever go missing unexpectedly.
+
 The running build identifies itself on the OLED boot screen, in the serial greeting and
 via the `version` command — handy when several builds are in circulation.
 
