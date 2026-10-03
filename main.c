@@ -3211,6 +3211,25 @@ static void persist_maybe_autosave(void) {
 // ==========================================================
 // Boot screen while waiting for the SI5351 clock
 // ==========================================================
+// Refresh the display and push the GUI status line. Rate-limited internally
+// (5 fps, and never while the previous DMA transfer is still running), so it
+// is cheap to call from every wait loop — and it has to be called from all of
+// them: in MIC mode the producer is paced by the ADC at the same rate Core1
+// consumes, so the "wait for a free block" loop almost never runs and the
+// display would otherwise stop updating entirely.
+static void ui_service(void) {
+    static absolute_time_t oled_next = {0};
+    if (!ssd1306_dma_busy() &&
+        absolute_time_diff_us(get_absolute_time(), oled_next) <= 0) {
+        oled_prepare_frame();
+        ssd1306_display_dma(OLED_I2C);
+        oled_next = make_timeout_time_ms(200);   // ~5 fps
+    }
+#if CFG_TUD_CDC
+    cdc_status_push();
+#endif
+}
+
 static void oled_draw_boot_wait(uint32_t elapsed_ms) {
     char line[22];
     ssd1306_clear();
@@ -3471,16 +3490,7 @@ int main(void) {
         // never executes, starving encoder/button/cw_keying polls.
         if (g_cw_test_mode) {
             usb_audio_pump();
-
-            {
-                static absolute_time_t oled_next_cw = {0};
-                if (!ssd1306_dma_busy() &&
-                    absolute_time_diff_us(get_absolute_time(), oled_next_cw) <= 0) {
-                    oled_prepare_frame();
-                    ssd1306_display_dma(OLED_I2C);
-                    oled_next_cw = make_timeout_time_ms(200);
-                }
-            }
+            ui_service();
 
             encoder_poll();
             button_poll();
@@ -3498,7 +3508,6 @@ int main(void) {
 
 #if CFG_TUD_CDC
             cdc_task();
-            cdc_status_push();
 #endif
             tight_loop_contents();
             continue;   // Skip block production entirely
@@ -3506,20 +3515,7 @@ int main(void) {
 
         while (g_block_ready[b]) {
             usb_audio_pump();
-
-            // --- OLED update via DMA (zero CPU during transfer) ---
-            // Render + kick DMA during idle time. DMA feeds I2C TX FIFO
-            // in background — CPU is completely free for USB/DSP.
-            {
-                static absolute_time_t oled_next = {0};
-
-                if (!ssd1306_dma_busy() &&
-                    absolute_time_diff_us(get_absolute_time(), oled_next) <= 0) {
-                    oled_prepare_frame();
-                    ssd1306_display_dma(OLED_I2C);
-                    oled_next = make_timeout_time_ms(200);  // ~5 fps
-                }
-            }
+            ui_service();
 
             // Poll encoder + buttons + carrier state machine
             encoder_poll();
@@ -3527,10 +3523,6 @@ int main(void) {
             carrier_poll();
             persist_maybe_autosave();
             gpsdo_task();   // 32-byte UART FIFO fills in ~33 ms at 9600 baud — keep draining
-
-#if CFG_TUD_CDC
-            cdc_status_push();
-#endif
 
             tight_loop_contents();
         }
@@ -3600,6 +3592,7 @@ int main(void) {
             bool bail = false;
             while (mic_available() < BLOCK_SAMPLES) {
                 usb_audio_pump();
+                ui_service();
                 encoder_poll();
                 button_poll();
                 carrier_poll();
@@ -3610,6 +3603,7 @@ int main(void) {
             }
             if (bail) continue;
         }
+        ui_service();   // guarantees a refresh per block even if the wait above was short
 
         sample_cmd_t *blk = g_blocks[b];
         uint8_t blk_tx = 0;   // did this block actually drive the PA?
