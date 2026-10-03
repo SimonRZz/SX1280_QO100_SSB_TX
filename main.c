@@ -131,7 +131,6 @@ static const uint32_t PIN_ENC_B   = 3;   // Encoder phase B
 static const uint32_t PIN_ENC_OK  = 10;  // Encoder push button (GP4 occupied by GPSDO UART1 TX)
 static const uint32_t PIN_KEY_DIT = 9;   // CW dit paddle (active LOW, internal pull-up)
 static const uint32_t PIN_KEY_DAH = 11;  // CW dah paddle (active LOW, internal pull-up; GP10 used by ENC_OK)
-static const uint32_t PIN_PTT     = 13;  // SSB push-to-talk (active LOW, internal pull-up)
 
 // ---------------- SPI config ----------------
 #define SX_SPI spi0
@@ -176,8 +175,10 @@ static volatile uint8_t g_soft_ptt_key = 0; // Software PTT/KEY via CDC "key 0|1
 // that is permanent VOX, and any room noise goes on the air. The PTT gates
 // microphone transmission. PC audio is left alone, so WSJT-X and friends
 // keep working without a hardware switch.
-static volatile uint8_t g_ptt_ext = 0;       // debounced PTT input, 1 = pressed
-static volatile uint8_t g_ptt_required = 1;  // 1 = MIC mode needs the PTT held
+// The PTT is the CW paddle itself — either contact. In SSB the keyer is
+// inactive (keyer_poll() returns early unless g_tx_mode == 1), so the paddle
+// is free to serve as the press-to-talk lever and needs no extra pin.
+static volatile uint8_t g_ptt_required = 1;  // 1 = MIC mode needs the paddle held
 
 // --- On-device CW keyer (paddles GP9/GP11 → element timing in firmware) ---
 enum { KEYER_STRAIGHT = 0, KEYER_IAMBIC_A = 1, KEYER_IAMBIC_B = 2 };
@@ -215,9 +216,9 @@ static inline bool tx_mode_guard_active(void) {
     return (to_ms_since_boot(get_absolute_time()) - g_mode_change_ms) < TX_MODE_GUARD_MS;
 }
 
-// True when the microphone path is held back by the PTT.
+// True when the microphone path is held back by the PTT (either paddle contact).
 static inline bool ssb_ptt_blocks(void) {
-    return (g_tx_mode == 0) && (g_audio_src == AUDIO_SRC_MIC) && g_ptt_required && !g_ptt_ext;
+    return (g_tx_mode == 0) && (g_audio_src == AUDIO_SRC_MIC) && g_ptt_required && !g_ptt_key;
 }
 
 static inline bool tx_allowed(void) {
@@ -1378,7 +1379,7 @@ static void cmd_help(void) {
         "  save          - write freq/ppm/txpwr/mode/DSP to flash now (autosaves 5 s after idle)\r\n"
         "  defaults      - restore compile-time defaults and save\r\n"
         "  oled flip 0|1 - rotate the display by 180 degrees\r\n"
-        "  ptt 0|1       - 1: MIC mode transmits only while the PTT on GP13 is held\r\n"
+        "  ptt 0|1       - 1: MIC mode transmits only while a CW paddle contact is held\r\n"
         "  src pc|mic    - audio source: USB from PC, or MAX4466 mic on GP26\r\n"
         "  mic [gain <1..50> | gate <0..0.5>] - mic gain and noise-gate threshold\r\n"
         "  keyer [wpm <5..60> | mode <straight|a|b> | ratio <2..5>] - on-device paddle keyer\r\n"
@@ -1619,7 +1620,7 @@ static void cdc_status_push_ex(bool force) {
     uint8_t  cur_stvol = g_st_vol;
     uint8_t  cur_src   = g_audio_src;
     // bit0 = PTT pressed, bit1 = PTT required, bit2 = currently blocking TX
-    uint8_t  cur_ptt   = (uint8_t)(g_ptt_ext | (g_ptt_required << 1) | (ssb_ptt_blocks() ? 4 : 0));
+    uint8_t  cur_ptt   = (uint8_t)(g_ptt_key | (g_ptt_required << 1) | (ssb_ptt_blocks() ? 4 : 0));
 
     if (!force) {
         // Check if anything changed
@@ -1790,10 +1791,10 @@ static void cdc_handle_line(char *line) {
             if (!parse_bool(argv[1], &v)) { cdc_write_str("ERR: ptt 0|1\r\n"); return; }
             if (v != g_ptt_required) { g_ptt_required = v; persist_mark_dirty(); }
         }
-        cdc_printf("OK ptt=%u (GP13, %s)  pressed=%u\r\n",
+        cdc_printf("OK ptt=%u (CW paddle, either contact, %s)  pressed=%u\r\n",
                    (unsigned)g_ptt_required,
                    g_ptt_required ? "required for MIC transmission" : "ignored — MIC keys on audio (VOX)",
-                   (unsigned)g_ptt_ext);
+                   (unsigned)g_ptt_key);
         return;
     }
     if (streqi(argv[0], "version") || streqi(argv[0], "ver")) {
@@ -2495,9 +2496,8 @@ static void keyer_diag_print(void) {
     cdc_printf("Paddles: GP9(dit) raw=%u db=%u  GP11(dah) raw=%u db=%u  (1 = pressed, pin at GND)\r\n",
                (unsigned)!gpio_get(PIN_KEY_DIT), (unsigned)g_key_dit,
                (unsigned)!gpio_get(PIN_KEY_DAH), (unsigned)g_key_dah);
-    cdc_printf("PTT: GP13 raw=%u db=%u  required=%u  blocking=%u\r\n",
-               (unsigned)!gpio_get(PIN_PTT), (unsigned)g_ptt_ext,
-               (unsigned)g_ptt_required, (unsigned)ssb_ptt_blocks());
+    cdc_printf("PTT: paddle (GP9|GP11) pressed=%u  required=%u  blocking=%u\r\n",
+               (unsigned)g_ptt_key, (unsigned)g_ptt_required, (unsigned)ssb_ptt_blocks());
     cdc_printf("Keyer: mode=%s wpm=%u ratio=%.1f state=%s pend=%u/%u out=%u softkey=%u\r\n",
                keyer_mode_name(g_cw_mode), (unsigned)g_cw_wpm, (double)g_cw_ratio,
                ks_names[s_kyr.state & 7], (unsigned)s_kyr.pend_dit, (unsigned)s_kyr.pend_dah,
@@ -2999,19 +2999,6 @@ static void button_poll(void) {
     }
     g_ptt_key = g_key_dit | g_key_dah;
 
-    // --- SSB PTT (GP13, active LOW), same stability filter as the paddles ---
-    {
-        static uint8_t  ptt_raw_last = 0;
-        static uint32_t ptt_raw_ms = 0;
-        uint8_t ptt_raw = !gpio_get(PIN_PTT);
-        if (ptt_raw != ptt_raw_last) {
-            ptt_raw_last = ptt_raw;
-            ptt_raw_ms   = now_ms;
-        } else if (ptt_raw != g_ptt_ext && (now_ms - ptt_raw_ms) >= KEY_DEBOUNCE_MS) {
-            g_ptt_ext = ptt_raw;
-        }
-    }
-
     keyer_poll();
 }
 
@@ -3349,7 +3336,6 @@ int main(void) {
     gpio_init(PIN_ENC_OK);  gpio_set_dir(PIN_ENC_OK, GPIO_IN);  gpio_pull_up(PIN_ENC_OK);
     gpio_init(PIN_KEY_DIT); gpio_set_dir(PIN_KEY_DIT, GPIO_IN); gpio_pull_up(PIN_KEY_DIT);
     gpio_init(PIN_KEY_DAH); gpio_set_dir(PIN_KEY_DAH, GPIO_IN); gpio_pull_up(PIN_KEY_DAH);
-    gpio_init(PIN_PTT);     gpio_set_dir(PIN_PTT, GPIO_IN);     gpio_pull_up(PIN_PTT);
     // Initialize encoder last state
     enc_last_ab = ((gpio_get(PIN_ENC_A) ? 0 : 1) << 1) | (gpio_get(PIN_ENC_B) ? 0 : 1);
 

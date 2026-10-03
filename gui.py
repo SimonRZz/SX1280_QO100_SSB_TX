@@ -1034,8 +1034,8 @@ class SX1280ControlApp(ttk.Frame):
         self.mic_gate_lbl = ttk.Label(asf, text="0.020", width=7)
         self.mic_gate_lbl.grid(row=2, column=3, sticky="w", pady=(2, 0))
 
-        # PTT on GP13 — without it, MIC mode keys on audio alone (VOX)
-        ttk.Checkbutton(asf, text="Require PTT (GP13) for microphone transmission",
+        # PTT — the CW paddle doubles as the push-to-talk in SSB
+        ttk.Checkbutton(asf, text="Require PTT (CW paddle, either side) for microphone transmission",
                         variable=self.ptt_req_var,
                         command=self._on_ptt_req).grid(row=3, column=0, columnspan=3,
                                                        sticky="w", pady=(8, 0))

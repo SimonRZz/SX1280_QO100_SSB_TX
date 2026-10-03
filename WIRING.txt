@@ -88,21 +88,22 @@ MICROPHONE (MAX4466 electret module, ADC0 on GPIO 26 / Pin 31)
     Without a microphone connected leave src=pc: an open ADC input is noise.
 
 ================================================================================
-SSB PUSH-TO-TALK (GPIO 13 / Pin 17)
+SSB PUSH-TO-TALK — the CW paddle
 ================================================================================
 
-    Button or footswitch:  GPIO 13 ──[ switch ]── GND
+    No extra wiring: the paddle on GPIO 9 / GPIO 11 doubles as the PTT.
+    Either contact works (dit, dah, or both), and a straight key on the tip
+    works too.
 
-    Internal pull-up, active LOW, same 4 ms stability filter as the paddles.
+    In SSB the keyer is inactive, so the paddle has no other job there.
 
     SSB has no PTT of its own — the carrier follows the audio amplitude. With
     a live microphone that is permanent VOX, so with src=mic the firmware
-    requires this switch to be held ("ptt 1", the default). The OLED TX field
-    shows "PTT" while it is holding transmission back.
+    requires a paddle contact to be held ("ptt 1", the default). The OLED TX
+    field shows "PTT" while it is holding transmission back.
 
     "ptt 0" disables the requirement and restores the old VOX behaviour.
-    PC audio (src=pc) is never gated, so WSJT-X and similar keep working
-    without a switch.
+    PC audio (src=pc) is never gated, so WSJT-X and similar keep working.
 
 ================================================================================
 CW KEY / PADDLE JACK (3.5 mm stereo)
@@ -114,6 +115,7 @@ CW KEY / PADDLE JACK (3.5 mm stereo)
 
     Internal pull-ups, active LOW. A straight key on Tip works in
     "keyer mode straight" (either contact keys).
+    In SSB the same contacts act as the push-to-talk — see above.
 
 ================================================================================
 GPIO SUMMARY (this fork)
@@ -132,4 +134,4 @@ GPIO SUMMARY (this fork)
     GPIO 10  —  Encoder push              GPIO 26  —  Microphone (MAX4466, ADC0)
     GPIO 11  —  CW dah                    GPIO 27  —  (free, ADC1)
     GPIO 12  —  Sidetone PWM              GPIO 28  —  (free, ADC2)
-    GPIO 13  —  SSB PTT
+    GPIO 13  —  (free)
