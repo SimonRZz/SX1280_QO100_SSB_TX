@@ -1274,8 +1274,21 @@ static int streqi(const char *a, const char *b) {
 static void cdc_write_str(const char *s) {
 #if CFG_TUD_CDC
     if (!tud_cdc_connected()) return;
-    tud_cdc_write_str(s);
-    tud_cdc_write_flush();
+    // tud_cdc_write() only accepts what currently fits in the 512-byte FIFO and
+    // reports how much it took — the remainder has to be retried or it is lost.
+    // Long output (get, help, diag) overflows that, which truncated lines and
+    // spliced the next command's text onto them. Push the rest as the host
+    // drains it, bounded so a stalled host cannot hold up the radio.
+    const size_t len = strlen(s);
+    size_t off = 0;
+    absolute_time_t deadline = make_timeout_time_ms(50);
+    while (off < len) {
+        off += tud_cdc_write(s + off, (uint32_t)(len - off));
+        tud_cdc_write_flush();
+        if (off >= len) break;
+        if (absolute_time_diff_us(get_absolute_time(), deadline) <= 0) break;
+        tud_task();   // never called from inside tud_task(): cdc_task() runs after it
+    }
 #else
     (void)s;
 #endif
@@ -1289,8 +1302,7 @@ static void cdc_printf(const char *fmt, ...) {
     va_start(ap, fmt);
     vsnprintf(b, sizeof(b), fmt, ap);
     va_end(ap);
-    tud_cdc_write_str(b);
-    tud_cdc_write_flush();
+    cdc_write_str(b);   // shares the retry loop, so long lines are not truncated
 #else
     (void)fmt;
 #endif
@@ -3392,8 +3404,7 @@ int main(void) {
                     last_status_ms = now_ms;
                     char gbuf[128];
                     gpsdo_format_status(gbuf, sizeof(gbuf));
-                    tud_cdc_write(gbuf, strlen(gbuf));
-                    tud_cdc_write_flush();
+                    cdc_write_str(gbuf);
                 }
             }
         }
