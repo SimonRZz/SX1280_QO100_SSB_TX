@@ -807,6 +807,8 @@ class SX1280ControlApp(ttk.Frame):
         self.audio_src_var  = tk.StringVar(value="pc")
         self.mic_gain_var   = tk.DoubleVar(value=10.0)
         self.mic_gate_var   = tk.DoubleVar(value=0.02)
+        self.ptt_req_var    = tk.BooleanVar(value=True)
+        self.ptt_state_var  = tk.StringVar(value="PTT —")
 
     def _build_ui(self):
         self.master.title("SX1280 QO-100 SSB TX Control")
@@ -1031,9 +1033,20 @@ class SX1280ControlApp(ttk.Frame):
                                                                        sticky="ew", padx=6, pady=(2, 0))
         self.mic_gate_lbl = ttk.Label(asf, text="0.020", width=7)
         self.mic_gate_lbl.grid(row=2, column=3, sticky="w", pady=(2, 0))
+
+        # PTT on GP13 — without it, MIC mode keys on audio alone (VOX)
+        ttk.Checkbutton(asf, text="Require PTT (GP13) for microphone transmission",
+                        variable=self.ptt_req_var,
+                        command=self._on_ptt_req).grid(row=3, column=0, columnspan=3,
+                                                       sticky="w", pady=(8, 0))
+        self.ptt_state_lbl = ttk.Label(asf, textvariable=self.ptt_state_var,
+                                       font=("Consolas", 10, "bold"))
+        self.ptt_state_lbl.grid(row=3, column=3, sticky="w", pady=(8, 0))
+
         ttk.Label(asf, text="Without a microphone wired to GP26 keep PC selected — an open ADC input is noise. "
-                            "The OLED MODE item cycles USB PC → USB MIC → CW.",
-                  foreground="gray", wraplength=760, justify="left").grid(row=3, column=0, columnspan=4,
+                            "The OLED MODE item cycles USB PC → USB MIC → CW. SSB has no PTT of its own: "
+                            "with the microphone selected and this unchecked, any room noise transmits.",
+                  foreground="gray", wraplength=760, justify="left").grid(row=4, column=0, columnspan=4,
                                                                            sticky="w", pady=(6, 0))
 
         cwf = ttk.LabelFrame(tab, text="CW Test Mode", padding=20)
@@ -1239,6 +1252,11 @@ class SX1280ControlApp(ttk.Frame):
         if self._status_updating:
             return
         self._send_cmd_safe(f"src {self.audio_src_var.get()}")
+
+    def _on_ptt_req(self):
+        if self._status_updating:
+            return
+        self._send_cmd_safe(f"ptt {1 if self.ptt_req_var.get() else 0}")
 
     def _on_mic_param(self, what):
         if self._status_updating:
@@ -1717,6 +1735,22 @@ class SX1280ControlApp(ttk.Frame):
                 src = "mic" if kv["src"] == "1" else "pc"
                 if self.audio_src_var.get() != src:
                     self.audio_src_var.set(src)
+
+            if "ptt" in kv:
+                # bit0 = pressed, bit1 = required, bit2 = currently blocking TX
+                p = int(kv["ptt"])
+                req = bool(p & 2)
+                if self.ptt_req_var.get() != req:
+                    self.ptt_req_var.set(req)
+                if p & 4:
+                    self.ptt_state_var.set("PTT open — TX blocked")
+                    self.ptt_state_lbl.config(foreground="#cc6600")
+                elif p & 1:
+                    self.ptt_state_var.set("PTT pressed")
+                    self.ptt_state_lbl.config(foreground="#cc0000")
+                else:
+                    self.ptt_state_var.set("PTT —")
+                    self.ptt_state_lbl.config(foreground="#444444")
             if "key" in kv or "pdl" in kv:
                 pdl = int(kv.get("pdl", "0"))
                 key = kv.get("key", "0") == "1"

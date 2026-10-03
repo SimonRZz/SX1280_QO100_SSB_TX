@@ -131,6 +131,7 @@ static const uint32_t PIN_ENC_B   = 3;   // Encoder phase B
 static const uint32_t PIN_ENC_OK  = 10;  // Encoder push button (GP4 occupied by GPSDO UART1 TX)
 static const uint32_t PIN_KEY_DIT = 9;   // CW dit paddle (active LOW, internal pull-up)
 static const uint32_t PIN_KEY_DAH = 11;  // CW dah paddle (active LOW, internal pull-up; GP10 used by ENC_OK)
+static const uint32_t PIN_PTT     = 13;  // SSB push-to-talk (active LOW, internal pull-up)
 
 // ---------------- SPI config ----------------
 #define SX_SPI spi0
@@ -170,6 +171,14 @@ static volatile uint8_t g_key_dit = 0;     // dit paddle (GP9), debounced
 static volatile uint8_t g_key_dah = 0;     // dah paddle (GP11), debounced
 static volatile uint8_t g_soft_ptt_key = 0; // Software PTT/KEY via CDC "key 0|1" (GUI CW keyer)
 
+// --- SSB push-to-talk (GP13) ---
+// Without this, SSB keys purely on audio amplitude: with a live microphone
+// that is permanent VOX, and any room noise goes on the air. The PTT gates
+// microphone transmission. PC audio is left alone, so WSJT-X and friends
+// keep working without a hardware switch.
+static volatile uint8_t g_ptt_ext = 0;       // debounced PTT input, 1 = pressed
+static volatile uint8_t g_ptt_required = 1;  // 1 = MIC mode needs the PTT held
+
 // --- On-device CW keyer (paddles GP9/GP11 → element timing in firmware) ---
 enum { KEYER_STRAIGHT = 0, KEYER_IAMBIC_A = 1, KEYER_IAMBIC_B = 2 };
 static volatile uint8_t g_cw_mode   = KEYER_IAMBIC_B;
@@ -204,6 +213,11 @@ static volatile uint32_t g_mode_change_ms = 0;
 static inline void tx_mode_changed(void) { g_mode_change_ms = to_ms_since_boot(get_absolute_time()); }
 static inline bool tx_mode_guard_active(void) {
     return (to_ms_since_boot(get_absolute_time()) - g_mode_change_ms) < TX_MODE_GUARD_MS;
+}
+
+// True when the microphone path is held back by the PTT.
+static inline bool ssb_ptt_blocks(void) {
+    return (g_tx_mode == 0) && (g_audio_src == AUDIO_SRC_MIC) && g_ptt_required && !g_ptt_ext;
 }
 
 static inline bool tx_allowed(void) {
@@ -1325,7 +1339,7 @@ static void cfg_print(void) {
         "  freq=%s Hz (target)  ppm=%.3f  tx=%s  txpwr=%d dBm\r\n"
         "  mode=%s  tune=%s  gps=%s  gpsgate=%s  config=%s\r\n"
         "  keyer=%s  wpm=%u  ratio=%.1f  sidetone=%u Hz  vol=%u%%\r\n"
-        "  src=%s  mic_gain=%.1f  mic_gate=%.3f\r\n"
+        "  src=%s  mic_gain=%.1f  mic_gate=%.3f  ptt=%s\r\n"
         "  corrected=%s Hz  base_steps=%lu  fine=%.1f Hz (auto)\r\n",
         freq_str, g_ppm_correction, g_tx_enabled ? "ON" : "OFF", g_tx_power_max_dbm,
         g_tx_mode ? "CW" : "USB", g_tune_active ? "ON" : "OFF",
@@ -1334,6 +1348,7 @@ static void cfg_print(void) {
         keyer_mode_name(g_cw_mode), (unsigned)g_cw_wpm, (double)g_cw_ratio,
         (unsigned)g_st_hz, (unsigned)g_st_vol,
         audio_src_name(g_audio_src), (double)g_mic_gain, (double)g_mic_gate,
+        g_ptt_required ? "required for MIC" : "off (VOX)",
         corr_str, (unsigned long)get_base_steps(), fine);
     cdc_printf(
         "  enable bp=%u eq=%u comp=%u\r\n"
@@ -1363,6 +1378,7 @@ static void cmd_help(void) {
         "  save          - write freq/ppm/txpwr/mode/DSP to flash now (autosaves 5 s after idle)\r\n"
         "  defaults      - restore compile-time defaults and save\r\n"
         "  oled flip 0|1 - rotate the display by 180 degrees\r\n"
+        "  ptt 0|1       - 1: MIC mode transmits only while the PTT on GP13 is held\r\n"
         "  src pc|mic    - audio source: USB from PC, or MAX4466 mic on GP26\r\n"
         "  mic [gain <1..50> | gate <0..0.5>] - mic gain and noise-gate threshold\r\n"
         "  keyer [wpm <5..60> | mode <straight|a|b> | ratio <2..5>] - on-device paddle keyer\r\n"
@@ -1434,7 +1450,8 @@ typedef struct __attribute__((packed)) {
     float       mic_gain;
     float       mic_gate;
     uint8_t     oled_flip;
-    uint8_t     _reserved[7];    // future fields fit here without a version bump
+    uint8_t     ptt_req_p1;      // 0 = unset (older save), else g_ptt_required + 1
+    uint8_t     _reserved[6];    // future fields fit here without a version bump
     audio_cfg_t dsp;
     uint32_t    crc32;           // over everything above
 } persist_cfg_t;
@@ -1475,6 +1492,7 @@ static void persist_collect(persist_cfg_t *c) {
     c->mic_gain       = g_mic_gain;
     c->mic_gate       = g_mic_gate;
     c->oled_flip      = g_oled_flip;
+    c->ptt_req_p1     = (uint8_t)(g_ptt_required + 1u);
     __compiler_memory_barrier();
     memcpy(&c->dsp, (const void *)&g_cfg, sizeof(c->dsp));
     __compiler_memory_barrier();
@@ -1511,6 +1529,9 @@ static void persist_apply(const persist_cfg_t *c) {
     g_mic_gain = (mg >= 1.0f && mg <= 50.0f) ? mg : 10.0f;
     g_mic_gate = (mt >= 0.0f && mt <= 0.5f)  ? mt : 0.02f;
     g_oled_flip = c->oled_flip ? 1 : 0;
+    // 0 means the field did not exist yet when this was saved — default to on,
+    // which is the safe direction (fails to not transmitting).
+    g_ptt_required = (c->ptt_req_p1 == 0u) ? 1 : ((c->ptt_req_p1 == 1u) ? 0 : 1);
 
     audio_cfg_t d = c->dsp;
     cfg_sanitize(&d, (float)WAV_SAMPLE_RATE);
@@ -1577,6 +1598,7 @@ static void cdc_status_push_ex(bool force) {
     static uint16_t last_sthz  = 0;
     static uint8_t  last_stvol = 0xFF;
     static uint8_t  last_src   = 0xFF;
+    static uint8_t  last_ptt   = 0xFF;
 
     if (!tud_cdc_connected()) return;
 
@@ -1596,6 +1618,8 @@ static void cdc_status_push_ex(bool force) {
     uint16_t cur_sthz  = g_st_hz;
     uint8_t  cur_stvol = g_st_vol;
     uint8_t  cur_src   = g_audio_src;
+    // bit0 = PTT pressed, bit1 = PTT required, bit2 = currently blocking TX
+    uint8_t  cur_ptt   = (uint8_t)(g_ptt_ext | (g_ptt_required << 1) | (ssb_ptt_blocks() ? 4 : 0));
 
     if (!force) {
         // Check if anything changed
@@ -1607,7 +1631,7 @@ static void cdc_status_push_ex(bool force) {
                        (cur_kwpm != last_kwpm) || (cur_kmode != last_kmode) ||
                        (cur_key != last_key) || (cur_pdl != last_pdl) ||
                        (cur_sthz != last_sthz) || (cur_stvol != last_stvol) ||
-                       (cur_src != last_src);
+                       (cur_src != last_src) || (cur_ptt != last_ptt);
 
         if (!changed) return;
 
@@ -1626,13 +1650,13 @@ static void cdc_status_push_ex(bool force) {
     uint32_t ppm_frac = (uint32_t)((ppm_abs - (float)ppm_int) * 10000.0f + 0.5f);
     if (ppm_frac >= 10000) { ppm_int++; ppm_frac = 0; }
 
-    char status_buf[160];
+    char status_buf[192];
     snprintf(status_buf, sizeof(status_buf),
-             "!S mode=%u tune=%u tx=%u pwr=%d ppm=%s%lu.%04lu freq=%s gps=%u gate=%u dirty=%u kwpm=%u kmode=%u key=%u pdl=%u sthz=%u stvol=%u src=%u\r\n",
+             "!S mode=%u tune=%u tx=%u pwr=%d ppm=%s%lu.%04lu freq=%s gps=%u gate=%u dirty=%u kwpm=%u kmode=%u key=%u pdl=%u sthz=%u stvol=%u src=%u ptt=%u\r\n",
              cur_mode, cur_tune, cur_tx, cur_pwr,
              ppm_neg ? "-" : "", (unsigned long)ppm_int, (unsigned long)ppm_frac,
              freq_str, cur_gps, cur_gate, cur_dirty, cur_kwpm, cur_kmode, cur_key, cur_pdl,
-             (unsigned)cur_sthz, (unsigned)cur_stvol, (unsigned)cur_src);
+             (unsigned)cur_sthz, (unsigned)cur_stvol, (unsigned)cur_src, (unsigned)cur_ptt);
     cdc_write_str(status_buf);
 
     last_mode = cur_mode;
@@ -1651,6 +1675,7 @@ static void cdc_status_push_ex(bool force) {
     last_sthz  = cur_sthz;
     last_stvol = cur_stvol;
     last_src   = cur_src;
+    last_ptt   = cur_ptt;
     last_push_ms = to_ms_since_boot(get_absolute_time());
 }
 
@@ -1695,6 +1720,7 @@ static void cdc_handle_line(char *line) {
         g_audio_src        = AUDIO_SRC_PC;
         g_mic_gain         = 10.0f;
         g_mic_gate         = 0.02f;
+        g_ptt_required     = 1;
         if (g_oled_flip) { g_oled_flip = 0; ssd1306_set_flip(OLED_I2C, false); }
         keyer_reset();
         cfg_commit(&k_cfg_defaults);
@@ -1711,7 +1737,13 @@ static void cdc_handle_line(char *line) {
             if      (streqi(argv[1], "pc") || streqi(argv[1], "usb")) s = AUDIO_SRC_PC;
             else if (streqi(argv[1], "mic") || streqi(argv[1], "adc")) s = AUDIO_SRC_MIC;
             else { cdc_write_str("ERR: src pc|mic\r\n"); return; }
-            if (s != g_audio_src) { g_audio_src = s; persist_mark_dirty(); }
+            if (s != g_audio_src) {
+                g_audio_src = s;
+                // Switching to the microphone must never start a transmission by
+                // itself — the operator enables TX deliberately afterwards.
+                if (s == AUDIO_SRC_MIC) g_tx_enabled = 0;
+                persist_mark_dirty();
+            }
         }
         cdc_printf("OK src=%s\r\n", audio_src_name(g_audio_src));
         return;
@@ -1749,6 +1781,19 @@ static void cdc_handle_line(char *line) {
             return;
         }
         cdc_printf("OK oled flip=%u\r\n", (unsigned)g_oled_flip);
+        return;
+    }
+    // SSB push-to-talk: ptt 0|1
+    if (streqi(argv[0], "ptt")) {
+        if (argc >= 2) {
+            uint8_t v;
+            if (!parse_bool(argv[1], &v)) { cdc_write_str("ERR: ptt 0|1\r\n"); return; }
+            if (v != g_ptt_required) { g_ptt_required = v; persist_mark_dirty(); }
+        }
+        cdc_printf("OK ptt=%u (GP13, %s)  pressed=%u\r\n",
+                   (unsigned)g_ptt_required,
+                   g_ptt_required ? "required for MIC transmission" : "ignored — MIC keys on audio (VOX)",
+                   (unsigned)g_ptt_ext);
         return;
     }
     if (streqi(argv[0], "version") || streqi(argv[0], "ver")) {
@@ -2196,6 +2241,8 @@ static void oled_prepare_frame(void) {
             tx_label = "GPS LOST";
         } else if (!tx_allowed()) {
             tx_label = "WAIT GPS";
+        } else if (ssb_ptt_blocks()) {
+            tx_label = "PTT";
         } else if (g_tx_mode == 1 && (g_keyer_key | g_soft_ptt_key)) {
             tx_label = "KEY";
         } else {
@@ -2448,6 +2495,9 @@ static void keyer_diag_print(void) {
     cdc_printf("Paddles: GP9(dit) raw=%u db=%u  GP11(dah) raw=%u db=%u  (1 = pressed, pin at GND)\r\n",
                (unsigned)!gpio_get(PIN_KEY_DIT), (unsigned)g_key_dit,
                (unsigned)!gpio_get(PIN_KEY_DAH), (unsigned)g_key_dah);
+    cdc_printf("PTT: GP13 raw=%u db=%u  required=%u  blocking=%u\r\n",
+               (unsigned)!gpio_get(PIN_PTT), (unsigned)g_ptt_ext,
+               (unsigned)g_ptt_required, (unsigned)ssb_ptt_blocks());
     cdc_printf("Keyer: mode=%s wpm=%u ratio=%.1f state=%s pend=%u/%u out=%u softkey=%u\r\n",
                keyer_mode_name(g_cw_mode), (unsigned)g_cw_wpm, (double)g_cw_ratio,
                ks_names[s_kyr.state & 7], (unsigned)s_kyr.pend_dit, (unsigned)s_kyr.pend_dah,
@@ -2786,6 +2836,7 @@ static void encoder_poll(void) {
                         idx = (idx + step + 3) % 3;
                         g_tx_mode   = (idx == 2) ? 1 : 0;
                         if (idx < 2) g_audio_src = (idx == 1) ? AUDIO_SRC_MIC : AUDIO_SRC_PC;
+                        if (g_audio_src == AUDIO_SRC_MIC) g_tx_enabled = 0;   // never key on mode change
                         tx_mode_changed();
                         persist_mark_dirty();
                     }
@@ -2947,6 +2998,19 @@ static void button_poll(void) {
         g_key_dah = dah_raw;
     }
     g_ptt_key = g_key_dit | g_key_dah;
+
+    // --- SSB PTT (GP13, active LOW), same stability filter as the paddles ---
+    {
+        static uint8_t  ptt_raw_last = 0;
+        static uint32_t ptt_raw_ms = 0;
+        uint8_t ptt_raw = !gpio_get(PIN_PTT);
+        if (ptt_raw != ptt_raw_last) {
+            ptt_raw_last = ptt_raw;
+            ptt_raw_ms   = now_ms;
+        } else if (ptt_raw != g_ptt_ext && (now_ms - ptt_raw_ms) >= KEY_DEBOUNCE_MS) {
+            g_ptt_ext = ptt_raw;
+        }
+    }
 
     keyer_poll();
 }
@@ -3285,6 +3349,7 @@ int main(void) {
     gpio_init(PIN_ENC_OK);  gpio_set_dir(PIN_ENC_OK, GPIO_IN);  gpio_pull_up(PIN_ENC_OK);
     gpio_init(PIN_KEY_DIT); gpio_set_dir(PIN_KEY_DIT, GPIO_IN); gpio_pull_up(PIN_KEY_DIT);
     gpio_init(PIN_KEY_DAH); gpio_set_dir(PIN_KEY_DAH, GPIO_IN); gpio_pull_up(PIN_KEY_DAH);
+    gpio_init(PIN_PTT);     gpio_set_dir(PIN_PTT, GPIO_IN);     gpio_pull_up(PIN_PTT);
     // Initialize encoder last state
     enc_last_ab = ((gpio_get(PIN_ENC_A) ? 0 : 1) << 1) | (gpio_get(PIN_ENC_B) ? 0 : 1);
 
@@ -3774,8 +3839,8 @@ int main(void) {
                 if (p_acc >= 1.0f && p_high != p_low) { p_chosen = p_high; p_acc -= 1.0f; }
             }
 
-            // Global TX enable (GUI TX button) and GPS gate
-            if (!g_tx_enabled || !tx_allowed()) {
+            // Global TX enable (GUI TX button), GPS gate and the SSB PTT
+            if (!g_tx_enabled || !tx_allowed() || ssb_ptt_blocks()) {
                 tx_on = 0;
             }
 
