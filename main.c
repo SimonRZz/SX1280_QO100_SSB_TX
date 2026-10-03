@@ -189,6 +189,7 @@ static volatile uint8_t g_keyer_key = 0;       // keyer output: 1 = key down
 static void keyer_reset(void);
 static const char *keyer_mode_name(uint8_t m);
 static void keyer_diag_print(void);
+static void persist_diag_print(void);
 
 // --- Sidetone (PWM audio on GP12, follows keyer output and TUNE) ---
 static volatile uint16_t g_st_hz   = 700;    // 300..1200
@@ -228,7 +229,9 @@ static inline bool tx_allowed(void) {
 // --- Persistent config (last flash sector) ---
 static volatile uint8_t  g_persist_dirty       = 0;  // something worth saving changed
 static volatile uint32_t g_persist_dirty_since = 0;  // ms of last change
-static uint8_t           g_persist_loaded      = 0;  // 1 = boot config came from flash
+static uint8_t           g_persist_loaded      = 0;  // 1 = a valid record exists in flash
+static int               g_persist_last_rc     = 1;  // last flash_safe_execute() result, 1 = never tried
+static uint32_t          g_persist_saves       = 0;  // successful writes since boot
 
 // Last moment the PA was actually driven — SSB block, CW element or TUNE.
 // A flash write parks Core1 for ~20 ms, so autosave waits until the radio
@@ -739,6 +742,7 @@ static void sx_print_diag(void) {
     uint32_t usb_r = g_usb_r;
     uint32_t usb_fill = (usb_w >= usb_r) ? (usb_w - usb_r) : (USB_RB_FRAMES - usb_r + usb_w);
     cdc_printf("USB ringbuf: %lu/%lu frames\r\n", (unsigned long)usb_fill, (unsigned long)USB_RB_FRAMES);
+    persist_diag_print();
     keyer_diag_print();
     cdc_printf("==========================\r\n");
 #endif
@@ -1578,13 +1582,35 @@ static bool persist_save_now(void) {
     memcpy(page, &c, sizeof(c));
 
     int r = flash_safe_execute(persist_flash_op, page, 100);
+    g_persist_last_rc = r;
     if (r == PICO_OK) {
         g_persist_dirty = 0;
+        g_persist_loaded = 1;   // a valid record now exists, even if boot found none
+        g_persist_saves++;
         return true;
     }
     // Don't retry back-to-back: each failed attempt costs up to 100 ms.
     g_persist_dirty_since = to_ms_since_boot(get_absolute_time());
     return false;
+}
+
+// What is actually sitting in the config sector, so a failing save or a
+// mismatching layout can be told apart from "never written".
+static void persist_diag_print(void) {
+    const persist_cfg_t *p = (const persist_cfg_t *)(XIP_BASE + CFG_FLASH_OFFSET);
+    const uint32_t crc = persist_cfg_crc(p);
+    cdc_printf("Config: offset=0x%08lx size=%u flash_size=%lu\r\n",
+               (unsigned long)CFG_FLASH_OFFSET, (unsigned)sizeof(persist_cfg_t),
+               (unsigned long)PICO_FLASH_SIZE_BYTES);
+    cdc_printf("Config: magic=0x%08lx/0x%08lx ver=%lu/%lu crc=0x%08lx/0x%08lx %s\r\n",
+               (unsigned long)p->magic, (unsigned long)CFG_MAGIC,
+               (unsigned long)p->version, (unsigned long)CFG_VERSION,
+               (unsigned long)p->crc32, (unsigned long)crc,
+               (p->magic == CFG_MAGIC && p->version == CFG_VERSION && crc == p->crc32)
+                   ? "VALID" : "INVALID");
+    cdc_printf("Config: loaded=%u dirty=%u saves=%lu last_rc=%d (0=ok)\r\n",
+               (unsigned)g_persist_loaded, (unsigned)g_persist_dirty,
+               (unsigned long)g_persist_saves, g_persist_last_rc);
 }
 
 // Periodic status push to CDC for GUI synchronization.
