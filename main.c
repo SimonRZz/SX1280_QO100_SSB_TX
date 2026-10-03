@@ -1300,9 +1300,12 @@ static void cdc_printf(const char *fmt, ...) {
     char b[256];
     va_list ap;
     va_start(ap, fmt);
-    vsnprintf(b, sizeof(b), fmt, ap);
+    int n = vsnprintf(b, sizeof(b), fmt, ap);
     va_end(ap);
     cdc_write_str(b);   // shares the retry loop, so long lines are not truncated
+    // vsnprintf silently cuts at the buffer size; make that visible instead of
+    // letting a caller lose the tail of a line without anyone noticing.
+    if (n >= (int)sizeof(b)) cdc_write_str("[line truncated]\r\n");
 #else
     (void)fmt;
 #endif
@@ -1346,37 +1349,32 @@ static void cfg_print(void) {
     fmt_freq(freq_str, sizeof(freq_str), g_target_freq_hz);
     fmt_freq(corr_str, sizeof(corr_str), corrected);
 
-    cdc_printf(
-        "CFG:\r\n"
-        "  fw=" FW_VERSION "  built=" FW_BUILD "\r\n"
-        "  freq=%s Hz (target)  ppm=%.3f  tx=%s  txpwr=%d dBm\r\n"
-        "  mode=%s  tune=%s  gps=%s  gpsgate=%s  config=%s\r\n"
-        "  keyer=%s  wpm=%u  ratio=%.1f  sidetone=%u Hz  vol=%u%%\r\n"
-        "  src=%s  mic_gain=%.1f  mic_gate=%.3f  ptt=%s\r\n"
-        "  corrected=%s Hz  base_steps=%lu  fine=%.1f Hz (auto)\r\n",
-        freq_str, g_ppm_correction, g_tx_enabled ? "ON" : "OFF", g_tx_power_max_dbm,
-        g_tx_mode ? "CW" : "USB", g_tune_active ? "ON" : "OFF",
-        gpsdo_is_ready() ? "ready" : "wait", g_gps_gate ? "ON" : "OFF",
-        g_persist_dirty ? "unsaved" : (g_persist_loaded ? "flash" : "defaults"),
-        keyer_mode_name(g_cw_mode), (unsigned)g_cw_wpm, (double)g_cw_ratio,
-        (unsigned)g_st_hz, (unsigned)g_st_vol,
-        audio_src_name(g_audio_src), (double)g_mic_gain, (double)g_mic_gate,
-        g_ptt_required ? "required for MIC" : "off (VOX)",
-        corr_str, (unsigned long)get_base_steps(), fine);
-    cdc_printf(
-        "  enable bp=%u eq=%u comp=%u\r\n"
-        "  bp_lo=%.1f bp_hi=%.1f bp_stages=%u (%u dB/oct)\r\n"
-        "  eq_low_hz=%.1f eq_low_db=%.1f\r\n"
-        "  eq_high_hz=%.1f eq_high_db=%.1f\r\n"
-        "  comp_thr=%.1f ratio=%.2f att=%.2fms rel=%.2fms makeup=%.1f knee=%.1f outlim=%.3f\r\n"
-        "  amp_gain=%.3f amp_min_a=%.9f\r\n",
-        c.enable_bandpass, c.enable_eq, c.enable_comp,
-        c.bp_lo_hz, c.bp_hi_hz, c.bp_stages, c.bp_stages * 12,
-        c.eq_low_hz, c.eq_low_db,
-        c.eq_high_hz, c.eq_high_db,
-        c.comp_thr_db, c.comp_ratio, c.comp_attack_ms, c.comp_release_ms, c.comp_makeup_db, c.comp_knee_db, c.comp_out_limit,
-        c.amp_gain, c.amp_min_a
-    );
+    cdc_printf("CFG:\r\n");
+    cdc_printf("  fw=" FW_VERSION "  built=" FW_BUILD "\r\n");
+    cdc_printf("  freq=%s Hz (target)  ppm=%.3f  tx=%s  txpwr=%d dBm\r\n",
+               freq_str, g_ppm_correction, g_tx_enabled ? "ON" : "OFF", g_tx_power_max_dbm);
+    cdc_printf("  mode=%s  tune=%s  gps=%s  gpsgate=%s  config=%s\r\n",
+               g_tx_mode ? "CW" : "USB", g_tune_active ? "ON" : "OFF",
+               gpsdo_is_ready() ? "ready" : "wait", g_gps_gate ? "ON" : "OFF",
+               g_persist_dirty ? "unsaved" : (g_persist_loaded ? "flash" : "defaults"));
+    cdc_printf("  keyer=%s  wpm=%u  ratio=%.1f  sidetone=%u Hz  vol=%u%%\r\n",
+               keyer_mode_name(g_cw_mode), (unsigned)g_cw_wpm, (double)g_cw_ratio,
+               (unsigned)g_st_hz, (unsigned)g_st_vol);
+    cdc_printf("  src=%s  mic_gain=%.1f  mic_gate=%.3f  ptt=%s\r\n",
+               audio_src_name(g_audio_src), (double)g_mic_gain, (double)g_mic_gate,
+               g_ptt_required ? "required for MIC" : "off (VOX)");
+    cdc_printf("  corrected=%s Hz  base_steps=%lu  fine=%.1f Hz (auto)\r\n",
+               corr_str, (unsigned long)get_base_steps(), fine);
+    cdc_printf("  enable bp=%u eq=%u comp=%u\r\n",
+               c.enable_bandpass, c.enable_eq, c.enable_comp);
+    cdc_printf("  bp_lo=%.1f bp_hi=%.1f bp_stages=%u (%u dB/oct)\r\n",
+               c.bp_lo_hz, c.bp_hi_hz, c.bp_stages, c.bp_stages * 12);
+    cdc_printf("  eq_low_hz=%.1f eq_low_db=%.1f\r\n", c.eq_low_hz, c.eq_low_db);
+    cdc_printf("  eq_high_hz=%.1f eq_high_db=%.1f\r\n", c.eq_high_hz, c.eq_high_db);
+    cdc_printf("  comp_thr=%.1f ratio=%.2f att=%.2fms rel=%.2fms makeup=%.1f knee=%.1f outlim=%.3f\r\n",
+               c.comp_thr_db, c.comp_ratio, c.comp_attack_ms, c.comp_release_ms,
+               c.comp_makeup_db, c.comp_knee_db, c.comp_out_limit);
+    cdc_printf("  amp_gain=%.3f amp_min_a=%.9f\r\n", c.amp_gain, c.amp_min_a);
 }
 
 static void cmd_help(void) {
