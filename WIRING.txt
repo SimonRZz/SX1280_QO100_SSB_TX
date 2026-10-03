@@ -88,6 +88,23 @@ MICROPHONE (MAX4466 electret module, ADC0 on GPIO 26 / Pin 31)
     Without a microphone connected leave src=pc: an open ADC input is noise.
 
 ================================================================================
+SSB PUSH-TO-TALK (GPIO 13 / Pin 17)
+================================================================================
+
+    Button or footswitch:  GPIO 13 ──[ switch ]── GND
+
+    Internal pull-up, active LOW, same 4 ms stability filter as the paddles.
+
+    SSB has no PTT of its own — the carrier follows the audio amplitude. With
+    a live microphone that is permanent VOX, so with src=mic the firmware
+    requires this switch to be held ("ptt 1", the default). The OLED TX field
+    shows "PTT" while it is holding transmission back.
+
+    "ptt 0" disables the requirement and restores the old VOX behaviour.
+    PC audio (src=pc) is never gated, so WSJT-X and similar keep working
+    without a switch.
+
+================================================================================
 CW KEY / PADDLE JACK (3.5 mm stereo)
 ================================================================================
 
@@ -115,4 +132,4 @@ GPIO SUMMARY (this fork)
     GPIO 10  —  Encoder push              GPIO 26  —  Microphone (MAX4466, ADC0)
     GPIO 11  —  CW dah                    GPIO 27  —  (free, ADC1)
     GPIO 12  —  Sidetone PWM              GPIO 28  —  (free, ADC2)
-    GPIO 13  —  (free)
+    GPIO 13  —  SSB PTT
