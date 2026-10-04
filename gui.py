@@ -1043,10 +1043,20 @@ class SX1280ControlApp(ttk.Frame):
                                        font=("Consolas", 10, "bold"))
         self.ptt_state_lbl.grid(row=3, column=3, sticky="w", pady=(8, 0))
 
+        # Live level meter — the only practical way to set the gain while talking
+        ttk.Label(asf, text="Level:").grid(row=4, column=0, sticky="w", pady=(8, 0))
+        self.mic_meter = tk.Canvas(asf, width=320, height=18, highlightthickness=1,
+                                   highlightbackground="#999999", bg="#f0f0f0")
+        self.mic_meter.grid(row=4, column=1, columnspan=2, sticky="w", padx=6, pady=(8, 0))
+        self.mic_meter_lbl = ttk.Label(asf, text="—", width=14, font=("Consolas", 9))
+        self.mic_meter_lbl.grid(row=4, column=3, sticky="w", pady=(8, 0))
+        self._mic_peak_hold = 0.0
+        self._mic_peak_age = 0
+
         ttk.Label(asf, text="Without a microphone wired to GP26 keep PC selected — an open ADC input is noise. "
                             "The OLED MODE item cycles USB PC → USB MIC → CW. SSB has no PTT of its own: "
                             "with the microphone selected and this unchecked, any room noise transmits.",
-                  foreground="gray", wraplength=760, justify="left").grid(row=4, column=0, columnspan=4,
+                  foreground="gray", wraplength=760, justify="left").grid(row=5, column=0, columnspan=4,
                                                                            sticky="w", pady=(6, 0))
 
         cwf = ttk.LabelFrame(tab, text="CW Test Mode", padding=20)
@@ -1252,6 +1262,55 @@ class SX1280ControlApp(ttk.Frame):
         if self._status_updating:
             return
         self._send_cmd_safe(f"src {self.audio_src_var.get()}")
+
+    _MIC_METER_W = 320
+
+    def _handle_mic_level(self, line):
+        """!M pk=<0..1000> env=<0..1000> thr=<0..1000> gate=<0|1>"""
+        kv = {}
+        for p in line[3:].split():
+            if "=" in p:
+                k, v = p.split("=", 1)
+                kv[k] = v
+        try:
+            pk   = int(kv.get("pk", 0)) / 1000.0
+            env  = int(kv.get("env", 0)) / 1000.0
+            thr  = int(kv.get("thr", 0)) / 1000.0
+            gate = kv.get("gate") == "1"
+        except ValueError:
+            return
+
+        # Peak hold decays after about a second so a short syllable stays readable
+        if pk >= self._mic_peak_hold:
+            self._mic_peak_hold = pk
+            self._mic_peak_age = 0
+        else:
+            self._mic_peak_age += 1
+            if self._mic_peak_age > 10:
+                self._mic_peak_hold = max(pk, self._mic_peak_hold - 0.05)
+
+        w, h = self._MIC_METER_W, 18
+        c = self.mic_meter
+        c.delete("all")
+        # bar: green while clean, orange approaching full scale, red at clipping
+        lvl = min(pk, 1.0)
+        colour = "#cc0000" if lvl >= 0.99 else "#cc8800" if lvl > 0.8 else "#2e8b2e"
+        if lvl > 0:
+            c.create_rectangle(0, 0, int(w * lvl), h, fill=colour, outline="")
+        # gate threshold: below this nothing is transmitted
+        tx = int(w * min(thr, 1.0))
+        c.create_line(tx, 0, tx, h, fill="#0066cc", width=2)
+        # peak hold
+        px = int(w * min(self._mic_peak_hold, 1.0))
+        if px > 1:
+            c.create_line(px, 0, px, h, fill="#333333", width=2)
+
+        self.mic_meter_lbl.config(
+            text=f"{lvl*100:3.0f}%  {'OPEN' if gate else 'shut'}",
+            foreground="#cc0000" if lvl >= 0.99 else ("#007700" if gate else "#888888"))
+        if abs(float(self.mic_gate_var.get()) - thr) > 0.0005:
+            self.mic_gate_var.set(thr)
+            self.mic_gate_lbl.config(text=f"{thr:.3f}")
 
     def _on_ptt_req(self):
         if self._status_updating:
@@ -2055,7 +2114,7 @@ class SX1280ControlApp(ttk.Frame):
     def _classify_log(msg, tag):
         if tag != "recv":
             return tag
-        if msg.startswith(("!S ", "!K ")):
+        if msg.startswith(("!S ", "!K ", "!M ")):
             return "status"
         if msg.startswith("GPSDO:"):
             return "gpsdo"
@@ -2211,6 +2270,10 @@ class SX1280ControlApp(ttk.Frame):
                         self._log(line, "recv")
                 elif line.startswith("!K "):
                     self._handle_keyer_event(line)
+                    if self.log_show_status_var.get():
+                        self._log(line, "recv")
+                elif line.startswith("!M "):
+                    self._handle_mic_level(line)
                     if self.log_show_status_var.get():
                         self._log(line, "recv")
                 else:

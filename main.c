@@ -2703,6 +2703,7 @@ static uint32_t s_mic_rd   = 0;
 static float    s_mic_dc   = 0.0f;   // DC estimate (MAX4466 idles at VCC/2)
 static float    s_mic_env  = 0.0f;   // gate envelope
 static float    s_mic_ggain = 0.0f;  // smoothed gate gain 0..1
+static volatile float s_mic_peak = 0.0f;  // |x| peak since the last level report
 static uint32_t s_mic_hold = 0;
 
 static inline uint32_t mic_wr_index(void) {
@@ -2729,6 +2730,7 @@ static float mic_get_sample(void) {
     x = (x - s_mic_dc) * g_mic_gain;
 
     float ax = fabsf(x);
+    if (ax > s_mic_peak) s_mic_peak = ax;   // peak hold for the GUI meter
     s_mic_env += (ax > s_mic_env ? 0.2f : 0.002f) * (ax - s_mic_env);
     const float thr = g_mic_gate;
     bool open;
@@ -3304,6 +3306,28 @@ static void persist_maybe_autosave(void) {
 // them: in MIC mode the producer is paced by the ADC at the same rate Core1
 // consumes, so the "wait for a free block" loop almost never runs and the
 // display would otherwise stop updating entirely.
+// Microphone level for the GUI meter. Only while the mic is the source, so
+// it costs nothing otherwise. Peak since the last report, because an
+// envelope snapshot from 'diag' is almost impossible to catch while talking.
+static void mic_level_push(void) {
+#if CFG_TUD_CDC
+    if (g_audio_src != AUDIO_SRC_MIC || !tud_cdc_connected()) return;
+    static uint32_t last_ms = 0;
+    const uint32_t now = to_ms_since_boot(get_absolute_time());
+    if ((now - last_ms) < 100u) return;
+    last_ms = now;
+
+    float pk = s_mic_peak;
+    s_mic_peak = 0.0f;
+    if (pk > 1.0f) pk = 1.0f;
+    cdc_printf("!M pk=%u env=%u thr=%u gate=%u\r\n",
+               (unsigned)(pk * 1000.0f),
+               (unsigned)(s_mic_env * 1000.0f),
+               (unsigned)(g_mic_gate * 1000.0f),
+               (unsigned)(s_mic_ggain > 0.5f));
+#endif
+}
+
 static void ui_service(void) {
     static absolute_time_t oled_next = {0};
     if (!ssd1306_dma_busy() &&
@@ -3314,6 +3338,7 @@ static void ui_service(void) {
     }
 #if CFG_TUD_CDC
     cdc_status_push();
+    mic_level_push();
 #endif
 }
 
