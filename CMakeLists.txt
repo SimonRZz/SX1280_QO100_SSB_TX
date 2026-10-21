@@ -44,6 +44,7 @@ add_executable(SX1280SDR
     main.c
     ssd1306.c
     gpsdo.c
+    si4732.c
     usb_descriptors.c
 )
 
@@ -52,6 +53,16 @@ pico_set_program_version(SX1280SDR "0.1")
 
 # UART0 stdio disabled — GP0/GP1 are used by GPSDO I2C0 (SI5351).
 # All control is via USB CDC (TinyUSB).
+# The Si473x SSB patch is a third-party blob fetched on demand, not tracked in
+# git. Say plainly at configure time whether this build will be able to do SSB,
+# so a missing fetch does not turn into a puzzling AM-only receiver.
+if(EXISTS ${CMAKE_CURRENT_LIST_DIR}/ssb_patch.h)
+    message(STATUS "Si4732: SSB patch found - sideband receive enabled")
+else()
+    message(STATUS "Si4732: ssb_patch.h missing - receiver will be AM only. "
+                   "Run 'sh tools/fetch_ssb_patch.sh' for SSB.")
+endif()
+
 pico_enable_stdio_uart(SX1280SDR 0)
 pico_enable_stdio_usb(SX1280SDR 0)
 

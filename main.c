@@ -31,6 +31,7 @@
 
 // GPSDO (SI5351 52 MHz clock gen + NEO-7M GPS)
 #include "gpsdo.h"
+#include "si4732.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -1428,6 +1429,17 @@ static void cmd_help(void) {
         "  set amp_gain <float>\r\n"
         "  set amp_min_a <float>\r\n"
         "\r\n"
+        "Receive (Si4732, QO-100 downlink via LNB + mixer):\r\n"
+        "  rx                   - receiver status\r\n"
+        "  rx diag              - detailed receiver report\r\n"
+        "  rx on | off          - power the receiver up / down\r\n"
+        "  rx usb | lsb | am    - demodulation mode (sideband needs the SSB patch)\r\n"
+        "  rx freq <kHz>        - 2300..26100, the IF from the mixer\r\n"
+        "  rx vol <0..63>\r\n"
+        "  rx bw <Hz>           - nearest available filter is used\r\n"
+        "  rx bfo <Hz>          - fine tuning, 8 Hz steps\r\n"
+        "  rx mute 0|1\r\n"
+        "\r\n"
         "Frequency is automatically split into PLL steps + fine DSP offset.\r\n"
     );
 }
@@ -1719,6 +1731,30 @@ static void cdc_status_push_ex(bool force) {
 static inline void cdc_status_push(void) { cdc_status_push_ex(false); }
 #endif
 
+// Both stdio backends are off in this build, so the Si4732 driver cannot use
+// printf. It hands its messages here instead and they go out on the console
+// like everything else.
+static void si4732_log_sink(const char *line) {
+    cdc_printf("%s\r\n", line);
+}
+
+// One machine-readable line, in the same shape as the other "!" pushes so the
+// GUI can pick it apart: !R on= mode= freq= bw= bfo= vol= mute= rssi= snr=
+static void rx_status_print(void) {
+    uint8_t rssi = 0, snr = 0;
+    bool have_rsq = si4732_read_rsq(&rssi, &snr);
+    cdc_printf("!R on=%d mode=%s freq=%lu bw=%u bfo=%d vol=%u mute=%d rssi=%d snr=%d\r\n",
+               si4732_is_on() ? 1 : 0,
+               si4732_mode_name(si4732_get_mode()),
+               (unsigned long)si4732_get_khz(),
+               si4732_get_bandwidth_hz(),
+               (int)si4732_get_bfo_hz(),
+               si4732_get_volume(),
+               si4732_get_mute() ? 1 : 0,
+               have_rsq ? (int)rssi : -1,
+               have_rsq ? (int)snr  : -1);
+}
+
 static void cdc_handle_line(char *line) {
     char *argv[6] = {0};
     int argc = 0;
@@ -1736,6 +1772,76 @@ static void cdc_handle_line(char *line) {
         char gbuf[128];
         gpsdo_format_status(gbuf, sizeof(gbuf));
         cdc_write_str(gbuf);
+        return;
+    }
+    // Receiver: rx [diag|on|off|usb|lsb|am|freq|vol|bw|bfo|mute]
+    if (streqi(argv[0], "rx")) {
+        if (!si4732_present()) {
+            cdc_write_str("ERR: no Si4732 on the bus — try 'rx diag'\r\n");
+            if (argc >= 2 && streqi(argv[1], "diag")) si4732_diag_print();
+            return;
+        }
+        if (argc < 2) { rx_status_print(); return; }
+
+        if (streqi(argv[1], "diag")) { si4732_diag_print(); return; }
+
+        if (streqi(argv[1], "on") || streqi(argv[1], "off")) {
+            bool on = streqi(argv[1], "on");
+            if (on) {
+                if (!si4732_set_mode(si4732_get_mode())) {
+                    cdc_write_str("ERR: receiver power-up failed — 'rx diag' for why\r\n");
+                    return;
+                }
+            } else {
+                si4732_power_down();
+            }
+            rx_status_print();
+            return;
+        }
+
+        if (streqi(argv[1], "usb") || streqi(argv[1], "lsb") || streqi(argv[1], "am")) {
+            si4732_mode_t m = streqi(argv[1], "usb") ? SI4732_MODE_USB
+                            : streqi(argv[1], "lsb") ? SI4732_MODE_LSB
+                                                     : SI4732_MODE_AM;
+            if (!si4732_set_mode(m)) {
+                cdc_write_str(si4732_has_ssb()
+                    ? "ERR: mode change failed — 'rx diag' for why\r\n"
+                    : "ERR: no SSB patch in this build — run tools/fetch_ssb_patch.sh "
+                      "and rebuild, or use 'rx am'\r\n");
+                return;
+            }
+            rx_status_print();
+            return;
+        }
+
+        if (argc < 3) { cdc_write_str("ERR: value missing — see 'help'\r\n"); return; }
+
+        if (streqi(argv[1], "freq")) {
+            long v = strtol(argv[2], NULL, 10);
+            if (!si4732_tune_khz((uint32_t)v)) {
+                cdc_write_str("ERR: rx freq 2300..26100 (kHz)\r\n");
+                return;
+            }
+        } else if (streqi(argv[1], "vol")) {
+            long v = strtol(argv[2], NULL, 10);
+            if (v < 0)  v = 0;
+            if (v > 63) v = 63;
+            si4732_set_volume((uint8_t)v);
+        } else if (streqi(argv[1], "bw")) {
+            long v = strtol(argv[2], NULL, 10);
+            if (v < 100 || v > 8000) { cdc_write_str("ERR: rx bw 100..8000 (Hz)\r\n"); return; }
+            si4732_set_bandwidth_hz((uint16_t)v);
+        } else if (streqi(argv[1], "bfo")) {
+            long v = strtol(argv[2], NULL, 10);
+            if (v < -16000 || v > 16000) { cdc_write_str("ERR: rx bfo -16000..16000 (Hz)\r\n"); return; }
+            si4732_set_bfo_hz((int16_t)v);
+        } else if (streqi(argv[1], "mute")) {
+            si4732_set_mute(strtol(argv[2], NULL, 10) != 0);
+        } else {
+            cdc_write_str("ERR: unknown rx subcommand — see 'help'\r\n");
+            return;
+        }
+        rx_status_print();
         return;
     }
     if (streqi(argv[0], "save")) {
@@ -3462,6 +3568,13 @@ int main(void) {
                           "TX stays blocked until GPS UTC is valid (see 'gpsgate').\r\n");
         }
     }
+
+    // ---- Si4732 receiver (shares I2C0 with the SI5351, RST on GP13) ----
+    // After gpsdo_init(), which owns the bus setup, and deliberately not
+    // powered up here: the patch upload takes a couple of seconds at 100 kHz,
+    // so the operator starts the receiver with "rx on" when they want it.
+    si4732_set_log(si4732_log_sink);
+    si4732_init();
 
     // Release SX1280 from reset (was held LOW during GPSDO init) and initialise
     printf("[SX1280] Resetting...\n");
