@@ -1436,10 +1436,15 @@ static void cmd_help(void) {
         "  rx diag              - detailed receiver report\r\n"
         "  rx on | off          - power the receiver up / down\r\n"
         "  rx usb | lsb | am    - demodulation mode (sideband needs the SSB patch)\r\n"
-        "  rx freq <kHz>        - 2300..26100, the IF from the mixer\r\n"
+        "  rx freq <kHz>        - 2300..26100, the IF from the mixer.\r\n"
+        "                         Decimals allowed: 19500.5 is 19 500 500 Hz.\r\n"
+        "  rx cal <Hz>          - LNB oscillator error, saved to flash. Measure\r\n"
+        "                         it on the lower QO-100 beacon: 10489.500 MHz\r\n"
+        "                         should land at 739.500 MHz, so a beacon seen\r\n"
+        "                         at 739.512 means 'rx cal 12000'.\r\n"
         "  rx vol <0..63>\r\n"
         "  rx bw <Hz>           - nearest available filter is used\r\n"
-        "  rx bfo <Hz>          - fine tuning, 8 Hz steps\r\n"
+        "  rx bfo <Hz>          - raw BFO; the next tune overwrites it\r\n"
         "  rx mute 0|1\r\n"
         "\r\n"
         "Frequency is automatically split into PLL steps + fine DSP offset.\r\n"
@@ -1461,7 +1466,7 @@ static void cfg_commit(const audio_cfg_t *c) {
 // GPS gate, soft key) is deliberately volatile and resets at boot.
 #define CFG_FLASH_OFFSET   (PICO_FLASH_SIZE_BYTES - FLASH_SECTOR_SIZE)
 #define CFG_MAGIC          0x51303130u   // 'Q010'
-#define CFG_VERSION        4u            // bump whenever persist_cfg_t layout changes
+#define CFG_VERSION        5u            // bump whenever persist_cfg_t layout changes
 
 typedef struct __attribute__((packed)) {
     uint32_t    magic;
@@ -1480,6 +1485,14 @@ typedef struct __attribute__((packed)) {
     float       mic_gate;
     uint8_t     oled_flip;
     uint8_t     ptt_req_p1;      // 0 = unset (older save), else g_ptt_required + 1
+    // Receive side. rx_cal_hz is the one that really has to survive a power
+    // cycle: it stands in for GPS discipline, which the Bullseye LNB cannot
+    // take, and re-measuring it on the beacon at every boot would be tedious.
+    int32_t     rx_cal_hz;       // LNB LO error in Hz (signal arrives this high)
+    uint32_t    rx_hz;           // last receive frequency
+    uint8_t     rx_mode;         // SI4732_MODE_*
+    uint8_t     rx_vol;          // 0..63
+    uint16_t    rx_bw_hz;
     uint8_t     _reserved[6];    // future fields fit here without a version bump
     audio_cfg_t dsp;
     uint32_t    crc32;           // over everything above
@@ -1522,6 +1535,11 @@ static void persist_collect(persist_cfg_t *c) {
     c->mic_gate       = g_mic_gate;
     c->oled_flip      = g_oled_flip;
     c->ptt_req_p1     = (uint8_t)(g_ptt_required + 1u);
+    c->rx_cal_hz      = si4732_get_cal_hz();
+    c->rx_hz          = si4732_get_hz();
+    c->rx_mode        = (uint8_t)si4732_get_mode();
+    c->rx_vol         = si4732_get_volume();
+    c->rx_bw_hz       = si4732_get_bandwidth_hz();
     __compiler_memory_barrier();
     memcpy(&c->dsp, (const void *)&g_cfg, sizeof(c->dsp));
     __compiler_memory_barrier();
@@ -1561,6 +1579,11 @@ static void persist_apply(const persist_cfg_t *c) {
     // 0 means the field did not exist yet when this was saved — default to on,
     // which is the safe direction (fails to not transmitting).
     g_ptt_required = (c->ptt_req_p1 == 0u) ? 1 : ((c->ptt_req_p1 == 1u) ? 0 : 1);
+
+    // Only remembered here — the receiver has not been probed yet at this
+    // point, and the first "rx on" applies the lot.
+    si4732_restore((si4732_mode_t)c->rx_mode, c->rx_hz, c->rx_vol,
+                   c->rx_bw_hz, c->rx_cal_hz);
 
     audio_cfg_t d = c->dsp;
     cfg_sanitize(&d, (float)WAV_SAMPLE_RATE);
@@ -1745,10 +1768,11 @@ static void si4732_log_sink(const char *line) {
 static void rx_status_print(void) {
     uint8_t rssi = 0, snr = 0;
     bool have_rsq = si4732_read_rsq(&rssi, &snr);
-    cdc_printf("!R on=%d mode=%s freq=%lu bw=%u bfo=%d vol=%u mute=%d rssi=%d snr=%d\r\n",
+    cdc_printf("!R on=%d mode=%s hz=%lu cal=%ld bw=%u bfo=%d vol=%u mute=%d rssi=%d snr=%d\r\n",
                si4732_is_on() ? 1 : 0,
                si4732_mode_name(si4732_get_mode()),
-               (unsigned long)si4732_get_khz(),
+               (unsigned long)si4732_get_hz(),
+               (long)si4732_get_cal_hz(),
                si4732_get_bandwidth_hz(),
                (int)si4732_get_bfo_hz(),
                si4732_get_volume(),
@@ -1832,11 +1856,27 @@ static void cdc_handle_line(char *line) {
         if (argc < 3) { cdc_write_str("ERR: value missing — see 'help'\r\n"); return; }
 
         if (streqi(argv[1], "freq")) {
-            long v = strtol(argv[2], NULL, 10);
-            if (!si4732_tune_khz((uint32_t)v)) {
-                cdc_write_str("ERR: rx freq 2300..26100 (kHz)\r\n");
+            // kHz, decimals allowed: "rx freq 19500.5" is 19 500 500 Hz. The
+            // driver splits that into whole kHz for the tuner and the rest
+            // into the BFO.
+            double khz = strtod(argv[2], NULL);
+            if (!(khz >= 2300.0 && khz <= 26100.0)) {
+                cdc_write_str("ERR: rx freq 2300..26100 (kHz, decimals allowed)\r\n");
                 return;
             }
+            if (!si4732_tune_hz((uint32_t)(khz * 1000.0 + 0.5))) {
+                cdc_printf("ERR: %.3f kHz is outside the band once the %+ld Hz "
+                           "calibration is applied\r\n",
+                           khz, (long)si4732_get_cal_hz());
+                return;
+            }
+        } else if (streqi(argv[1], "cal")) {
+            long v = strtol(argv[2], NULL, 10);
+            if (!si4732_set_cal_hz((int32_t)v)) {
+                cdc_write_str("ERR: rx cal -200000..200000 (Hz)\r\n");
+                return;
+            }
+            persist_mark_dirty();
         } else if (streqi(argv[1], "vol")) {
             long v = strtol(argv[2], NULL, 10);
             if (v < 0)  v = 0;
@@ -1880,6 +1920,8 @@ static void cdc_handle_line(char *line) {
         g_mic_gate         = 0.02f;
         g_ptt_required     = 1;
         if (g_oled_flip) { g_oled_flip = 0; ssd1306_set_flip(OLED_I2C, false); }
+        // Receive side back to the planned QO-100 IF, no LNB calibration.
+        si4732_restore(SI4732_MODE_USB, 19500000u, 32u, 2200u, 0);
         keyer_reset();
         cfg_commit(&k_cfg_defaults);
         if (g_tune_active) tune_apply_settings();

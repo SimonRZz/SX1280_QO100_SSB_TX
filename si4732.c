@@ -89,7 +89,9 @@ static uint8_t       s_addr      = 0x00u;
 static bool          s_present   = false;
 static bool          s_on        = false;
 static si4732_mode_t s_mode      = SI4732_MODE_USB;
-static uint32_t      s_khz       = 19500u;   // middle of the planned IF
+static uint32_t      s_hz        = 19500000u; // middle of the planned IF
+static uint32_t      s_khz       = 19500u;    // what the tuner was actually given
+static int32_t       s_cal_hz    = 0;         // LNB LO error, see si4732.h
 static uint8_t       s_volume    = 32u;
 static uint16_t      s_bw_hz     = 2200u;
 static int16_t       s_bfo_hz    = 0;
@@ -430,14 +432,78 @@ void si4732_power_down(void)
 
 bool si4732_tune_khz(uint32_t khz)
 {
+    return si4732_tune_hz(khz * 1000u);
+}
+
+uint32_t si4732_get_hz(void) { return s_hz; }
+
+// Splits the wanted frequency into what the tuner can take and what the BFO
+// has to make up. The calibration offset is added here, in one place, so
+// everything above this layer can work in true downlink terms and stay unaware
+// of the LNB's error.
+//
+// SIGN CONVENTION OF THE BFO IS ASSUMED, NOT VERIFIED: positive BFO is taken to
+// shift the received frequency up, the same direction as the tuner. Check it on
+// the beacon — tune to it, then "rx bfo 500" and listen whether the tone rises
+// or falls. If it falls, the one negation below is wrong and nothing else is.
+bool si4732_tune_hz(uint32_t hz)
+{
     if (!s_present) return false;
-    if (khz < SI_KHZ_MIN || khz > SI_KHZ_MAX) {
-        s_last_err = "frequency outside 2300..26100 kHz";
+
+    int64_t want = (int64_t)hz + (int64_t)s_cal_hz;
+    if (want < (int64_t)SI_KHZ_MIN * 1000 || want > (int64_t)SI_KHZ_MAX * 1000) {
+        s_last_err = "frequency outside 2300..26100 kHz after calibration";
         return false;
     }
-    s_khz = khz;
+
+    uint32_t khz = (uint32_t)((want + 500) / 1000);          // nearest kHz
+    int32_t  rem = (int32_t)(want - (int64_t)khz * 1000);    // -500..+499 Hz
+
+    s_hz     = hz;
+    s_khz    = khz;
+    s_bfo_hz = (int16_t)rem;
+
     if (!s_on) return true;       // remembered, applied at power-up
-    return si_tune();
+
+    bool ok = si_tune();
+    if (s_mode != SI4732_MODE_AM)
+        ok = si_set_prop(PROP_SSB_BFO, (uint16_t)(int16_t)s_bfo_hz) && ok;
+    return ok;
+}
+
+bool si4732_set_cal_hz(int32_t hz)
+{
+    // Wider than any LNB should ever be off, but narrow enough that a typo
+    // cannot push the tuning out of the band.
+    if (hz < -200000 || hz > 200000) {
+        s_last_err = "calibration outside +-200 kHz";
+        return false;
+    }
+    s_cal_hz = hz;
+    return si4732_tune_hz(s_hz);   // re-apply at the new offset
+}
+
+int32_t si4732_get_cal_hz(void) { return s_cal_hz; }
+
+void si4732_restore(si4732_mode_t mode, uint32_t hz, uint8_t vol,
+                    uint16_t bw_hz, int32_t cal_hz)
+{
+    s_mode = (mode == SI4732_MODE_LSB || mode == SI4732_MODE_USB ||
+              mode == SI4732_MODE_AM) ? mode : SI4732_MODE_USB;
+
+    s_cal_hz = (cal_hz >= -200000 && cal_hz <= 200000) ? cal_hz : 0;
+
+    s_volume = (vol <= 63u) ? vol : 32u;
+
+    s_bw_hz = bw_nearest((bw_hz >= 100u && bw_hz <= 8000u) ? bw_hz : 2200u,
+                         s_mode != SI4732_MODE_AM)->hz;
+
+    // Checked against the band after calibration, exactly as tuning would.
+    int64_t want = (int64_t)hz + (int64_t)s_cal_hz;
+    if (want < (int64_t)SI_KHZ_MIN * 1000 || want > (int64_t)SI_KHZ_MAX * 1000)
+        hz = 19500000u;
+    s_hz  = hz;
+    s_khz = (uint32_t)(((int64_t)hz + s_cal_hz + 500) / 1000);
 }
 
 bool si4732_set_bfo_hz(int16_t hz)

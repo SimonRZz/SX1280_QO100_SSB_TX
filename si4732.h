@@ -45,10 +45,40 @@ si4732_mode_t si4732_get_mode(void);
 void     si4732_power_down(void);
 bool     si4732_is_on(void);
 
+// Tuning. The chip itself only accepts whole kilohertz, which is useless for
+// SSB — a kilohertz of error puts every voice a kilohertz off pitch. So the
+// Hz-resolution entry point rounds to the nearest kHz for the tuner and puts
+// the remainder into the BFO, which steps in 8 Hz. Prefer it over the kHz form.
+bool     si4732_tune_hz(uint32_t hz);
+uint32_t si4732_get_hz(void);
+
 bool     si4732_tune_khz(uint32_t khz);   // 2300..26100 (SW band)
 uint32_t si4732_get_khz(void);
 
-bool     si4732_set_bfo_hz(int16_t hz);   // fine tuning, 8 Hz steps
+// The LNB's local-oscillator error, in Hz, as the amount by which everything
+// arrives HIGH of where it should. Measure it on the QO-100 beacon: the lower
+// CW beacon at 10489.500 MHz should land at 739.500 MHz out of a 9750 MHz LNB,
+// so a beacon seen at 739.512 MHz means +12000.
+//
+// The Bullseye LNB cannot take an external reference — its 25 MHz connector is
+// an output — so this offset is what stands in for GPS discipline on the
+// receive side. Its TCXO is ±2 ppm, roughly ±10 kHz at 23 °C and ±30 kHz over
+// the full temperature range, so one calibration holds for a session.
+bool     si4732_set_cal_hz(int32_t hz);
+int32_t  si4732_get_cal_hz(void);
+
+// Adopt saved settings without touching the chip. Called at boot, before the
+// receiver has even been probed — the first si4732_set_mode() then applies all
+// of it at once. Values are range-checked and silently replaced by the
+// defaults where they are not plausible.
+void     si4732_restore(si4732_mode_t mode, uint32_t hz, uint8_t vol,
+                        uint16_t bw_hz, int32_t cal_hz);
+
+// Raw access to the beat frequency offset. Normally you do not want this:
+// si4732_tune_hz() owns the BFO and uses it for the sub-kilohertz part of the
+// tuning, so the next tune overwrites whatever is set here. It is kept for
+// checking the sign convention on the beacon.
+bool     si4732_set_bfo_hz(int16_t hz);
 int16_t  si4732_get_bfo_hz(void);
 
 bool     si4732_set_volume(uint8_t vol);  // 0..63
