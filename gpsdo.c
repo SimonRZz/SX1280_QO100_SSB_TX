@@ -48,20 +48,39 @@
 
 // ---------------------------------------------------------------------------
 // SI5351 minimal driver (I2C0)
-// Configures 52 MHz on CLK1 from a 24 MHz GPS TIMEPULSE reference.
+// Two outputs, both from the 24 MHz GPS TIMEPULSE reference:
 //
-// VCO:    24 MHz × (36 + 5/6) = 884 MHz   (PLL A)
-// CLK1:   884 MHz ÷ 17        = 52 MHz    (integer divider)
+//   CLK1  52 MHz  → SX1280 XTA        PLL A: 24 MHz × (36 + 5/6) = 884 MHz
+//                                     MS1:   884 ÷ 17 = 52 MHz
+//   CLK0 144 MHz  → receive mixer LO  PLL B: 24 MHz × 36        = 864 MHz
+//                                     MS0:   864 ÷ 6  = 144 MHz
+//
+// The mixer does not run on 144 MHz itself: its local oscillator is the 5th
+// harmonic at 720 MHz, picked out by a high-pass and lifted by an SPF5189Z at
+// the receiver. That is why CLK0 runs at 8 mA — the harmonic lives on the edge
+// steepness — and why the divider is a plain even integer. Multiplying by 5
+// also multiplies the phase noise by 20·log10(5) = 14 dB, so there is no room
+// for a fractional divider here. 144 MHz is the only frequency near the target
+// that PLL B reaches with an integer divider (720 ÷ 144 = 5 is not a legal
+// MultiSynth value, 864 ÷ 6 is).
+//
+// PLL A stays fractional, as it always was: 52 MHz needs a 624 MHz VCO for an
+// integer path and there are only two PLLs. It has been on the air like this.
 //
 // Register values:
 //   PLL A: p1=4202 (0x106A), p2=4, p3=6
 //   MS1:   p1=1664 (0x0680), p2=0, p3=1
+//   PLL B: p1=4096 (0x1000), p2=0, p3=1
+//   MS0:   p1=256  (0x0100), p2=0, p3=1
 // ---------------------------------------------------------------------------
 // SI5351 I2C address — auto-detected in gpsdo_init().
 // Common values: 0x60 (SDO/AD0=GND), 0x61 (SDO/AD0=VCC).
 // Some boards use 0x62 or 0x63; all four are tried.
 // 0x00 means "not found yet".
 static uint8_t s_si_addr = 0x00u;
+
+// Whether CLK0 (144 MHz, the receive mixer LO) is currently enabled.
+static bool s_loOn = false;
 
 #define SI_REG_STATUS      0u    // Device status (read-only)
 #define SI_STATUS_SYS_INIT (1u << 7) // 1 = calibrating (not ready)
@@ -72,9 +91,17 @@ static uint8_t s_si_addr = 0x00u;
 #define SI_REG_CLK1_CTRL   17u
 #define SI_REG_CLK2_CTRL   18u
 #define SI_REG_PLLA_BASE   26u   // 8 bytes: regs 26-33
+#define SI_REG_PLLB_BASE   34u   // 8 bytes: regs 34-41
+#define SI_REG_MS0_BASE    42u   // 8 bytes: regs 42-49
 #define SI_REG_MS1_BASE    50u   // 8 bytes: regs 50-57  (MS2/CLK2 starts at 58)
 #define SI_REG_PLL_RESET   177u
 #define SI_REG_XTAL_LOAD   183u
+
+// Output enable is active LOW, one bit per clock. CLK1 must never be disabled —
+// it is the SX1280's only clock.
+#define SI_OEB_ALL_OFF     0xFFu
+#define SI_OEB_CLK1        0xFDu  // CLK1 on, CLK0 and CLK2 off
+#define SI_OEB_CLK1_CLK0   0xFCu  // CLK1 and CLK0 on
 
 // Scan 0x60–0x63 (all valid SI5351 I2C addresses).
 // Retries up to 3 times with a short delay between attempts.
@@ -120,22 +147,27 @@ static bool si_read_reg(uint8_t reg, uint8_t *val)
     return i2c_read_blocking(GPSDO_I2C, s_si_addr, val, 1, false) == 1;
 }
 
-static bool si5351_init_52mhz(void)
+static bool si5351_init_clocks(void)
 {
     // Scan for SI5351 at 0x60–0x63 before writing any registers.
     if (!si5351_scan()) return false;
 
     // Disable all outputs while configuring.
-    if (!si_write_reg(SI_REG_OEB, 0xFFu)) return false;
+    if (!si_write_reg(SI_REG_OEB, SI_OEB_ALL_OFF)) return false;
 
-    // Power down unused CLK0 and CLK2.
-    si_write_reg(SI_REG_CLK0_CTRL, 0x80u);
+    // Power down unused CLK2.
     si_write_reg(SI_REG_CLK2_CTRL, 0x80u);
 
     // CLK1: PDN=0, INT=1 (integer mode), MS_SRC=PLLA, INV=0,
     //        CLK_SRC=MS1(self)=0b11, IDRV=4mA=0b01
     //   Byte: 0b 0 1 0 0 11 01 = 0x4D
     si_write_reg(SI_REG_CLK1_CTRL, 0x4Du);
+
+    // CLK0: PDN=0, INT=1, MS_SRC=PLLB, INV=0, CLK_SRC=MS0=0b11, IDRV=8mA=0b11
+    //   Byte: 0b 0 1 1 0 11 11 = 0x6F
+    // 8 mA is deliberate: the wanted signal is the 5th harmonic, which only
+    // exists because the edges are steep.
+    si_write_reg(SI_REG_CLK0_CTRL, 0x6Fu);
 
     // Crystal load capacitance: 8 pF (bits[7:6]=0b10) + reserved 0x12.
     si_write_reg(SI_REG_XTAL_LOAD, 0x92u);
@@ -163,14 +195,50 @@ static bool si5351_init_52mhz(void)
     };
     if (!si_write_regs(SI_REG_MS1_BASE, ms1, 8u)) return false;
 
-    // Reset PLLs to lock them to the new multisynth settings.
+    // PLL B: p1=4096=0x1000, p2=0, p3=1  →  24 MHz × 36 = 864 MHz
+    static const uint8_t pllb[8] = {
+        0x00u, 0x01u,   // p3=1
+        0x00u,          // p1[17:16]=0
+        0x10u, 0x00u,   // p1[15:8]=0x10, p1[7:0]=0x00  (4096)
+        0x00u,          // upper nibbles of p3/p2 = 0
+        0x00u, 0x00u    // p2=0
+    };
+    if (!si_write_regs(SI_REG_PLLB_BASE, pllb, 8u)) return false;
+
+    // MS0 (CLK0): p1=256=0x0100, p2=0, p3=1  →  864 ÷ 6 = 144 MHz
+    static const uint8_t ms0[8] = {
+        0x00u, 0x01u,   // p3=1
+        0x00u,          // R_DIV=/1, DIVBY4=0, p1[17:16]=0
+        0x01u, 0x00u,   // p1[15:8]=0x01, p1[7:0]=0x00  (256)
+        0x00u,          // upper nibbles = 0
+        0x00u, 0x00u    // p2=0
+    };
+    if (!si_write_regs(SI_REG_MS0_BASE, ms0, 8u)) return false;
+
+    // Reset both PLLs to lock them to the new multisynth settings. Safe here
+    // because nothing depends on either clock yet — the SX1280 is still held in
+    // reset. At runtime PLL A must never be reset: the SX1280 would lose its
+    // clock for milliseconds. Reset B alone with 0x80 if that is ever needed.
     si_write_reg(SI_REG_PLL_RESET, 0xA0u);
 
-    // Enable CLK1 only (bit 1 = 0 → enabled).
-    si_write_reg(SI_REG_OEB, 0xFDu);
+    si_write_reg(SI_REG_OEB, SI_OEB_CLK1_CLK0);
+    s_loOn = true;
 
     return true;
 }
+
+// Switch the 144 MHz mixer LO without touching CLK1. Useful for measuring the
+// LO branch against a quiet baseline, and for silencing it during transmit.
+bool gpsdo_set_lo_enabled(bool on)
+{
+    if (s_si_addr == 0x00u) return false;
+    if (!si_write_reg(SI_REG_OEB, on ? SI_OEB_CLK1_CLK0 : SI_OEB_CLK1))
+        return false;
+    s_loOn = on;
+    return true;
+}
+
+bool gpsdo_lo_enabled(void) { return s_loOn; }
 
 // ---------------------------------------------------------------------------
 // Runtime state
@@ -527,7 +595,7 @@ void gpsdo_init(void)
 
     sleep_ms(10u); // SI5351 power-on stabilisation
 
-    s_clk1Ok = si5351_init_52mhz();
+    s_clk1Ok = si5351_init_clocks();
     if (s_clk1Ok) {
         sleep_ms(50u);  // give PLL time to lock before reading status
         si_read_reg(SI_REG_STATUS, &s_si5351_status);
