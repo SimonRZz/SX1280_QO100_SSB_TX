@@ -70,7 +70,7 @@ typedef struct {
 void gpsdo_get_info(gpsdo_info_t *out);
 
 // ---------------------------------------------------------------------------
-// Receive mixer local oscillator — SI5351 CLK0, 144 MHz
+// Receive mixer local oscillator — SI5351 CLK2, 144 MHz
 // ---------------------------------------------------------------------------
 // The downconverter's LO is the 5th harmonic of this, 720 MHz, selected by a
 // high-pass and amplified at the receiver. Enabled at init; these let it be

@@ -1430,7 +1430,7 @@ static void cmd_help(void) {
         "  set amp_min_a <float>\r\n"
         "\r\n"
         "Receive (Si4732, QO-100 downlink via LNB + mixer):\r\n"
-        "  lo [0|1]             - 144 MHz on SI5351 CLK0; mixer LO is its 5th\r\n"
+        "  lo [0|1]             - 144 MHz on SI5351 CLK2; mixer LO is its 5th\r\n"
         "                         harmonic at 720 MHz. On by default.\r\n"
         "  rx                   - receiver status\r\n"
         "  rx diag              - detailed receiver report\r\n"
@@ -1800,7 +1800,7 @@ static void cdc_handle_line(char *line) {
         cdc_write_str(gbuf);
         return;
     }
-    // Receive mixer LO on SI5351 CLK0: lo [0|1]
+    // Receive mixer LO on SI5351 CLK2: lo [0|1]
     if (streqi(argv[0], "lo")) {
         if (argc >= 2) {
             bool on = (strtol(argv[1], NULL, 10) != 0);
@@ -1809,7 +1809,7 @@ static void cdc_handle_line(char *line) {
                 return;
             }
         }
-        cdc_printf("OK lo=%d (CLK0, 144 MHz; mixer LO is the 5th harmonic, 720 MHz)\r\n",
+        cdc_printf("OK lo=%d (CLK2, 144 MHz; mixer LO is the 5th harmonic, 720 MHz)\r\n",
                    gpsdo_lo_enabled() ? 1 : 0);
         return;
     }

@@ -52,12 +52,16 @@
 //
 //   CLK1  52 MHz  → SX1280 XTA        PLL A: 24 MHz × (36 + 5/6) = 884 MHz
 //                                     MS1:   884 ÷ 17 = 52 MHz
-//   CLK0 144 MHz  → receive mixer LO  PLL B: 24 MHz × 36        = 864 MHz
-//                                     MS0:   864 ÷ 6  = 144 MHz
+//   CLK2 144 MHz  → receive mixer LO  PLL B: 24 MHz × 36        = 864 MHz
+//                                     MS2:   864 ÷ 6  = 144 MHz
+//
+// CLK0 is left powered down. CLK2 carries the mixer LO because that is where
+// the filter is wired; electrically either output would do, both sit next to
+// CLK1 on the package and either can be driven from PLL B.
 //
 // The mixer does not run on 144 MHz itself: its local oscillator is the 5th
 // harmonic at 720 MHz, picked out by a high-pass and lifted by an SPF5189Z at
-// the receiver. That is why CLK0 runs at 8 mA — the harmonic lives on the edge
+// the receiver. That is why CLK2 runs at 8 mA — the harmonic lives on the edge
 // steepness — and why the divider is a plain even integer. Multiplying by 5
 // also multiplies the phase noise by 20·log10(5) = 14 dB, so there is no room
 // for a fractional divider here. 144 MHz is the only frequency near the target
@@ -71,7 +75,7 @@
 //   PLL A: p1=4202 (0x106A), p2=4, p3=6
 //   MS1:   p1=1664 (0x0680), p2=0, p3=1
 //   PLL B: p1=4096 (0x1000), p2=0, p3=1
-//   MS0:   p1=256  (0x0100), p2=0, p3=1
+//   MS2:   p1=256  (0x0100), p2=0, p3=1
 // ---------------------------------------------------------------------------
 // SI5351 I2C address — auto-detected in gpsdo_init().
 // Common values: 0x60 (SDO/AD0=GND), 0x61 (SDO/AD0=VCC).
@@ -79,7 +83,7 @@
 // 0x00 means "not found yet".
 static uint8_t s_si_addr = 0x00u;
 
-// Whether CLK0 (144 MHz, the receive mixer LO) is currently enabled.
+// Whether CLK2 (144 MHz, the receive mixer LO) is currently enabled.
 static bool s_loOn = false;
 
 #define SI_REG_STATUS      0u    // Device status (read-only)
@@ -92,16 +96,17 @@ static bool s_loOn = false;
 #define SI_REG_CLK2_CTRL   18u
 #define SI_REG_PLLA_BASE   26u   // 8 bytes: regs 26-33
 #define SI_REG_PLLB_BASE   34u   // 8 bytes: regs 34-41
-#define SI_REG_MS0_BASE    42u   // 8 bytes: regs 42-49
-#define SI_REG_MS1_BASE    50u   // 8 bytes: regs 50-57  (MS2/CLK2 starts at 58)
+#define SI_REG_MS0_BASE    42u   // 8 bytes: regs 42-49  (CLK0, unused here)
+#define SI_REG_MS1_BASE    50u   // 8 bytes: regs 50-57
+#define SI_REG_MS2_BASE    58u   // 8 bytes: regs 58-65
 #define SI_REG_PLL_RESET   177u
 #define SI_REG_XTAL_LOAD   183u
 
-// Output enable is active LOW, one bit per clock. CLK1 must never be disabled —
-// it is the SX1280's only clock.
+// Output enable is active LOW, one bit per clock: bit 0 = CLK0, 1 = CLK1,
+// 2 = CLK2. CLK1 must never be disabled — it is the SX1280's only clock.
 #define SI_OEB_ALL_OFF     0xFFu
 #define SI_OEB_CLK1        0xFDu  // CLK1 on, CLK0 and CLK2 off
-#define SI_OEB_CLK1_CLK0   0xFCu  // CLK1 and CLK0 on
+#define SI_OEB_CLK1_CLK2   0xF9u  // CLK1 and CLK2 on, CLK0 off
 
 // Scan 0x60–0x63 (all valid SI5351 I2C addresses).
 // Retries up to 3 times with a short delay between attempts.
@@ -155,19 +160,19 @@ static bool si5351_init_clocks(void)
     // Disable all outputs while configuring.
     if (!si_write_reg(SI_REG_OEB, SI_OEB_ALL_OFF)) return false;
 
-    // Power down unused CLK2.
-    si_write_reg(SI_REG_CLK2_CTRL, 0x80u);
+    // Power down unused CLK0.
+    si_write_reg(SI_REG_CLK0_CTRL, 0x80u);
 
     // CLK1: PDN=0, INT=1 (integer mode), MS_SRC=PLLA, INV=0,
     //        CLK_SRC=MS1(self)=0b11, IDRV=4mA=0b01
     //   Byte: 0b 0 1 0 0 11 01 = 0x4D
     si_write_reg(SI_REG_CLK1_CTRL, 0x4Du);
 
-    // CLK0: PDN=0, INT=1, MS_SRC=PLLB, INV=0, CLK_SRC=MS0=0b11, IDRV=8mA=0b11
+    // CLK2: PDN=0, INT=1, MS_SRC=PLLB, INV=0, CLK_SRC=MS2=0b11, IDRV=8mA=0b11
     //   Byte: 0b 0 1 1 0 11 11 = 0x6F
     // 8 mA is deliberate: the wanted signal is the 5th harmonic, which only
     // exists because the edges are steep.
-    si_write_reg(SI_REG_CLK0_CTRL, 0x6Fu);
+    si_write_reg(SI_REG_CLK2_CTRL, 0x6Fu);
 
     // Crystal load capacitance: 8 pF (bits[7:6]=0b10) + reserved 0x12.
     si_write_reg(SI_REG_XTAL_LOAD, 0x92u);
@@ -205,15 +210,15 @@ static bool si5351_init_clocks(void)
     };
     if (!si_write_regs(SI_REG_PLLB_BASE, pllb, 8u)) return false;
 
-    // MS0 (CLK0): p1=256=0x0100, p2=0, p3=1  →  864 ÷ 6 = 144 MHz
-    static const uint8_t ms0[8] = {
+    // MS2 (CLK2): p1=256=0x0100, p2=0, p3=1  →  864 ÷ 6 = 144 MHz
+    static const uint8_t ms2[8] = {
         0x00u, 0x01u,   // p3=1
         0x00u,          // R_DIV=/1, DIVBY4=0, p1[17:16]=0
         0x01u, 0x00u,   // p1[15:8]=0x01, p1[7:0]=0x00  (256)
         0x00u,          // upper nibbles = 0
         0x00u, 0x00u    // p2=0
     };
-    if (!si_write_regs(SI_REG_MS0_BASE, ms0, 8u)) return false;
+    if (!si_write_regs(SI_REG_MS2_BASE, ms2, 8u)) return false;
 
     // Reset both PLLs to lock them to the new multisynth settings. Safe here
     // because nothing depends on either clock yet — the SX1280 is still held in
@@ -221,7 +226,7 @@ static bool si5351_init_clocks(void)
     // clock for milliseconds. Reset B alone with 0x80 if that is ever needed.
     si_write_reg(SI_REG_PLL_RESET, 0xA0u);
 
-    si_write_reg(SI_REG_OEB, SI_OEB_CLK1_CLK0);
+    si_write_reg(SI_REG_OEB, SI_OEB_CLK1_CLK2);
     s_loOn = true;
 
     return true;
@@ -232,7 +237,7 @@ static bool si5351_init_clocks(void)
 bool gpsdo_set_lo_enabled(bool on)
 {
     if (s_si_addr == 0x00u) return false;
-    if (!si_write_reg(SI_REG_OEB, on ? SI_OEB_CLK1_CLK0 : SI_OEB_CLK1))
+    if (!si_write_reg(SI_REG_OEB, on ? SI_OEB_CLK1_CLK2 : SI_OEB_CLK1))
         return false;
     s_loOn = on;
     return true;
