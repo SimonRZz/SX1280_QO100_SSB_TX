@@ -53,6 +53,7 @@
 //   CLK1  52 MHz  → SX1280 XTA        PLL A: 24 MHz × (36 + 5/6) = 884 MHz
 //                                     MS1:   884 ÷ 17 = 52 MHz
 //   CLK2 144 MHz  → receive mixer LO  PLL B: 24 MHz × 36        = 864 MHz
+//                 (off at boot, enable with "lo 1")
 //                                     MS2:   864 ÷ 6  = 144 MHz
 //
 // CLK0 is left powered down. CLK2 carries the mixer LO because that is where
@@ -226,8 +227,17 @@ static bool si5351_init_clocks(void)
     // clock for milliseconds. Reset B alone with 0x80 if that is ever needed.
     si_write_reg(SI_REG_PLL_RESET, 0xA0u);
 
-    si_write_reg(SI_REG_OEB, SI_OEB_CLK1_CLK2);
-    s_loOn = true;
+    // CLK1 only. The mixer LO stays OFF until asked for with "lo 1".
+    //
+    // It used to come up enabled, which was a mistake: gpsdo_init() runs before
+    // the boot gate that waits for a locked 52 MHz, so anything wrong on the
+    // CLK2 line — stray DC from an amplifier module, a supply droop from the
+    // extra 8 mA, 144 MHz coupling into the 24 MHz reference on XA — could stop
+    // the transmitter from starting at all. The receive side must never be able
+    // to do that. MS2 and CLK2_CTRL are configured above, so "lo 1" only has to
+    // flip the output-enable bit; PLL B is already locked by then.
+    si_write_reg(SI_REG_OEB, SI_OEB_CLK1);
+    s_loOn = false;
 
     return true;
 }

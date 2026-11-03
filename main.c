@@ -1430,7 +1430,7 @@ static void cmd_help(void) {
         "  set amp_min_a <float>\r\n"
         "\r\n"
         "Receive (Si4732, QO-100 downlink via LNB + mixer):\r\n"
-        "  lo [0|1]             - 144 MHz on SI5351 CLK2; mixer LO is its 5th\r\n"
+        "  lo [0|1]             - 144 MHz on SI5351 CLK2, OFF at boot; mixer LO is its 5th\r\n"
         "                         harmonic at 720 MHz. On by default.\r\n"
         "  rx                   - receiver status\r\n"
         "  rx diag              - detailed receiver report\r\n"

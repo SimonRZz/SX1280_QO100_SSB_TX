@@ -73,8 +73,11 @@ void gpsdo_get_info(gpsdo_info_t *out);
 // Receive mixer local oscillator — SI5351 CLK2, 144 MHz
 // ---------------------------------------------------------------------------
 // The downconverter's LO is the 5th harmonic of this, 720 MHz, selected by a
-// high-pass and amplified at the receiver. Enabled at init; these let it be
-// silenced, which is handy for measuring the LO branch and for keeping it quiet
-// during transmit. CLK1 (52 MHz, the SX1280's only clock) is never affected.
+// high-pass and amplified at the receiver.
+//
+// OFF after gpsdo_init(). Deliberately: init runs before the boot gate that
+// waits for a locked 52 MHz, so a fault on the CLK2 line would otherwise stop
+// the transmitter from starting. Enable it with gpsdo_set_lo_enabled(true) once
+// the radio is up. CLK1 (52 MHz, the SX1280's only clock) is never affected.
 bool gpsdo_set_lo_enabled(bool on);
 bool gpsdo_lo_enabled(void);
