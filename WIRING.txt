@@ -123,12 +123,28 @@ RECEIVER: Si4732-A10 (QO-100 downlink via LNB + mixer)
 
 Signal chain:
 
-   dish -> LNB (LO 9750) -> 739.5 MHz -> bandpass -> RMS-11X mixer
-        -> 19.5 MHz IF -> Si4732 (SSB) -> audio -> GPIO 27 (ADC1)
+   dish -> Bullseye LNB (LO 9750) -> 739.5 MHz -> triplexer -> SAW filter
+        -> RMS-11X mixer -> 19.5 MHz IF -> 3 dB pad -> low-pass
+        -> Si4732 (SSB) -> audio -> GPIO 27 (ADC1)
 
-The mixer LO is the 5th harmonic of 144 MHz from SI5351 CLK2; the LNB reference
-and the Si4732 reference both come from the second GPSDO. The whole receive
-chain therefore hangs off GPS, same as the transmitter.
+   SI5351 CLK2 144 MHz -> high-pass -> SPF5189Z -> mixer LO
+                                       (5th harmonic, 720 MHz)
+
+RMS-11X pins: 1 = LO, 4 = IF, 5 = RF, 2/3/6 = ground. Verify with an ohmmeter
+before soldering: pins 2, 3 and 6 read 0 ohm to each other, pins 1 and 5 read a
+few ohms to ground through their transformer windings, and pin 4 reads much
+higher because it is the diode ring. That identifies IF unambiguously; LO versus
+RF needs the package's pin-1 marker. RF/LO cover 5-1900 MHz and IF 5-1000 MHz,
+so every frequency here is comfortably in range. Maximum RF input is 200 mW and
+the IF port tolerates 40 mA of DC — if the receiver on the IF side has a bias
+tee, switch it OFF.
+
+The mixer LO is GPS-disciplined, and so is the Si4732's reference clock, which
+takes 25 MHz from the second GPSDO. THE LNB IS NOT: the Bullseye runs on its own
+TCXO and cannot accept an external reference, because the 25 MHz on its red
+connector is an output. Its +-2 ppm, roughly +-10 kHz at room temperature, is
+therefore the accuracy limit of the whole receive side and is calibrated out with
+"rx cal" against the beacon.
 
 Si4732-A10 pin assignment (16-pin SOP):
 
@@ -221,13 +237,40 @@ frequency useless and wasted the whole GPSDO effort.
 IF INPUT — AMI, not FMI
 --------------------------------------------------------------------------------
 
-    mixer IF out ──[ 3 dB pad ]──[ 10 nF ]──> Si4732   8  AMI
+                                  120 nH
+    mixer IF out ──[ 3 dB pad ]────(((((((──┬──[ 10 nF ]──> Si4732  8  AMI
+                              │             │
+                            27 pF         27 pF
+                              │             │
+                             GND           GND
+
     Si4732   7  RFGND  ----  GND (keep this separate from digital ground)
     Si4732   6  FMI    ----  leave OPEN
 
 SSB runs through the AM path, so the 19.5 MHz IF goes to AMI. Keep the lead
-short. A weak QO-100 signal lands around -74 dBm here, roughly 36 dB above the
-receiver's sensitivity, so there is plenty of margin.
+short. A weak QO-100 signal lands around -80 dBm here, roughly 30 dB above the
+receiver's sensitivity, so there is margin — but only behind that low-pass.
+
+THE LOW-PASS IS NOT OPTIONAL. A double balanced mixer leaks its local
+oscillator into the IF port; LO-to-IF isolation is typically 20 to 30 dB. With
+-5 dBm at the LO port that puts -25 to -35 dBm of 720 MHz on the IF line, which
+is 49 to 59 dB STRONGER than the beacon you are trying to hear. Any receiver
+with an AGC locks onto that instead, and on an 8-bit SDR the wanted signal
+disappears into quantisation noise because the converter only spans about 48 dB.
+Measured on the bench: without the filter, nothing below roughly -55 dBm at the
+IF was audible, which is a dynamic-range limit, not a sensitivity limit.
+
+    19.5 - 20.0 MHz   0.0 dB     720 MHz (LO leak)    46 dB
+    144 MHz           5   dB     739.5 MHz (RF leak)  47 dB
+
+Component values suit a 50 ohm system and are what happened to be in the parts
+bin; the design is forgiving. Two 27 pF in parallel with 15 pF each (42 pF)
+raises the 720 MHz rejection to 54 dB for the same effort. A 2.2 uH inductor
+would put the corner at 7 MHz and kill the IF itself — 120 nH is the right one.
+
+ORDER MATTERS: the pad goes BEFORE the low-pass. That way the mixer sees a
+resistive load rather than the filter's reactance, and the filter gets a defined
+source impedance.
 
 --------------------------------------------------------------------------------
 AUDIO INTO THE PICO — GPIO 27 / ADC1
