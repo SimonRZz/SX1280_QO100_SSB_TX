@@ -98,6 +98,8 @@ static int16_t       s_bfo_hz    = 0;
 static bool          s_mute      = false;
 static uint8_t       s_rev_pn    = 0u;
 static uint8_t       s_rev_fw[2] = { 0u, 0u };
+static uint8_t       s_rev_raw[9] = { 0 };   // last GET_REV response, for diag
+static bool          s_rev_valid = false;
 static const char   *s_last_err  = "none";
 
 static si4732_log_fn s_log       = NULL;
@@ -129,9 +131,23 @@ static bool si_wait_cts(uint32_t timeout_ms)
     absolute_time_t deadline = make_timeout_time_ms(timeout_ms);
     for (;;) {
         uint8_t st = 0u;
-        if (i2c_read_blocking(SI_I2C, s_addr, &st, 1, false) == 1 && (st & 0x80u))
-            return true;
+        if (i2c_read_blocking(SI_I2C, s_addr, &st, 1, false) == 1) {
+            // 0xFF is what an idle bus reads: SDA held high by the pull-up
+            // because nothing is driving it. Bit 7 is set in that pattern, so
+            // a plain "CTS is bit 7" test passes on a chip that is not talking
+            // at all — which is how a patch upload once reported 1979
+            // successful blocks into a silent device. Bit 6 is ERR, and no real
+            // status has both CTS and ERR plus every other bit set, so treat
+            // 0xFF as "no answer".
+            if (st == 0xFFu) {
+                s_last_err = "no answer (bus reads 0xFF)";
+            } else if (st & 0x80u) {
+                return true;
+            }
+        }
         if (absolute_time_diff_us(get_absolute_time(), deadline) <= 0) {
+            if (s_last_err != (const char *)0 && s_last_err[0] == 'n')
+                return false;              // keep the more specific message
             s_last_err = "CTS timeout";
             return false;
         }
@@ -332,11 +348,30 @@ bool si4732_init(void)
                s_addr, s_last_err);
         return false;
     }
-    uint8_t rev[9] = { 0 };
-    if (i2c_read_blocking(SI_I2C, s_addr, rev, sizeof rev, false) == (int)sizeof rev) {
-        s_rev_pn    = rev[1];
-        s_rev_fw[0] = rev[2];
-        s_rev_fw[1] = rev[3];
+    int got = i2c_read_blocking(SI_I2C, s_addr, s_rev_raw, sizeof s_rev_raw, false);
+    s_rev_valid = (got == (int)sizeof s_rev_raw);
+    if (s_rev_valid) {
+        s_rev_pn    = s_rev_raw[1];
+        s_rev_fw[0] = s_rev_raw[2];
+        s_rev_fw[1] = s_rev_raw[3];
+    }
+
+    // A real part reports a part number. All zeros means the read came back
+    // empty, all ones means nothing was driving the bus — in both cases the
+    // address acknowledged but the device is not actually answering, and
+    // carrying on would only produce writes that fail later with no clue why.
+    //
+    // The usual cause is a missing reference clock: POWER_UP runs with
+    // XOSCEN = 0, so without the 25 MHz on pin 13 the chip has no clock for its
+    // digital core. After that, reset and the GPO1/GPO2 bus-mode latch.
+    if (!s_rev_valid || s_rev_pn == 0x00u || s_rev_pn == 0xFFu) {
+        s_last_err = "GET_REV returned no part number";
+        si_log("[SI4732] 0x%02X acknowledges but does not answer: GET_REV gave "
+               "part=%u (%s)", s_addr, s_rev_pn,
+               s_rev_valid ? "read ok, data empty" : "read failed");
+        si_log("[SI4732]   check in this order: 25 MHz on pin 13 ('rclk'), "
+               "3V3 on pin 14, RST on GP13, GPO1+GPO2 left open");
+        return false;
     }
 
     s_present  = true;
@@ -560,12 +595,28 @@ void si4732_diag_print(void)
            (int)s_present, s_addr, (int)s_on, (int)si4732_has_ssb());
     if (!s_present) {
         si_log("[SI4732]   last error: %s", s_last_err);
-        si_log("[SI4732]   check: RST on GP13, SDIO/SCLK on GP0/GP1, SENB strap,");
-        si_log("[SI4732]          and that GPO1/GPO2 are left open for 2-wire mode");
+        si_log("[SI4732]   GET_REV raw%s: %02X %02X %02X %02X %02X %02X %02X %02X %02X",
+               s_rev_valid ? "" : " (READ FAILED)",
+               s_rev_raw[0], s_rev_raw[1], s_rev_raw[2], s_rev_raw[3], s_rev_raw[4],
+               s_rev_raw[5], s_rev_raw[6], s_rev_raw[7], s_rev_raw[8]);
+        si_log("[SI4732]   check in this order:");
+        si_log("[SI4732]     1. 25 MHz on pin 13 - 'rclk' must say 1, and POWER_UP");
+        si_log("[SI4732]        runs with XOSCEN=0, so without it the chip has no clock");
+        si_log("[SI4732]     2. 3V3 on pin 14, GND on pin 15, 100 nF close by");
+        si_log("[SI4732]     3. RST on GP13");
+        si_log("[SI4732]     4. GPO1 (pin 4) and GPO2 (pin 3) left OPEN - bus mode");
+        si_log("[SI4732]     5. SENB (pin 10) tied to a level, not floating");
         return;
     }
     si_log("[SI4732]   part=%u fw=%c.%c", s_rev_pn,
            s_rev_fw[0] ? s_rev_fw[0] : '?', s_rev_fw[1] ? s_rev_fw[1] : '?');
+    // The raw GET_REV bytes say more than the decoded fields when something is
+    // wrong: all 00 means the chip answered with nothing, all FF means nothing
+    // was driving the bus at all.
+    si_log("[SI4732]   GET_REV raw%s: %02X %02X %02X %02X %02X %02X %02X %02X %02X",
+           s_rev_valid ? "" : " (READ FAILED)",
+           s_rev_raw[0], s_rev_raw[1], s_rev_raw[2], s_rev_raw[3], s_rev_raw[4],
+           s_rev_raw[5], s_rev_raw[6], s_rev_raw[7], s_rev_raw[8]);
     si_log("[SI4732]   mode=%s freq=%lu kHz bw=%u Hz bfo=%d Hz vol=%u mute=%d",
            si4732_mode_name(s_mode), (unsigned long)s_khz, s_bw_hz,
            (int)s_bfo_hz, s_volume, (int)s_mute);
