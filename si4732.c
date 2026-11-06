@@ -108,6 +108,11 @@ static bool          s_rsq_smute = false; // RESP2: soft mute engaged
 static int8_t        s_rsq_off   = 0;     // RESP7: frequency offset, kHz
 static uint16_t      s_read_khz  = 0u;    // frequency the tuner reports back
 static bool          s_stc_ok    = false; // last tune reported seek/tune complete
+// XOSCEN in POWER_UP. 0 means "external clock on RCLK, crystal amplifier off",
+// which is what this design wants and what AM tunes happily with. The reference
+// library uses 1 and calls it "a condition for loading the patch", so while SSB
+// refuses to tune this stays switchable rather than asserted.
+static bool          s_xoscen    = false;
 static bool          s_rev_valid = false;
 static const char   *s_last_err  = "none";
 
@@ -353,7 +358,9 @@ static bool si_power_up(bool with_patch)
     // FUNC=1 (AM/SSB). ARG2: analog audio out.
     const uint8_t b[3] = {
         CMD_POWER_UP,
-        (uint8_t)((with_patch ? PU_PATCH : 0u) | PU_FUNC_AM),
+        (uint8_t)((with_patch ? PU_PATCH : 0u)
+                  | (s_xoscen ? PU_XOSCEN : 0u)
+                  | PU_FUNC_AM),
         PU_OPMODE_ANALOG
     };
     if (i2c_write_blocking(SI_I2C, s_addr, b, sizeof b, false) != (int)sizeof b) {
@@ -615,6 +622,11 @@ bool si4732_set_cal_hz(int32_t hz)
 
 int32_t si4732_get_cal_hz(void) { return s_cal_hz; }
 
+bool si4732_get_xoscen(void) { return s_xoscen; }
+
+// Takes effect on the next power-up, so re-select the mode afterwards.
+void si4732_set_xoscen(bool on) { s_xoscen = on; }
+
 void si4732_restore(si4732_mode_t mode, uint32_t hz, uint8_t vol,
                     uint16_t bw_hz, int32_t cal_hz)
 {
@@ -727,6 +739,7 @@ void si4732_diag_print(void)
     si_log("[SI4732]   mode=%s freq=%lu kHz bw=%u Hz bfo=%d Hz vol=%u mute=%d",
            si4732_mode_name(s_mode), (unsigned long)s_khz, s_bw_hz,
            (int)s_bfo_hz, s_volume, (int)s_mute);
+    si_log("[SI4732]   xoscen=%d (0 = external clock on RCLK)", (int)s_xoscen);
     si_log("[SI4732]   rclk=%u Hz / %u = refclk %u Hz",
            (unsigned)SI_RCLK_HZ, (unsigned)SI_RCLK_PRESCALE, (unsigned)SI_REFCLK_FREQ);
 

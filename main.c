@@ -1439,6 +1439,7 @@ static void cmd_help(void) {
         "                         harmonic at 720 MHz. On by default.\r\n"
         "  rx                   - receiver status\r\n"
         "  rx diag              - detailed receiver report\r\n"
+        "  rx xosc <0|1>        - POWER_UP crystal-oscillator bit; 0 = external RCLK\r\n"
         "  rx on | off          - power the receiver up / down\r\n"
         "  rx usb | lsb | am    - demodulation mode (sideband needs the SSB patch)\r\n"
         "  rx freq <kHz>        - 2300..26100, the IF from the mixer.\r\n"
@@ -1915,6 +1916,20 @@ static void cdc_handle_line(char *line) {
         if (argc < 2) { rx_status_print(); return; }
 
         if (streqi(argv[1], "diag")) { si4732_diag_print(); return; }
+
+        // rx xosc 0|1 — the crystal-oscillator bit of POWER_UP. Switchable
+        // because the reference library sets it where this driver does not,
+        // and that is the one documented difference while SSB refuses to tune.
+        if (streqi(argv[1], "xosc")) {
+            if (argc >= 3) {
+                si4732_set_xoscen(strtol(argv[2], NULL, 10) != 0);
+                if (si4732_is_on() && !si4732_set_mode(si4732_get_mode()))
+                    cdc_write_str("ERR: re-power-up failed — 'rx diag'\r\n");
+            }
+            cdc_printf("OK xoscen=%d (0 = external clock on RCLK)\r\n",
+                       si4732_get_xoscen() ? 1 : 0);
+            return;
+        }
 
         if (streqi(argv[1], "on") || streqi(argv[1], "off")) {
             bool on = streqi(argv[1], "on");

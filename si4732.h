@@ -67,6 +67,14 @@ uint32_t si4732_get_khz(void);
 bool     si4732_set_cal_hz(int32_t hz);
 int32_t  si4732_get_cal_hz(void);
 
+// XOSCEN bit of POWER_UP. false (the default) means "external clock on RCLK,
+// crystal amplifier off", which is what this design uses and what AM tunes
+// with. The reference library passes true and calls it a condition for loading
+// the SSB patch, so this is switchable while that is unresolved. Takes effect
+// on the next power-up.
+void     si4732_set_xoscen(bool on);
+bool     si4732_get_xoscen(void);
+
 // Adopt saved settings without touching the chip. Called at boot, before the
 // receiver has even been probed — the first si4732_set_mode() then applies all
 // of it at once. Values are range-checked and silently replaced by the
