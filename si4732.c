@@ -100,6 +100,10 @@ static uint8_t       s_rev_pn    = 0u;
 static uint8_t       s_rev_fw[2] = { 0u, 0u };
 static uint8_t       s_rev_raw[9] = { 0 };   // last GET_REV response, for diag
 static uint16_t      s_patch_id  = 0u;    // PATCHH/PATCHL from GET_REV
+static bool          s_rsq_valid = false; // RESP2: chip considers this a channel
+static bool          s_rsq_afcrl = false; // RESP2: AFC railed
+static bool          s_rsq_smute = false; // RESP2: soft mute engaged
+static int8_t        s_rsq_off   = 0;     // RESP7: frequency offset, kHz
 static bool          s_rev_valid = false;
 static const char   *s_last_err  = "none";
 
@@ -598,11 +602,19 @@ bool si4732_read_rsq(uint8_t *rssi_dbuv, uint8_t *snr_db)
     const uint8_t b[2] = { CMD_RSQ_STATUS, 0x00u };
     if (!si_cmd(b, sizeof b)) return false;
 
-    uint8_t r[6] = { 0 };
+    // Eight bytes, not six: RESP2 carries VALID and AFCRL, and RESP7 a signed
+    // frequency offset in kHz. Those three say whether the chip thinks it is on
+    // a real channel and how far off it is — worth far more while hunting for a
+    // beacon than the two level figures alone.
+    uint8_t r[8] = { 0 };
     if (i2c_read_blocking(SI_I2C, s_addr, r, sizeof r, false) != (int)sizeof r) {
         s_last_err = "RSQ read failed";
         return false;
     }
+    s_rsq_valid = (r[2] & 0x01u) != 0u;
+    s_rsq_afcrl = (r[2] & 0x02u) != 0u;
+    s_rsq_smute = (r[2] & 0x08u) != 0u;
+    s_rsq_off   = (int8_t)r[7];
     if (rssi_dbuv) *rssi_dbuv = r[4];
     if (snr_db)    *snr_db    = r[5];
     return true;
@@ -648,7 +660,9 @@ void si4732_diag_print(void)
 
     uint8_t rssi = 0u, snr = 0u;
     if (si4732_read_rsq(&rssi, &snr))
-        si_log("[SI4732]   rssi=%u dBuV snr=%u dB", rssi, snr);
+        si_log("[SI4732]   rssi=%u dBuV snr=%u dB  valid=%d afc_railed=%d "
+               "softmute=%d offset=%d kHz", rssi, snr, (int)s_rsq_valid,
+               (int)s_rsq_afcrl, (int)s_rsq_smute, (int)s_rsq_off);
     else
         si_log("[SI4732]   rsq unavailable (%s)", s_last_err);
     si_log("[SI4732]   last error: %s", s_last_err);
