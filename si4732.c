@@ -99,6 +99,7 @@ static bool          s_mute      = false;
 static uint8_t       s_rev_pn    = 0u;
 static uint8_t       s_rev_fw[2] = { 0u, 0u };
 static uint8_t       s_rev_raw[9] = { 0 };   // last GET_REV response, for diag
+static uint16_t      s_patch_id  = 0u;    // PATCHH/PATCHL from GET_REV
 static bool          s_rev_valid = false;
 static const char   *s_last_err  = "none";
 
@@ -286,6 +287,49 @@ static bool si_download_patch(void)
 // ---------------------------------------------------------------------------
 // Power up / tune
 // ---------------------------------------------------------------------------
+// Reads GET_REV and checks it. Only meaningful once the chip is powered up:
+// before that the payload comes back empty. After a patch upload the PATCHH and
+// PATCHL bytes carry the patch id, which is how we know the upload actually
+// landed rather than merely that 1979 writes were acknowledged.
+#define SI_PATCH_ID_FULL 0x9D29u   // amrx_6_0_1_ssbrx_patch_full_0x9D29
+
+static bool si_read_rev(bool expect_patch)
+{
+    const uint8_t cmd[1] = { CMD_GET_REV };
+    if (!si_cmd(cmd, 1)) return false;
+
+    int got = i2c_read_blocking(SI_I2C, s_addr, s_rev_raw, sizeof s_rev_raw, false);
+    s_rev_valid = (got == (int)sizeof s_rev_raw);
+    if (!s_rev_valid) { s_last_err = "GET_REV read failed"; return false; }
+
+    s_rev_pn    = s_rev_raw[1];
+    s_rev_fw[0] = s_rev_raw[2];
+    s_rev_fw[1] = s_rev_raw[3];
+    s_patch_id  = (uint16_t)((s_rev_raw[4] << 8) | s_rev_raw[5]);
+
+    if (s_rev_pn == 0x00u || s_rev_pn == 0xFFu) {
+        s_last_err = "no part number after power-up";
+        si_log("[SI4732] powered up but reports no part number — raw "
+               "%02X %02X %02X %02X %02X %02X %02X %02X %02X",
+               s_rev_raw[0], s_rev_raw[1], s_rev_raw[2], s_rev_raw[3],
+               s_rev_raw[4], s_rev_raw[5], s_rev_raw[6], s_rev_raw[7],
+               s_rev_raw[8]);
+        si_log("[SI4732]   most likely no 25 MHz on pin 13: POWER_UP runs with "
+               "XOSCEN=0, so without it the chip has no clock. Check 'rclk'.");
+        return false;
+    }
+
+    si_log("[SI4732] part %u, fw %c.%c, chiprev 0x%02X, patch id 0x%04X",
+           s_rev_pn, s_rev_fw[0] ? s_rev_fw[0] : '?',
+           s_rev_fw[1] ? s_rev_fw[1] : '?', s_rev_raw[8], s_patch_id);
+
+    if (expect_patch && s_patch_id != SI_PATCH_ID_FULL)
+        si_log("[SI4732] WARNING: patch id is 0x%04X, expected 0x%04X — the "
+               "upload may not have taken; SSB will not work", s_patch_id,
+               SI_PATCH_ID_FULL);
+    return true;
+}
+
 static bool si_power_up(bool with_patch)
 {
     // ARG1: CTSIEN=0, GPO2OEN=0, PATCH as asked, XOSCEN=0 (external RCLK),
@@ -340,45 +384,16 @@ bool si4732_init(void)
         return false;
     }
 
-    // GET_REV also proves the bus mode latched correctly: in SPI or 3-wire mode
-    // this read returns nothing sensible.
-    const uint8_t rev_cmd[1] = { CMD_GET_REV };
-    if (!si_cmd(rev_cmd, 1)) {
-        si_log("[SI4732] found at 0x%02X but GET_REV failed (%s)",
-               s_addr, s_last_err);
-        return false;
-    }
-    int got = i2c_read_blocking(SI_I2C, s_addr, s_rev_raw, sizeof s_rev_raw, false);
-    s_rev_valid = (got == (int)sizeof s_rev_raw);
-    if (s_rev_valid) {
-        s_rev_pn    = s_rev_raw[1];
-        s_rev_fw[0] = s_rev_raw[2];
-        s_rev_fw[1] = s_rev_raw[3];
-    }
-
-    // A real part reports a part number. All zeros means the read came back
-    // empty, all ones means nothing was driving the bus — in both cases the
-    // address acknowledged but the device is not actually answering, and
-    // carrying on would only produce writes that fail later with no clue why.
-    //
-    // The usual cause is a missing reference clock: POWER_UP runs with
-    // XOSCEN = 0, so without the 25 MHz on pin 13 the chip has no clock for its
-    // digital core. After that, reset and the GPO1/GPO2 bus-mode latch.
-    if (!s_rev_valid || s_rev_pn == 0x00u || s_rev_pn == 0xFFu) {
-        s_last_err = "GET_REV returned no part number";
-        si_log("[SI4732] 0x%02X acknowledges but does not answer: GET_REV gave "
-               "part=%u (%s)", s_addr, s_rev_pn,
-               s_rev_valid ? "read ok, data empty" : "read failed");
-        si_log("[SI4732]   check in this order: 25 MHz on pin 13 ('rclk'), "
-               "3V3 on pin 14, RST on GP13, GPO1+GPO2 left open");
-        return false;
-    }
-
+    // No GET_REV here. In the powered-down state the chip answers it with a
+    // valid status byte and an empty payload — observed as
+    // "80 00 00 00 00 00 00 00 10" — because its internal controller is not
+    // running yet. Treating that as a fault, as an earlier version did, declares
+    // a perfectly good chip dead. The real check happens after POWER_UP, in
+    // si_read_rev(), where the part number and the patch id mean something.
     s_present  = true;
     s_last_err = "none";
-    si_log("[SI4732] found at 0x%02X, part %u, fw %c.%c, SSB patch %s",
-           s_addr, s_rev_pn,
-           s_rev_fw[0] ? s_rev_fw[0] : '?', s_rev_fw[1] ? s_rev_fw[1] : '?',
+    si_log("[SI4732] 0x%02X answers; revision read deferred until power-up. "
+           "SSB patch %s", s_addr,
 #ifdef SI4732_SSB_PATCH
            "compiled in");
 #else
@@ -435,6 +450,10 @@ bool si4732_set_mode(si4732_mode_t mode)
 #ifdef SI4732_SSB_PATCH
     if (want_patch && !si_download_patch()) { s_on = false; return false; }
 #endif
+
+    // Now the revision read means something: the chip is running, and after a
+    // patch upload the patch id proves it landed.
+    if (!si_read_rev(want_patch)) { s_on = false; return false; }
 
     s_mode = mode;
     s_on   = true;
@@ -595,6 +614,8 @@ void si4732_diag_print(void)
            (int)s_present, s_addr, (int)s_on, (int)si4732_has_ssb());
     if (!s_present) {
         si_log("[SI4732]   last error: %s", s_last_err);
+        si_log("[SI4732]   note: before power-up the chip answers GET_REV with a");
+        si_log("[SI4732]         valid status and an empty payload. That is normal.");
         si_log("[SI4732]   GET_REV raw%s: %02X %02X %02X %02X %02X %02X %02X %02X %02X",
                s_rev_valid ? "" : " (READ FAILED)",
                s_rev_raw[0], s_rev_raw[1], s_rev_raw[2], s_rev_raw[3], s_rev_raw[4],
@@ -608,8 +629,10 @@ void si4732_diag_print(void)
         si_log("[SI4732]     5. SENB (pin 10) tied to a level, not floating");
         return;
     }
-    si_log("[SI4732]   part=%u fw=%c.%c", s_rev_pn,
-           s_rev_fw[0] ? s_rev_fw[0] : '?', s_rev_fw[1] ? s_rev_fw[1] : '?');
+    si_log("[SI4732]   part=%u fw=%c.%c chiprev=0x%02X patch_id=0x%04X%s",
+           s_rev_pn, s_rev_fw[0] ? s_rev_fw[0] : '?',
+           s_rev_fw[1] ? s_rev_fw[1] : '?', s_rev_raw[8], s_patch_id,
+           (s_patch_id == SI_PATCH_ID_FULL) ? " (SSB patch confirmed)" : "");
     // The raw GET_REV bytes say more than the decoded fields when something is
     // wrong: all 00 means the chip answered with nothing, all FF means nothing
     // was driving the bus at all.
