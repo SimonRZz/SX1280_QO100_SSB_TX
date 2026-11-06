@@ -255,11 +255,18 @@ static bool si_apply_bandwidth(void)
     s_bw_hz = e->hz;
 
     if (ssb) {
-        // SSB_MODE: AUDIOBW in bits 3:0, SBCUTFLT 7:4, then AVC_DIVIDER 11:8,
+        // SSB_MODE: AUDIOBW bits 3:0, SBCUTFLT 7:4, AVC_DIVIDER 11:8,
         // AVCEN 12, SMUTESEL 13, DSP_AFCDIS 15.
-        // AVC on, AFC off (AFC belongs to SYNC mode and would drag the tuning).
-        uint16_t val = (uint16_t)(0x9000u | e->code);
-        return si_set_prop(PROP_SSB_MODE, val);
+        //
+        // Values taken from the reference library's setSSBConfig(bw, 1, 0, 0,
+        // 0, 1) rather than chosen: side-band cutoff filter on, AVC off,
+        // soft-mute on SNR, AFC disabled (AFC belongs to SYNC mode and would
+        // drag the tuning). An earlier version had the cutoff filter off and
+        // AVC on, which is not what the parts this patch was written for use.
+        uint16_t val = (uint16_t)(0x8010u | e->code);
+        if (!si_set_prop(PROP_SSB_MODE, val)) return false;
+        sleep_ms(25);          // the library waits here too
+        return true;
     }
     return si_set_prop(PROP_AM_CHANNEL_FILTER, e->code);
 }
@@ -284,6 +291,8 @@ static bool si_download_patch(void)
             return false;
         }
     }
+
+    sleep_ms(50);   // let the chip digest it before the next command
 
     int ms = (int)(absolute_time_diff_us(t0, get_absolute_time()) / 1000);
     si_log("[SI4732] SSB patch uploaded: %u bytes in %d ms",
@@ -351,7 +360,9 @@ static bool si_power_up(bool with_patch)
         s_last_err = "POWER_UP write failed";
         return false;
     }
-    sleep_ms(10);                 // chip boot
+    // The library waits 50 ms here before touching the chip again, and the
+    // patch upload that follows is unforgiving about being rushed.
+    sleep_ms(50);
     return si_wait_cts(500u);
 }
 
@@ -396,9 +407,14 @@ static bool si_read_tune_status(void)
 
 static bool si_tune(void)
 {
+    // No FAST bit. The data sheet says of it: "executes fast and invalidated
+    // tune. The tune status will not be accurate." That is precisely the
+    // symptom we were chasing — seek/tune-complete never arriving and the
+    // read-back frequency coming out as zero. A tune that takes a few more
+    // milliseconds and reports honestly is worth more here.
     uint8_t arg1 = 0u;
-    if (s_mode == SI4732_MODE_LSB)      arg1 = TUNE_SB_LSB | TUNE_FAST;
-    else if (s_mode == SI4732_MODE_USB) arg1 = TUNE_SB_USB | TUNE_FAST;
+    if (s_mode == SI4732_MODE_LSB)      arg1 = TUNE_SB_LSB;
+    else if (s_mode == SI4732_MODE_USB) arg1 = TUNE_SB_USB;
 
     uint16_t khz = (uint16_t)s_khz;
     const uint8_t b[6] = {
@@ -408,12 +424,15 @@ static bool si_tune(void)
     };                            // 50 ohm driven input
     if (!si_cmd(b, sizeof b)) return false;
 
-    s_stc_ok = si_wait_stc(250u);
-    if (!s_stc_ok) {
-        s_last_err = "tune did not complete (no STC within 250 ms)";
-        si_log("[SI4732] WARNING: %s", s_last_err);
-    }
+    // Advisory only: a tune that does not announce itself may still have
+    // worked, and failing the whole call here would hide the rest of the
+    // diagnosis behind one flag.
+    const char *err_before = s_last_err;
+    s_stc_ok = si_wait_stc(300u);
+    if (!s_stc_ok)
+        si_log("[SI4732] note: no seek/tune-complete within 300 ms");
     (void)si_read_tune_status();
+    if (s_stc_ok) s_last_err = err_before;
 
     if (s_stc_ok && s_read_khz != (uint16_t)s_khz)
         si_log("[SI4732] WARNING: asked for %u kHz, tuner reports %u kHz",
