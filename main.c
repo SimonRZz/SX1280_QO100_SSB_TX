@@ -1762,8 +1762,42 @@ static inline void cdc_status_push(void) { cdc_status_push_ex(false); }
 // Both stdio backends are off in this build, so the Si4732 driver cannot use
 // printf. It hands its messages here instead and they go out on the console
 // like everything else.
+//
+// Early messages would otherwise be lost: si4732_init() runs during boot, long
+// before anyone opens the terminal, and cdc_printf discards whatever it cannot
+// deliver. That is how a whole receiver init report — which address answered,
+// what GET_REV returned — vanished and had to be guessed at. So until the
+// console is there, lines go into a buffer and are replayed on connect.
+#define BOOTLOG_LINES 16
+#define BOOTLOG_LEN   120
+static char    g_bootlog[BOOTLOG_LINES][BOOTLOG_LEN];
+static uint8_t g_bootlog_n    = 0;
+static uint8_t g_bootlog_lost = 0;
+static bool    g_bootlog_done = false;
+
 static void si4732_log_sink(const char *line) {
+    if (!g_bootlog_done && !tud_cdc_connected()) {
+        if (g_bootlog_n < BOOTLOG_LINES) {
+            snprintf(g_bootlog[g_bootlog_n], BOOTLOG_LEN, "%s", line);
+            g_bootlog_n++;
+        } else if (g_bootlog_lost < 255u) {
+            g_bootlog_lost++;
+        }
+        return;
+    }
     cdc_printf("%s\r\n", line);
+}
+
+// Replays what was logged before the console existed. Called once, from the
+// greeting.
+static void bootlog_flush(void) {
+    g_bootlog_done = true;
+    if (g_bootlog_n == 0u) return;
+    cdc_write_str("--- logged during boot ---\r\n");
+    for (uint8_t i = 0; i < g_bootlog_n; i++) cdc_printf("%s\r\n", g_bootlog[i]);
+    if (g_bootlog_lost)
+        cdc_printf("--- %u further line(s) dropped ---\r\n", (unsigned)g_bootlog_lost);
+    cdc_write_str("--- end of boot log ---\r\n");
 }
 
 // One machine-readable line, in the same shape as the other "!" pushes so the
@@ -3866,6 +3900,7 @@ int main(void) {
             cdc_write_str("\r\nSX1280_SDR control ready. FW " FW_VERSION " built " FW_BUILD ". Type 'help'.\r\n");
             cdc_write_str(g_persist_loaded ? "Config: restored from flash.\r\n"
                                            : "Config: compile-time defaults (nothing valid in flash).\r\n");
+            bootlog_flush();
             cfg_print();
         }
 
