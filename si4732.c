@@ -741,6 +741,19 @@ void si4732_diag_print(void)
         si_log("[SI4732]     5. SENB (pin 10) tied to a level, not floating");
         return;
     }
+    // Before power-up there is nothing to report: the revision read comes back
+    // empty by design, and printing it next to "READ FAILED" and a part number
+    // of zero reads as a broken chip. It has misled us twice.
+    if (!s_on) {
+        si_log("[SI4732]   not powered up yet — run 'rx on' (or 'rx am' / 'rx usb')");
+        si_log("[SI4732]   xoscen=%d antcap=%u  rclk=%u Hz / %u = refclk %u Hz",
+               (int)s_xoscen, s_antcap, (unsigned)SI_RCLK_HZ,
+               (unsigned)SI_RCLK_PRESCALE, (unsigned)SI_REFCLK_FREQ);
+        si_log("[SI4732]   stored settings: mode=%s freq=%lu kHz bw=%u Hz vol=%u",
+               si4732_mode_name(s_mode), (unsigned long)s_khz, s_bw_hz, s_volume);
+        return;
+    }
+
     si_log("[SI4732]   part=%u fw=%c.%c chiprev=0x%02X patch_id=0x%04X%s",
            s_rev_pn, s_rev_fw[0] ? s_rev_fw[0] : '?',
            s_rev_fw[1] ? s_rev_fw[1] : '?', s_rev_raw[8], s_patch_id,
