@@ -94,7 +94,7 @@ static uint8_t s_si_addr = 0x00u;
 // Receive-side outputs, both off until asked for.
 static bool s_loOn   = false;  // CLK0, 144 MHz, mixer LO
 static bool s_rclkOn = false;  // CLK2, 25 MHz, Si4732 reference clock
-static uint8_t s_rclkDrive = 0u;  // IDRV field of CLK2_CTRL: 0=2mA .. 3=8mA
+static uint8_t s_rclkDrive = 3u;  // IDRV field of CLK2_CTRL: 0=2mA .. 3=8mA
 
 #define SI_REG_STATUS      0u    // Device status (read-only)
 #define SI_STATUS_SYS_INIT (1u << 7) // 1 = calibrating (not ready)
@@ -197,13 +197,14 @@ static bool si5351_init_clocks(void)
     //   Byte: 0b 0 1 0 0 11 01 = 0x4D
     si_write_reg(SI_REG_CLK1_CTRL, 0x4Du);
 
-    // CLK2: PDN=0, INT=0 (fractional), MS_SRC=PLLB, INV=0, CLK_SRC=MS2, IDRV=2mA
-    //   Byte: 0b 0 0 1 0 11 00 = 0x2C
-    // 2 mA because the level at the Si4732 is set by the divider on its RCLK
-    // pin, not by the drive setting: into a high-impedance divider the output
-    // swings close to the supply whatever the drive is. Lower drive just means
-    // less current and less crosstalk inside the chip.
-    si_write_reg(SI_REG_CLK2_CTRL, 0x2Cu);
+    // CLK2: PDN=0, INT=0 (fractional), MS_SRC=PLLB, INV=0, CLK_SRC=MS2, IDRV=8mA
+    //   Byte: 0b 0 0 1 0 11 11 = 0x2F
+    // 8 mA, found on the bench. At 2 mA the Si4732 answered on I2C but refused
+    // to tune — "tune did not complete", 0 kHz read back — which looks exactly
+    // like a dead antenna and is not. Its RCLK input wants a hard-driven CMOS
+    // clock, not the gentle level a crystal oscillator would present.
+    // Changeable at runtime with "rclk drive".
+    si_write_reg(SI_REG_CLK2_CTRL, 0x2Fu);
 
     // Crystal load capacitance: 8 pF (bits[7:6]=0b10) + reserved 0x12.
     si_write_reg(SI_REG_XTAL_LOAD, 0x92u);

@@ -209,15 +209,32 @@ latched wrong — that is the first thing to check.
 REFERENCE CLOCK — 25 MHz from SI5351 CLK2
 --------------------------------------------------------------------------------
 
-    SI5351 CLK2 ──[ 1 kOhm ]──┬──[ 100 pF ]──> Si4732  13  RCLK
-    (25 MHz, 2 mA)            │
-                          [ 220 Ohm ]           pin 2 (GPO3) stays OPEN
-                              │
-                             GND
+    SI5351 CLK2 ──[ 1 nF ]──> Si4732  13  RCLK
+    (25 MHz, 8 mA)
+                                        pin 2 (GPO3) stays OPEN
+
+NO VOLTAGE DIVIDER. Coupling capacitor only, and drive the output hard.
+
+This was wrong in an earlier version of these notes, which put a 1 kOhm / 220 Ohm
+divider here on the strength of a "0.3 to 1.5 V" input range recalled from
+AN332. That figure describes a crystal-style input fed with a sine wave, not a
+25 MHz CMOS clock. With the divider and 2 mA drive the chip behaved exactly as
+if it had no reference at all: it answered on I2C, reported part 32 and firmware
+1.0, accepted commands — and refused to tune, returning "tune did not complete"
+and 0 kHz read back from AM_TUNE_STATUS. Raising the drive to 8 mA fixed it
+immediately: tune complete, correct frequency, real RSSI readings.
+
+Use "rclk drive 2|4|6|8" to set it from the console; 8 mA is the value that
+works. The 1 nF rather than 100 pF is for margin — 6 ohms of reactance at
+25 MHz instead of 64.
 
 Same SI5351 as everything else, PLL B through a fractional MultiSynth:
 864 / (34 + 14/25) = 25.000000 MHz exactly, divided by 800 inside the Si4732 to
 31250 Hz. Enable it with "rclk 1"; "rx on" does that for you.
+
+VERIFIED, not assumed: AN332's SSB amendment supports RCLK from 31130 Hz to
+40 MHz, so 25 MHz is in range, and 31250 Hz sits inside the 31130..34406 Hz
+REFCLK window. Prescaler 800 with RCLKSEL = 0 selects the RCLK pin.
 
 Fractional is fine here. The Si4732 divides the 25 MHz down by 800 and
 multiplies back up internally, so the two roughly cancel, and the chip is built
@@ -234,7 +251,7 @@ THE THREE OUTPUTS, all on the Pico's SI5351:
 
     CLK0  144 MHz, 8 mA, PLL B integer      mixer LO         "lo 0|1"
     CLK1   52 MHz, 4 mA, PLL A fractional   SX1280 XTA       never switched
-    CLK2   25 MHz, 2 mA, PLL B fractional   Si4732 RCLK      "rclk 0|1"
+    CLK2   25 MHz, 8 mA, PLL B fractional   Si4732 RCLK      "rclk 0|1"
 
 CLK1 is the SX1280's only clock. si_write_oeb() clears its enable bit
 unconditionally, so no combination of "lo" and "rclk" can take it away, and
@@ -242,21 +259,9 @@ PLL A must never be reset at runtime. Both receive-side outputs come up OFF:
 gpsdo_init() runs before the boot gate that waits for a locked 52 MHz, and
 nothing on the receive side may keep the transmitter from starting.
 
-SET THE DIVIDER BY MEASUREMENT, NOT BY CALCULATION. The drive setting controls
-how much current the output can source, not its voltage swing: into a 1.2 kOhm
-divider the output swings close to the supply whatever the drive is set to.
-Measure at pin 13, aim for about 0.5 V peak to peak, and change the shunt
-resistor if it is off. A 50 ohm instrument loads the divider and changes what it
-reads, so a scope probe is the honest measurement here.
-
-  NOT VERIFIED: the RCLK input level limits come from AN332 as carried by the
-  PU2CLR library headers. The 31130..34406 Hz window for REFCLK_FREQ is
-  confirmed; the 0.3 to 1.5 V input range is not. Check the data sheet.
-
-Why bother at all: the 32.768 kHz watch crystal is +-20 ppm, about +-390 Hz at a
-19.5 MHz IF. That is small next to the Bullseye's +-10 kHz, so today it buys
-little — but once the LNB error is measured and corrected, it becomes the
-dominant term.
+A CHIP THAT TALKS BUT WILL NOT TUNE IS A REFERENCE-CLOCK FAULT. "rx diag" shows
+it plainly: part number and firmware come back fine, while "tuner reports 0 kHz,
+tune complete=0". Nothing about the signal path can cause that.
 
 --------------------------------------------------------------------------------
 IF INPUT — AMI, not FMI
