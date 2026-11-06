@@ -75,6 +75,14 @@ int32_t  si4732_get_cal_hz(void);
 void     si4732_set_xoscen(bool on);
 bool     si4732_get_xoscen(void);
 
+// Antenna tuning capacitor, sent with every tune. 0 lets the chip tune its own
+// varactor, which Silicon Labs recommends and which suits a medium-wave
+// loopstick. A short wire, or a 50 ohm feed from a mixer, has no inductance to
+// resonate against; a fixed small value may work better there. The capacitance
+// is 95 fF x ANTCAP + 7 pF, so 1 is about 7.1 pF. Range 0..6143.
+bool     si4732_set_antcap(uint16_t cap);
+uint16_t si4732_get_antcap(void);
+
 // Adopt saved settings without touching the chip. Called at boot, before the
 // receiver has even been probed — the first si4732_set_mode() then applies all
 // of it at once. Values are range-checked and silently replaced by the

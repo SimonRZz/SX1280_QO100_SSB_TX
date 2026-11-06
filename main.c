@@ -1440,6 +1440,8 @@ static void cmd_help(void) {
         "  rx                   - receiver status\r\n"
         "  rx diag              - detailed receiver report\r\n"
         "  rx xosc <0|1>        - POWER_UP crystal-oscillator bit; 0 = external RCLK\r\n"
+        "  rx antcap <0..6143>  - antenna tuning capacitor; 0 = automatic. Try 1 for a\r\n"
+        "                         short wire or a 50 ohm feed.\r\n"
         "  rx on | off          - power the receiver up / down\r\n"
         "  rx usb | lsb | am    - demodulation mode (sideband needs the SSB patch)\r\n"
         "  rx freq <kHz>        - 2300..26100, the IF from the mixer.\r\n"
@@ -1920,6 +1922,16 @@ static void cdc_handle_line(char *line) {
         // rx xosc 0|1 — the crystal-oscillator bit of POWER_UP. Switchable
         // because the reference library sets it where this driver does not,
         // and that is the one documented difference while SSB refuses to tune.
+        if (streqi(argv[1], "antcap") && argc >= 3) {
+            long v = strtol(argv[2], NULL, 10);
+            if (v < 0 || !si4732_set_antcap((uint16_t)v)) {
+                cdc_write_str("ERR: rx antcap 0..6143 (0 = automatic)\r\n");
+                return;
+            }
+            cdc_printf("OK antcap=%u (%s)\r\n", si4732_get_antcap(),
+                       si4732_get_antcap() ? "fixed" : "chip tunes its own varactor");
+            return;
+        }
         if (streqi(argv[1], "xosc")) {
             if (argc >= 3) {
                 si4732_set_xoscen(strtol(argv[2], NULL, 10) != 0);

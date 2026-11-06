@@ -113,6 +113,12 @@ static bool          s_stc_ok    = false; // last tune reported seek/tune comple
 // library uses 1 and calls it "a condition for loading the patch", so while SSB
 // refuses to tune this stays switchable rather than asserted.
 static bool          s_xoscen    = false;
+// Antenna tuning capacitor sent with every tune. 0 = the chip tunes its own
+// varactor, which is what Silicon Labs recommends and what a medium-wave
+// loopstick wants. A short wire or a 50 ohm feed from a mixer has no
+// inductance to resonate against, so a fixed small value may suit better:
+// the capacitance is 95 fF x ANTCAP + 7 pF, range 1..6143.
+static uint16_t      s_antcap    = 0u;
 static bool          s_rev_valid = false;
 static const char   *s_last_err  = "none";
 
@@ -427,8 +433,8 @@ static bool si_tune(void)
     const uint8_t b[6] = {
         CMD_TUNE_FREQ, arg1,
         (uint8_t)(khz >> 8), (uint8_t)khz,
-        0x00u, 0x00u              // ANTCAP = 0: automatic, irrelevant on a
-    };                            // 50 ohm driven input
+        (uint8_t)(s_antcap >> 8), (uint8_t)s_antcap
+    };
     if (!si_cmd(b, sizeof b)) return false;
 
     // Advisory only: a tune that does not announce itself may still have
@@ -624,6 +630,16 @@ int32_t si4732_get_cal_hz(void) { return s_cal_hz; }
 
 bool si4732_get_xoscen(void) { return s_xoscen; }
 
+uint16_t si4732_get_antcap(void) { return s_antcap; }
+
+bool si4732_set_antcap(uint16_t cap)
+{
+    if (cap > 6143u) return false;
+    s_antcap = cap;
+    if (!s_present || !s_on) return true;
+    return si_tune();              // ANTCAP travels with the tune command
+}
+
 // Takes effect on the next power-up, so re-select the mode afterwards.
 void si4732_set_xoscen(bool on) { s_xoscen = on; }
 
@@ -739,7 +755,9 @@ void si4732_diag_print(void)
     si_log("[SI4732]   mode=%s freq=%lu kHz bw=%u Hz bfo=%d Hz vol=%u mute=%d",
            si4732_mode_name(s_mode), (unsigned long)s_khz, s_bw_hz,
            (int)s_bfo_hz, s_volume, (int)s_mute);
-    si_log("[SI4732]   xoscen=%d (0 = external clock on RCLK)", (int)s_xoscen);
+    si_log("[SI4732]   xoscen=%d (0 = external clock on RCLK)  antcap=%u%s",
+           (int)s_xoscen, s_antcap,
+           s_antcap ? "" : " (chip tunes its own varactor)");
     si_log("[SI4732]   rclk=%u Hz / %u = refclk %u Hz",
            (unsigned)SI_RCLK_HZ, (unsigned)SI_RCLK_PRESCALE, (unsigned)SI_REFCLK_FREQ);
 
