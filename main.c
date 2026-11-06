@@ -1432,6 +1432,8 @@ static void cmd_help(void) {
         "Receive (Si4732, QO-100 downlink via LNB + mixer):\r\n"
         "  i2c                  - scan both buses; shows what actually answers\r\n"
         "  rclk [0|1]           - 25 MHz on SI5351 CLK2 -> Si4732 pin 13. OFF at boot,\r\n"
+        "  rclk drive <2|4|6|8> - drive strength in mA, for finding the level the\r\n"
+        "                         Si4732 needs. 2 mA at boot.\r\n"
         "                         'rx on' enables it. The receiver needs it to tune.\r\n"
         "  lo [0|1]             - 144 MHz on SI5351 CLK0, OFF at boot; mixer LO is its 5th\r\n"
         "                         harmonic at 720 MHz. On by default.\r\n"
@@ -1880,8 +1882,17 @@ static void cdc_handle_line(char *line) {
                    gpsdo_lo_enabled() ? 1 : 0);
         return;
     }
-    // Si4732 reference clock on SI5351 CLK2: rclk [0|1]
+    // Si4732 reference clock on SI5351 CLK2: rclk [0|1] | rclk drive <mA>
     if (streqi(argv[0], "rclk")) {
+        if (argc >= 3 && streqi(argv[1], "drive")) {
+            long ma = strtol(argv[2], NULL, 10);
+            if (!gpsdo_set_rclk_drive((uint8_t)ma)) {
+                cdc_write_str("ERR: rclk drive 2|4|6|8 (mA)\r\n");
+                return;
+            }
+            cdc_printf("OK rclk drive=%u mA\r\n", gpsdo_rclk_drive());
+            return;
+        }
         if (argc >= 2) {
             bool on = (strtol(argv[1], NULL, 10) != 0);
             if (!gpsdo_set_rclk_enabled(on)) {
@@ -1889,8 +1900,9 @@ static void cdc_handle_line(char *line) {
                 return;
             }
         }
-        cdc_printf("OK rclk=%d (CLK2, 25 MHz -> Si4732 pin 13; divided by 800 "
-                   "to 31250 Hz)\r\n", gpsdo_rclk_enabled() ? 1 : 0);
+        cdc_printf("OK rclk=%d drive=%u mA (CLK2, 25 MHz -> Si4732 pin 13; "
+                   "divided by 800 to 31250 Hz)\r\n",
+                   gpsdo_rclk_enabled() ? 1 : 0, gpsdo_rclk_drive());
         return;
     }
     // Receiver: rx [diag|on|off|usb|lsb|am|freq|vol|bw|bfo|mute]

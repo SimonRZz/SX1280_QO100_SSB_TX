@@ -95,3 +95,10 @@ bool gpsdo_lo_enabled(void);
 // without it, so bring-up enables it before powering the Si4732 up.
 bool gpsdo_set_rclk_enabled(bool on);
 bool gpsdo_rclk_enabled(void);
+
+// Drive strength of that output, 2/4/6/8 mA, changeable at runtime. The level
+// the Si4732 actually needs on RCLK is not settled in this project; a chip that
+// answers on I2C but reports "tune did not complete" and 0 kHz back is the
+// symptom of too weak a reference.
+bool    gpsdo_set_rclk_drive(uint8_t ma);
+uint8_t gpsdo_rclk_drive(void);

@@ -94,6 +94,7 @@ static uint8_t s_si_addr = 0x00u;
 // Receive-side outputs, both off until asked for.
 static bool s_loOn   = false;  // CLK0, 144 MHz, mixer LO
 static bool s_rclkOn = false;  // CLK2, 25 MHz, Si4732 reference clock
+static uint8_t s_rclkDrive = 0u;  // IDRV field of CLK2_CTRL: 0=2mA .. 3=8mA
 
 #define SI_REG_STATUS      0u    // Device status (read-only)
 #define SI_STATUS_SYS_INIT (1u << 7) // 1 = calibrating (not ready)
@@ -307,6 +308,33 @@ bool gpsdo_set_rclk_enabled(bool on)
 }
 
 bool gpsdo_rclk_enabled(void) { return s_rclkOn; }
+
+// Drive strength of CLK2, settable at runtime because the level the Si4732
+// needs on its RCLK pin is not something this project has pinned down: the
+// chip talks happily but refuses to tune when the reference is too weak, and
+// that is a bench question, not a datasheet one. 2, 4, 6 or 8 mA.
+bool gpsdo_set_rclk_drive(uint8_t ma)
+{
+    if (s_si_addr == 0x00u) return false;
+    uint8_t idrv;
+    switch (ma) {
+        case 2u: idrv = 0u; break;
+        case 4u: idrv = 1u; break;
+        case 6u: idrv = 2u; break;
+        case 8u: idrv = 3u; break;
+        default: return false;
+    }
+    // CLK2_CTRL base: PDN=0, INT=0 (fractional), MS_SRC=PLLB, CLK_SRC=MS2.
+    if (!si_write_reg(SI_REG_CLK2_CTRL, (uint8_t)(0x2Cu | idrv))) return false;
+    s_rclkDrive = idrv;
+    return true;
+}
+
+uint8_t gpsdo_rclk_drive(void)
+{
+    static const uint8_t ma[4] = { 2u, 4u, 6u, 8u };
+    return ma[s_rclkDrive & 3u];
+}
 
 bool gpsdo_lo_enabled(void) { return s_loOn; }
 
