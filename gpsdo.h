@@ -70,20 +70,20 @@ typedef struct {
 void gpsdo_get_info(gpsdo_info_t *out);
 
 // ---------------------------------------------------------------------------
-// Receive mixer local oscillator — SI5351 CLK2, 144 MHz
+// Receive mixer local oscillator — SI5351 CLK0, 144 MHz
 // ---------------------------------------------------------------------------
 // The downconverter's LO is the 5th harmonic of this, 720 MHz, selected by a
 // high-pass and amplified at the receiver.
 //
 // OFF after gpsdo_init(). Deliberately: init runs before the boot gate that
-// waits for a locked 52 MHz, so a fault on the CLK2 line would otherwise stop
+// waits for a locked 52 MHz, so a fault on the CLK0 line would otherwise stop
 // the transmitter from starting. Enable it with gpsdo_set_lo_enabled(true) once
 // the radio is up. CLK1 (52 MHz, the SX1280's only clock) is never affected.
 bool gpsdo_set_lo_enabled(bool on);
 bool gpsdo_lo_enabled(void);
 
 // ---------------------------------------------------------------------------
-// Si4732 reference clock — SI5351 CLK0, 25 MHz
+// Si4732 reference clock — SI5351 CLK2, 25 MHz
 // ---------------------------------------------------------------------------
 // The Si4732 has no crystal: it runs off this clock on its RCLK pin, divided by
 // 800 to 31250 Hz. Exact (864 MHz / 25), from PLL B, through a fractional

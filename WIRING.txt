@@ -127,9 +127,9 @@ Signal chain:
         -> RMS-11X mixer -> 19.5 MHz IF -> 3 dB pad -> low-pass
         -> Si4732 (SSB) -> audio -> GPIO 27 (ADC1)
 
-   SI5351 CLK2, 144 MHz -> high-pass -> SPF5189Z -> mixer LO
+   SI5351 CLK0, 144 MHz -> high-pass -> SPF5189Z -> mixer LO
                                          (5th harmonic, 720 MHz)
-   SI5351 CLK0,  25 MHz -> divider -> Si4732 RCLK (pin 13)
+   SI5351 CLK2,  25 MHz -> divider -> Si4732 RCLK (pin 13)
 
 Both from the PICO's SI5351, so the receiver needs no second board: the Pro
 Micro GPSDO is not part of the receive chain at all.
@@ -206,10 +206,10 @@ If "rx diag" reports the chip answering but GET_REV failing, the bus mode
 latched wrong — that is the first thing to check.
 
 --------------------------------------------------------------------------------
-REFERENCE CLOCK — 25 MHz from SI5351 CLK0
+REFERENCE CLOCK — 25 MHz from SI5351 CLK2
 --------------------------------------------------------------------------------
 
-    SI5351 CLK0 ──[ 1 kOhm ]──┬──[ 100 pF ]──> Si4732  13  RCLK
+    SI5351 CLK2 ──[ 1 kOhm ]──┬──[ 100 pF ]──> Si4732  13  RCLK
     (25 MHz, 2 mA)            │
                           [ 220 Ohm ]           pin 2 (GPO3) stays OPEN
                               │
@@ -232,9 +232,9 @@ instead.
 
 THE THREE OUTPUTS, all on the Pico's SI5351:
 
-    CLK0   25 MHz, 2 mA, PLL B fractional   Si4732 RCLK      "rclk 0|1"
+    CLK0  144 MHz, 8 mA, PLL B integer      mixer LO         "lo 0|1"
     CLK1   52 MHz, 4 mA, PLL A fractional   SX1280 XTA       never switched
-    CLK2  144 MHz, 8 mA, PLL B integer      mixer LO         "lo 0|1"
+    CLK2   25 MHz, 2 mA, PLL B fractional   Si4732 RCLK      "rclk 0|1"
 
 CLK1 is the SX1280's only clock. si_write_oeb() clears its enable bit
 unconditionally, so no combination of "lo" and "rclk" can take it away, and
@@ -336,8 +336,8 @@ CONSOLE COMMANDS
 --------------------------------------------------------------------------------
 
     i2c                  scan both buses; shows what actually answers
-    rclk [0|1]           25 MHz on CLK0 -> Si4732 pin 13. OFF at boot.
-    lo [0|1]             144 MHz on CLK2 -> mixer LO. OFF at boot.
+    rclk [0|1]           25 MHz on CLK2 -> Si4732 pin 13. OFF at boot.
+    lo [0|1]             144 MHz on CLK0 -> mixer LO. OFF at boot.
     rx                   receiver status (!R line)
     rx diag              detailed report, including which address answered
     rx on | off          power up / down. Enables rclk first, then uploads

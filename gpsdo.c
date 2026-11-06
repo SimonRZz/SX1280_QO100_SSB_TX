@@ -52,13 +52,14 @@
 //
 //   CLK1  52 MHz  → SX1280 XTA        PLL A: 24 MHz × (36 + 5/6) = 884 MHz
 //                                     MS1:   884 ÷ 17 = 52 MHz
-//   CLK2 144 MHz  → receive mixer LO  PLL B: 24 MHz × 36        = 864 MHz
-//                 (off at boot, enable with "lo 1")
-//                                     MS2:   864 ÷ 6  = 144 MHz
+//   CLK0 144 MHz  → receive mixer LO  PLL B: 24 MHz × 36 = 864 MHz
+//                 (off at boot, "lo 1")    MS0: 864 ÷ 6 = 144 MHz
+//   CLK2  25 MHz  → Si4732 RCLK           PLL B, fractional
+//                 (off at boot, "rclk 1")  MS2: 864 ÷ (34+14/25) = 25 MHz
 //
-// CLK0 is left powered down. CLK2 carries the mixer LO because that is where
-// the filter is wired; electrically either output would do, both sit next to
-// CLK1 on the package and either can be driven from PLL B.
+// Which receive-side signal sits on which output follows the board, not the
+// other way round; electrically either would do, both are next to CLK1 on the
+// package and both can be driven from PLL B.
 //
 // The mixer does not run on 144 MHz itself: its local oscillator is the 5th
 // harmonic at 720 MHz, picked out by a high-pass and lifted by an SPF5189Z at
@@ -67,7 +68,12 @@
 // also multiplies the phase noise by 20·log10(5) = 14 dB, so there is no room
 // for a fractional divider here. 144 MHz is the only frequency near the target
 // that PLL B reaches with an integer divider (720 ÷ 144 = 5 is not a legal
-// MultiSynth value, 864 ÷ 6 is).
+// MultiSynth value, 864 ÷ 6 is). Hence CLK0 at 8 mA with an even integer.
+//
+// The 25 MHz on CLK2 may be fractional: the Si4732 divides it by 800 and
+// multiplies back up internally, so the two roughly cancel, and the part is
+// built for a 32.768 kHz watch crystal at ±20 ppm. 864/25 is an exact
+// fraction, so the frequency is exact.
 //
 // PLL A stays fractional, as it always was: 52 MHz needs a 624 MHz VCO for an
 // integer path and there are only two PLLs. It has been on the air like this.
@@ -76,7 +82,8 @@
 //   PLL A: p1=4202 (0x106A), p2=4, p3=6
 //   MS1:   p1=1664 (0x0680), p2=0, p3=1
 //   PLL B: p1=4096 (0x1000), p2=0, p3=1
-//   MS2:   p1=256  (0x0100), p2=0, p3=1
+//   MS0:   p1=256  (0x0100), p2=0,  p3=1    (144 MHz, integer ÷6)
+//   MS2:   p1=3911 (0x0F47), p2=17, p3=25   (25 MHz, ÷34+14/25)
 // ---------------------------------------------------------------------------
 // SI5351 I2C address — auto-detected in gpsdo_init().
 // Common values: 0x60 (SDO/AD0=GND), 0x61 (SDO/AD0=VCC).
@@ -85,8 +92,8 @@
 static uint8_t s_si_addr = 0x00u;
 
 // Receive-side outputs, both off until asked for.
-static bool s_loOn   = false;  // CLK2, 144 MHz, mixer LO
-static bool s_rclkOn = false;  // CLK0, 25 MHz, Si4732 reference clock
+static bool s_loOn   = false;  // CLK0, 144 MHz, mixer LO
+static bool s_rclkOn = false;  // CLK2, 25 MHz, Si4732 reference clock
 
 #define SI_REG_STATUS      0u    // Device status (read-only)
 #define SI_STATUS_SYS_INIT (1u << 7) // 1 = calibrating (not ready)
@@ -165,8 +172,8 @@ static bool si_write_oeb(void)
 {
     uint8_t v = SI_OEB_ALL_OFF;
     v &= (uint8_t)~SI_OEB_BIT_CLK1;                        // always on
-    if (s_loOn)   v &= (uint8_t)~SI_OEB_BIT_CLK2;          // 144 MHz
-    if (s_rclkOn) v &= (uint8_t)~SI_OEB_BIT_CLK0;          // 25 MHz
+    if (s_loOn)   v &= (uint8_t)~SI_OEB_BIT_CLK0;          // 144 MHz
+    if (s_rclkOn) v &= (uint8_t)~SI_OEB_BIT_CLK2;          // 25 MHz
     return si_write_reg(SI_REG_OEB, v);
 }
 
@@ -178,24 +185,24 @@ static bool si5351_init_clocks(void)
     // Disable all outputs while configuring.
     if (!si_write_reg(SI_REG_OEB, SI_OEB_ALL_OFF)) return false;
 
-    // CLK0: PDN=0, INT=0 (fractional), MS_SRC=PLLB, INV=0, CLK_SRC=MS0, IDRV=2mA
-    //   Byte: 0b 0 0 1 0 11 00 = 0x2C
-    // 2 mA because the level at the Si4732 is set by the divider on its RCLK
-    // pin, not by the drive setting: into a high-impedance divider the output
-    // swings close to the supply whatever the drive is. Lower drive just means
-    // less current and less crosstalk inside the chip.
-    si_write_reg(SI_REG_CLK0_CTRL, 0x2Cu);
+    // CLK0: PDN=0, INT=1, MS_SRC=PLLB, INV=0, CLK_SRC=MS0=0b11, IDRV=8mA=0b11
+    //   Byte: 0b 0 1 1 0 11 11 = 0x6F
+    // 8 mA is deliberate: the wanted signal is the 5th harmonic, which only
+    // exists because the edges are steep.
+    si_write_reg(SI_REG_CLK0_CTRL, 0x6Fu);
 
     // CLK1: PDN=0, INT=1 (integer mode), MS_SRC=PLLA, INV=0,
     //        CLK_SRC=MS1(self)=0b11, IDRV=4mA=0b01
     //   Byte: 0b 0 1 0 0 11 01 = 0x4D
     si_write_reg(SI_REG_CLK1_CTRL, 0x4Du);
 
-    // CLK2: PDN=0, INT=1, MS_SRC=PLLB, INV=0, CLK_SRC=MS2=0b11, IDRV=8mA=0b11
-    //   Byte: 0b 0 1 1 0 11 11 = 0x6F
-    // 8 mA is deliberate: the wanted signal is the 5th harmonic, which only
-    // exists because the edges are steep.
-    si_write_reg(SI_REG_CLK2_CTRL, 0x6Fu);
+    // CLK2: PDN=0, INT=0 (fractional), MS_SRC=PLLB, INV=0, CLK_SRC=MS2, IDRV=2mA
+    //   Byte: 0b 0 0 1 0 11 00 = 0x2C
+    // 2 mA because the level at the Si4732 is set by the divider on its RCLK
+    // pin, not by the drive setting: into a high-impedance divider the output
+    // swings close to the supply whatever the drive is. Lower drive just means
+    // less current and less crosstalk inside the chip.
+    si_write_reg(SI_REG_CLK2_CTRL, 0x2Cu);
 
     // Crystal load capacitance: 8 pF (bits[7:6]=0b10) + reserved 0x12.
     si_write_reg(SI_REG_XTAL_LOAD, 0x92u);
@@ -233,31 +240,26 @@ static bool si5351_init_clocks(void)
     };
     if (!si_write_regs(SI_REG_PLLB_BASE, pllb, 8u)) return false;
 
-    // MS2 (CLK2): p1=256=0x0100, p2=0, p3=1  →  864 ÷ 6 = 144 MHz
-    static const uint8_t ms2[8] = {
+    // MS0 (CLK0): p1=256=0x0100, p2=0, p3=1  →  864 ÷ 6 = 144 MHz
+    static const uint8_t ms0[8] = {
         0x00u, 0x01u,   // p3=1
         0x00u,          // R_DIV=/1, DIVBY4=0, p1[17:16]=0
         0x01u, 0x00u,   // p1[15:8]=0x01, p1[7:0]=0x00  (256)
         0x00u,          // upper nibbles = 0
         0x00u, 0x00u    // p2=0
     };
-    if (!si_write_regs(SI_REG_MS2_BASE, ms2, 8u)) return false;
+    if (!si_write_regs(SI_REG_MS0_BASE, ms0, 8u)) return false;
 
-    // MS0 (CLK0): 864 ÷ (34 + 14/25) = 25 MHz exactly → Si4732 reference clock.
+    // MS2 (CLK2): 864 ÷ (34 + 14/25) = 25 MHz exactly → Si4732 reference clock.
     //   p1=3911 (0x0F47), p2=17, p3=25
-    // Fractional, and that is fine here. The Si4732 divides this by 800 down to
-    // 31250 Hz and multiplies back up internally, so the two roughly cancel —
-    // and the chip is built to run off a 32.768 kHz watch crystal at ±20 ppm.
-    // Its tolerance for reference jitter is orders of magnitude above the
-    // SX1280's. 864/25 is an exact fraction, so the frequency is exact.
-    static const uint8_t ms0[8] = {
+    static const uint8_t ms2[8] = {
         0x00u, 0x19u,   // p3=25
         0x00u,          // R_DIV=/1, DIVBY4=0, p1[17:16]=0
         0x0Fu, 0x47u,   // p1[15:8]=0x0F, p1[7:0]=0x47  (3911)
         0x00u,          // upper nibbles of p3/p2 = 0
         0x00u, 0x11u    // p2=17
     };
-    if (!si_write_regs(SI_REG_MS0_BASE, ms0, 8u)) return false;
+    if (!si_write_regs(SI_REG_MS2_BASE, ms2, 8u)) return false;
 
     // Reset both PLLs to lock them to the new multisynth settings. Safe here
     // because nothing depends on either clock yet — the SX1280 is still held in
@@ -267,7 +269,7 @@ static bool si5351_init_clocks(void)
 
     // CLK1 only. Both receive-side outputs stay OFF until asked for.
     //
-    // CLK2 used to come up enabled, which was a mistake: gpsdo_init() runs
+    // The mixer LO used to come up enabled, a mistake: gpsdo_init() runs
     // before the boot gate that waits for a locked 52 MHz, so anything wrong on
     // a receive-side line — stray DC from an amplifier module, a supply droop
     // from the extra output current, 144 MHz coupling into the 24 MHz reference
@@ -282,7 +284,7 @@ static bool si5351_init_clocks(void)
     return true;
 }
 
-// Switch the 144 MHz mixer LO (CLK2). Useful for measuring the LO branch
+// Switch the 144 MHz mixer LO (CLK0). Useful for measuring the LO branch
 // against a quiet baseline, and for silencing it during transmit.
 bool gpsdo_set_lo_enabled(bool on)
 {
@@ -293,7 +295,7 @@ bool gpsdo_set_lo_enabled(bool on)
     return true;
 }
 
-// Switch the 25 MHz Si4732 reference clock (CLK0). The receiver cannot tune
+// Switch the 25 MHz Si4732 reference clock (CLK2). The receiver cannot tune
 // without it, so si4732 bring-up turns it on first.
 bool gpsdo_set_rclk_enabled(bool on)
 {
