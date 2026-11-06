@@ -1430,6 +1430,7 @@ static void cmd_help(void) {
         "  set amp_min_a <float>\r\n"
         "\r\n"
         "Receive (Si4732, QO-100 downlink via LNB + mixer):\r\n"
+        "  i2c                  - scan both buses; shows what actually answers\r\n"
         "  lo [0|1]             - 144 MHz on SI5351 CLK2, OFF at boot; mixer LO is its 5th\r\n"
         "                         harmonic at 720 MHz. On by default.\r\n"
         "  rx                   - receiver status\r\n"
@@ -1798,6 +1799,36 @@ static void cdc_handle_line(char *line) {
         char gbuf[128];
         gpsdo_format_status(gbuf, sizeof(gbuf));
         cdc_write_str(gbuf);
+        return;
+    }
+        // Bus scan: i2c
+    //
+    // For first contact with a newly wired chip. Knowing what answers tells you
+    // whether the bus works at all: if the SI5351 shows up at 0x60 but nothing
+    // appears at 0x11 or 0x63, the wiring is fine and the problem is at the
+    // Si4732 itself (reset, bus mode latch, supply). If nothing answers, look
+    // at pull-ups and the pins first.
+    if (streqi(argv[0], "i2c")) {
+        static const struct { i2c_inst_t *bus; const char *name; } buses[] = {
+            { i2c0, "i2c0 (GP0/GP1)" },
+            { i2c1, "i2c1 (GP6/GP7)" },
+        };
+        for (size_t b = 0; b < 2; b++) {
+            int found = 0;
+            cdc_printf("%s:\r\n", buses[b].name);
+            for (uint8_t a = 0x08u; a <= 0x77u; a++) {
+                uint8_t dummy;
+                if (i2c_read_blocking(buses[b].bus, a, &dummy, 1, false) != 1) continue;
+                found++;
+                const char *who = "unknown";
+                if      (a >= 0x60u && a <= 0x63u) who = "SI5351 (or Si4732 at 0x63)";
+                else if (a == 0x11u)               who = "Si4732";
+                else if (a == 0x3Cu || a == 0x3Du) who = "SSD1306 OLED";
+                cdc_printf("  0x%02X  %s\r\n", a, who);
+            }
+            if (!found) cdc_write_str("  nothing answered\r\n");
+            tud_task();
+        }
         return;
     }
     // Receive mixer LO on SI5351 CLK2: lo [0|1]
