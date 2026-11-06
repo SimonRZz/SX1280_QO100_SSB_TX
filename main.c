@@ -1940,6 +1940,14 @@ static void cdc_handle_line(char *line) {
             }
             cdc_printf("OK xoscen=%d (0 = external clock on RCLK)\r\n",
                        si4732_get_xoscen() ? 1 : 0);
+            // Leaving this on breaks reception in every mode, AM included: the
+            // chip switches on its crystal amplifier and works against the
+            // clock we feed into RCLK, with no crystal to settle it. It has
+            // cost one round of "AM stopped working too", so say so every time.
+            if (si4732_get_xoscen())
+                cdc_write_str("WARN: xoscen=1 expects a crystal on pins 13/2. This board "
+                              "has none,\r\n      so nothing will tune while it is set. "
+                              "Back to normal: 'rx xosc 0'.\r\n");
             return;
         }
 
