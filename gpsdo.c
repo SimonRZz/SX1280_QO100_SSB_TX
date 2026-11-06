@@ -84,8 +84,9 @@
 // 0x00 means "not found yet".
 static uint8_t s_si_addr = 0x00u;
 
-// Whether CLK2 (144 MHz, the receive mixer LO) is currently enabled.
-static bool s_loOn = false;
+// Receive-side outputs, both off until asked for.
+static bool s_loOn   = false;  // CLK2, 144 MHz, mixer LO
+static bool s_rclkOn = false;  // CLK0, 25 MHz, Si4732 reference clock
 
 #define SI_REG_STATUS      0u    // Device status (read-only)
 #define SI_STATUS_SYS_INIT (1u << 7) // 1 = calibrating (not ready)
@@ -97,17 +98,21 @@ static bool s_loOn = false;
 #define SI_REG_CLK2_CTRL   18u
 #define SI_REG_PLLA_BASE   26u   // 8 bytes: regs 26-33
 #define SI_REG_PLLB_BASE   34u   // 8 bytes: regs 34-41
-#define SI_REG_MS0_BASE    42u   // 8 bytes: regs 42-49  (CLK0, unused here)
+#define SI_REG_MS0_BASE    42u   // 8 bytes: regs 42-49
 #define SI_REG_MS1_BASE    50u   // 8 bytes: regs 50-57
 #define SI_REG_MS2_BASE    58u   // 8 bytes: regs 58-65
 #define SI_REG_PLL_RESET   177u
 #define SI_REG_XTAL_LOAD   183u
 
-// Output enable is active LOW, one bit per clock: bit 0 = CLK0, 1 = CLK1,
-// 2 = CLK2. CLK1 must never be disabled — it is the SX1280's only clock.
 #define SI_OEB_ALL_OFF     0xFFu
-#define SI_OEB_CLK1        0xFDu  // CLK1 on, CLK0 and CLK2 off
-#define SI_OEB_CLK1_CLK2   0xF9u  // CLK1 and CLK2 on, CLK0 off
+
+// Output enable is active LOW, one bit per clock: bit 0 = CLK0, 1 = CLK1,
+// 2 = CLK2. Written only through si_write_oeb(), which always leaves CLK1
+// enabled — it is the SX1280's only clock — so no combination of receive-side
+// switching can take the transmitter's clock away.
+#define SI_OEB_BIT_CLK0    (1u << 0)
+#define SI_OEB_BIT_CLK1    (1u << 1)
+#define SI_OEB_BIT_CLK2    (1u << 2)
 
 // Scan 0x60–0x63 (all valid SI5351 I2C addresses).
 // Retries up to 3 times with a short delay between attempts.
@@ -153,6 +158,18 @@ static bool si_read_reg(uint8_t reg, uint8_t *val)
     return i2c_read_blocking(GPSDO_I2C, s_si_addr, val, 1, false) == 1;
 }
 
+// Writes the output-enable register from the two receive-side flags. CLK1 is
+// cleared unconditionally, so there is no code path — and no combination of
+// "lo" and "rclk" — that can switch off the SX1280's clock.
+static bool si_write_oeb(void)
+{
+    uint8_t v = SI_OEB_ALL_OFF;
+    v &= (uint8_t)~SI_OEB_BIT_CLK1;                        // always on
+    if (s_loOn)   v &= (uint8_t)~SI_OEB_BIT_CLK2;          // 144 MHz
+    if (s_rclkOn) v &= (uint8_t)~SI_OEB_BIT_CLK0;          // 25 MHz
+    return si_write_reg(SI_REG_OEB, v);
+}
+
 static bool si5351_init_clocks(void)
 {
     // Scan for SI5351 at 0x60–0x63 before writing any registers.
@@ -161,8 +178,13 @@ static bool si5351_init_clocks(void)
     // Disable all outputs while configuring.
     if (!si_write_reg(SI_REG_OEB, SI_OEB_ALL_OFF)) return false;
 
-    // Power down unused CLK0.
-    si_write_reg(SI_REG_CLK0_CTRL, 0x80u);
+    // CLK0: PDN=0, INT=0 (fractional), MS_SRC=PLLB, INV=0, CLK_SRC=MS0, IDRV=2mA
+    //   Byte: 0b 0 0 1 0 11 00 = 0x2C
+    // 2 mA because the level at the Si4732 is set by the divider on its RCLK
+    // pin, not by the drive setting: into a high-impedance divider the output
+    // swings close to the supply whatever the drive is. Lower drive just means
+    // less current and less crosstalk inside the chip.
+    si_write_reg(SI_REG_CLK0_CTRL, 0x2Cu);
 
     // CLK1: PDN=0, INT=1 (integer mode), MS_SRC=PLLA, INV=0,
     //        CLK_SRC=MS1(self)=0b11, IDRV=4mA=0b01
@@ -221,37 +243,68 @@ static bool si5351_init_clocks(void)
     };
     if (!si_write_regs(SI_REG_MS2_BASE, ms2, 8u)) return false;
 
+    // MS0 (CLK0): 864 ÷ (34 + 14/25) = 25 MHz exactly → Si4732 reference clock.
+    //   p1=3911 (0x0F47), p2=17, p3=25
+    // Fractional, and that is fine here. The Si4732 divides this by 800 down to
+    // 31250 Hz and multiplies back up internally, so the two roughly cancel —
+    // and the chip is built to run off a 32.768 kHz watch crystal at ±20 ppm.
+    // Its tolerance for reference jitter is orders of magnitude above the
+    // SX1280's. 864/25 is an exact fraction, so the frequency is exact.
+    static const uint8_t ms0[8] = {
+        0x00u, 0x19u,   // p3=25
+        0x00u,          // R_DIV=/1, DIVBY4=0, p1[17:16]=0
+        0x0Fu, 0x47u,   // p1[15:8]=0x0F, p1[7:0]=0x47  (3911)
+        0x00u,          // upper nibbles of p3/p2 = 0
+        0x00u, 0x11u    // p2=17
+    };
+    if (!si_write_regs(SI_REG_MS0_BASE, ms0, 8u)) return false;
+
     // Reset both PLLs to lock them to the new multisynth settings. Safe here
     // because nothing depends on either clock yet — the SX1280 is still held in
     // reset. At runtime PLL A must never be reset: the SX1280 would lose its
     // clock for milliseconds. Reset B alone with 0x80 if that is ever needed.
     si_write_reg(SI_REG_PLL_RESET, 0xA0u);
 
-    // CLK1 only. The mixer LO stays OFF until asked for with "lo 1".
+    // CLK1 only. Both receive-side outputs stay OFF until asked for.
     //
-    // It used to come up enabled, which was a mistake: gpsdo_init() runs before
-    // the boot gate that waits for a locked 52 MHz, so anything wrong on the
-    // CLK2 line — stray DC from an amplifier module, a supply droop from the
-    // extra 8 mA, 144 MHz coupling into the 24 MHz reference on XA — could stop
-    // the transmitter from starting at all. The receive side must never be able
-    // to do that. MS2 and CLK2_CTRL are configured above, so "lo 1" only has to
-    // flip the output-enable bit; PLL B is already locked by then.
-    si_write_reg(SI_REG_OEB, SI_OEB_CLK1);
-    s_loOn = false;
+    // CLK2 used to come up enabled, which was a mistake: gpsdo_init() runs
+    // before the boot gate that waits for a locked 52 MHz, so anything wrong on
+    // a receive-side line — stray DC from an amplifier module, a supply droop
+    // from the extra output current, 144 MHz coupling into the 24 MHz reference
+    // on XA — could stop the transmitter from starting at all. The receive side
+    // must never be able to do that. All the MultiSynths and control registers
+    // are configured above, so enabling an output only flips its output-enable
+    // bit; both PLLs are already locked by then.
+    s_loOn   = false;
+    s_rclkOn = false;
+    si_write_oeb();
 
     return true;
 }
 
-// Switch the 144 MHz mixer LO without touching CLK1. Useful for measuring the
-// LO branch against a quiet baseline, and for silencing it during transmit.
+// Switch the 144 MHz mixer LO (CLK2). Useful for measuring the LO branch
+// against a quiet baseline, and for silencing it during transmit.
 bool gpsdo_set_lo_enabled(bool on)
 {
     if (s_si_addr == 0x00u) return false;
-    if (!si_write_reg(SI_REG_OEB, on ? SI_OEB_CLK1_CLK2 : SI_OEB_CLK1))
-        return false;
+    bool prev = s_loOn;
     s_loOn = on;
+    if (!si_write_oeb()) { s_loOn = prev; return false; }
     return true;
 }
+
+// Switch the 25 MHz Si4732 reference clock (CLK0). The receiver cannot tune
+// without it, so si4732 bring-up turns it on first.
+bool gpsdo_set_rclk_enabled(bool on)
+{
+    if (s_si_addr == 0x00u) return false;
+    bool prev = s_rclkOn;
+    s_rclkOn = on;
+    if (!si_write_oeb()) { s_rclkOn = prev; return false; }
+    return true;
+}
+
+bool gpsdo_rclk_enabled(void) { return s_rclkOn; }
 
 bool gpsdo_lo_enabled(void) { return s_loOn; }
 

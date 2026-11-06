@@ -127,8 +127,12 @@ Signal chain:
         -> RMS-11X mixer -> 19.5 MHz IF -> 3 dB pad -> low-pass
         -> Si4732 (SSB) -> audio -> GPIO 27 (ADC1)
 
-   SI5351 CLK2 144 MHz -> high-pass -> SPF5189Z -> mixer LO
-                                       (5th harmonic, 720 MHz)
+   SI5351 CLK2, 144 MHz -> high-pass -> SPF5189Z -> mixer LO
+                                         (5th harmonic, 720 MHz)
+   SI5351 CLK0,  25 MHz -> divider -> Si4732 RCLK (pin 13)
+
+Both from the PICO's SI5351, so the receiver needs no second board: the Pro
+Micro GPSDO is not part of the receive chain at all.
 
 RMS-11X pins: 1 = LO, 4 = IF, 5 = RF, 2/3/6 = ground. Verify with an ohmmeter
 before soldering: pins 2, 3 and 6 read 0 ohm to each other, pins 1 and 5 read a
@@ -202,36 +206,57 @@ If "rx diag" reports the chip answering but GET_REV failing, the bus mode
 latched wrong — that is the first thing to check.
 
 --------------------------------------------------------------------------------
-REFERENCE CLOCK — 25 MHz from the second GPSDO
+REFERENCE CLOCK — 25 MHz from SI5351 CLK0
 --------------------------------------------------------------------------------
 
-    GPSDO 2  ──[ 1 kOhm ]──┬──[ 100 pF ]──> Si4732  13  RCLK
-    (25 MHz)               │
-                       [ 220 Ohm ]              pin 2 (GPO3) stays OPEN
-                           │
-                          GND
+    SI5351 CLK0 ──[ 1 kOhm ]──┬──[ 100 pF ]──> Si4732  13  RCLK
+    (25 MHz, 2 mA)            │
+                          [ 220 Ohm ]           pin 2 (GPO3) stays OPEN
+                              │
+                             GND
 
-  CAREFUL, TWO DIFFERENT SI5351s: this 25 MHz comes from the SECOND GPSDO, the
-  one on the Pro Micro. Not from the Pico's SI5351, whose CLK2 carries the
-  144 MHz mixer LO. Both happen to use CLK2 on their respective chips.
+Same SI5351 as everything else, PLL B through a fractional MultiSynth:
+864 / (34 + 14/25) = 25.000000 MHz exactly, divided by 800 inside the Si4732 to
+31250 Hz. Enable it with "rclk 1"; "rx on" does that for you.
 
-There is no XTAL1/XTAL2 pair on the 16-pin package: RCLK is its own pin, and in
-crystal mode the 32.768 kHz crystal would sit between pin 13 and pin 2. We use
-neither — the firmware powers up with XOSCEN = 0 and sets
-REFCLK_PRESCALE = 800, REFCLK_FREQ = 31250 (25 MHz / 800, exact).
+Fractional is fine here. The Si4732 divides the 25 MHz down by 800 and
+multiplies back up internally, so the two roughly cancel, and the chip is built
+to run off a 32.768 kHz watch crystal at +-20 ppm — its tolerance for reference
+jitter is orders of magnitude above the SX1280's. The fraction is exact, so the
+frequency is exact.
 
-The divider is there because the SI5351 delivers about 2.4 V peak-to-peak at
-8 mA drive while the RCLK input wants roughly 0.3 to 1.5 V. 1 kOhm / 220 Ohm
-gives about 0.44 V. Set that output to 2 mA drive as well for margin.
+This used to come from the second GPSDO on the Pro Micro, which was built to
+feed the LNB a 25 MHz reference. The Bullseye cannot accept one, so that board
+has no job in the receiver any more and is free for the LNB-disciplining idea
+instead.
 
-  NOT VERIFIED: the RCLK input level limits and the 31130..34406 Hz window come
-  from AN332 as carried by the PU2CLR library headers. The window is confirmed;
-  the input level range is not. Check the data sheet before committing to this
-  divider.
+THE THREE OUTPUTS, all on the Pico's SI5351:
 
-Why bother: the 32.768 kHz watch crystal is +-20 ppm, which at a 19.5 MHz IF is
-about +-390 Hz. That would have made the automatic coupling to the transmit
-frequency useless and wasted the whole GPSDO effort.
+    CLK0   25 MHz, 2 mA, PLL B fractional   Si4732 RCLK      "rclk 0|1"
+    CLK1   52 MHz, 4 mA, PLL A fractional   SX1280 XTA       never switched
+    CLK2  144 MHz, 8 mA, PLL B integer      mixer LO         "lo 0|1"
+
+CLK1 is the SX1280's only clock. si_write_oeb() clears its enable bit
+unconditionally, so no combination of "lo" and "rclk" can take it away, and
+PLL A must never be reset at runtime. Both receive-side outputs come up OFF:
+gpsdo_init() runs before the boot gate that waits for a locked 52 MHz, and
+nothing on the receive side may keep the transmitter from starting.
+
+SET THE DIVIDER BY MEASUREMENT, NOT BY CALCULATION. The drive setting controls
+how much current the output can source, not its voltage swing: into a 1.2 kOhm
+divider the output swings close to the supply whatever the drive is set to.
+Measure at pin 13, aim for about 0.5 V peak to peak, and change the shunt
+resistor if it is off. A 50 ohm instrument loads the divider and changes what it
+reads, so a scope probe is the honest measurement here.
+
+  NOT VERIFIED: the RCLK input level limits come from AN332 as carried by the
+  PU2CLR library headers. The 31130..34406 Hz window for REFCLK_FREQ is
+  confirmed; the 0.3 to 1.5 V input range is not. Check the data sheet.
+
+Why bother at all: the 32.768 kHz watch crystal is +-20 ppm, about +-390 Hz at a
+19.5 MHz IF. That is small next to the Bullseye's +-10 kHz, so today it buys
+little — but once the LNB error is measured and corrected, it becomes the
+dominant term.
 
 --------------------------------------------------------------------------------
 IF INPUT — AMI, not FMI
@@ -310,9 +335,15 @@ There is no separate VIO pin on the 16-pin package; VDD supplies both.
 CONSOLE COMMANDS
 --------------------------------------------------------------------------------
 
+    i2c                  scan both buses; shows what actually answers
+    rclk [0|1]           25 MHz on CLK0 -> Si4732 pin 13. OFF at boot.
+    lo [0|1]             144 MHz on CLK2 -> mixer LO. OFF at boot.
     rx                   receiver status (!R line)
     rx diag              detailed report, including which address answered
-    rx on | off          power up / down (power-up uploads the SSB patch)
+    rx on | off          power up / down. Enables rclk first, then uploads
+                         the SSB patch — the chip cannot tune without its
+                         reference clock.
+    rx cal <Hz>          LNB oscillator error, saved to flash
     rx usb | lsb | am    demodulation mode
     rx freq <kHz>        2300..26100
     rx vol <0..63>

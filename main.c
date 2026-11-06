@@ -1431,6 +1431,8 @@ static void cmd_help(void) {
         "\r\n"
         "Receive (Si4732, QO-100 downlink via LNB + mixer):\r\n"
         "  i2c                  - scan both buses; shows what actually answers\r\n"
+        "  rclk [0|1]           - 25 MHz on SI5351 CLK0 -> Si4732 pin 13. OFF at boot,\r\n"
+        "                         'rx on' enables it. The receiver needs it to tune.\r\n"
         "  lo [0|1]             - 144 MHz on SI5351 CLK2, OFF at boot; mixer LO is its 5th\r\n"
         "                         harmonic at 720 MHz. On by default.\r\n"
         "  rx                   - receiver status\r\n"
@@ -1844,6 +1846,19 @@ static void cdc_handle_line(char *line) {
                    gpsdo_lo_enabled() ? 1 : 0);
         return;
     }
+    // Si4732 reference clock on SI5351 CLK0: rclk [0|1]
+    if (streqi(argv[0], "rclk")) {
+        if (argc >= 2) {
+            bool on = (strtol(argv[1], NULL, 10) != 0);
+            if (!gpsdo_set_rclk_enabled(on)) {
+                cdc_write_str("ERR: SI5351 not reachable\r\n");
+                return;
+            }
+        }
+        cdc_printf("OK rclk=%d (CLK0, 25 MHz -> Si4732 pin 13; divided by 800 "
+                   "to 31250 Hz)\r\n", gpsdo_rclk_enabled() ? 1 : 0);
+        return;
+    }
     // Receiver: rx [diag|on|off|usb|lsb|am|freq|vol|bw|bfo|mute]
     if (streqi(argv[0], "rx")) {
         if (!si4732_present()) {
@@ -1858,6 +1873,12 @@ static void cdc_handle_line(char *line) {
         if (streqi(argv[1], "on") || streqi(argv[1], "off")) {
             bool on = streqi(argv[1], "on");
             if (on) {
+                // The chip cannot tune without its reference clock, and that
+                // comes up disabled so the receive side can never block the
+                // transmitter from booting. Turn it on before powering up.
+                if (!gpsdo_rclk_enabled() && !gpsdo_set_rclk_enabled(true))
+                    cdc_write_str("WARN: could not enable the 25 MHz reference "
+                                  "(SI5351 unreachable) — receiver will not tune\r\n");
                 if (!si4732_set_mode(si4732_get_mode())) {
                     cdc_write_str("ERR: receiver power-up failed — 'rx diag' for why\r\n");
                     return;

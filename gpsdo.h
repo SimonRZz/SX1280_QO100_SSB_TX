@@ -81,3 +81,17 @@ void gpsdo_get_info(gpsdo_info_t *out);
 // the radio is up. CLK1 (52 MHz, the SX1280's only clock) is never affected.
 bool gpsdo_set_lo_enabled(bool on);
 bool gpsdo_lo_enabled(void);
+
+// ---------------------------------------------------------------------------
+// Si4732 reference clock — SI5351 CLK0, 25 MHz
+// ---------------------------------------------------------------------------
+// The Si4732 has no crystal: it runs off this clock on its RCLK pin, divided by
+// 800 to 31250 Hz. Exact (864 MHz / 25), from PLL B, through a fractional
+// MultiSynth, which the Si4732 does not mind — it is built for a 32.768 kHz
+// watch crystal.
+//
+// OFF after gpsdo_init(), for the same reason as the mixer LO: nothing on the
+// receive side may keep the transmitter from booting. The receiver cannot tune
+// without it, so bring-up enables it before powering the Si4732 up.
+bool gpsdo_set_rclk_enabled(bool on);
+bool gpsdo_rclk_enabled(void);
