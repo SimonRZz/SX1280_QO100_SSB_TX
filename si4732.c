@@ -39,6 +39,8 @@
 #define CMD_SET_PROPERTY    0x12u
 #define CMD_TUNE_FREQ       0x40u   // AM_TUNE_FREQ and SSB_TUNE_FREQ are the same
 #define CMD_RSQ_STATUS      0x43u
+#define CMD_GET_INT_STATUS  0x14u
+#define CMD_TUNE_STATUS     0x42u   // AM_TUNE_STATUS == SSB_TUNE_STATUS
 
 #define PROP_SSB_BFO             0x0100u
 #define PROP_SSB_MODE            0x0101u
@@ -104,6 +106,8 @@ static bool          s_rsq_valid = false; // RESP2: chip considers this a channe
 static bool          s_rsq_afcrl = false; // RESP2: AFC railed
 static bool          s_rsq_smute = false; // RESP2: soft mute engaged
 static int8_t        s_rsq_off   = 0;     // RESP7: frequency offset, kHz
+static uint16_t      s_read_khz  = 0u;    // frequency the tuner reports back
+static bool          s_stc_ok    = false; // last tune reported seek/tune complete
 static bool          s_rev_valid = false;
 static const char   *s_last_err  = "none";
 
@@ -351,6 +355,45 @@ static bool si_power_up(bool with_patch)
     return si_wait_cts(500u);
 }
 
+// Waits for the seek/tune-complete flag. The tune command is acknowledged long
+// before the tuner has settled, and until then every quality figure reads as
+// zero — which is indistinguishable from "no signal" and sent us looking at the
+// antenna for something that was a missing wait.
+static bool si_wait_stc(uint32_t timeout_ms)
+{
+    absolute_time_t deadline = make_timeout_time_ms(timeout_ms);
+    const uint8_t cmd[1] = { CMD_GET_INT_STATUS };
+    for (;;) {
+        if (si_cmd(cmd, 1)) {
+            uint8_t st = 0u;
+            if (i2c_read_blocking(SI_I2C, s_addr, &st, 1, false) == 1
+                && st != 0xFFu && (st & 0x01u))
+                return true;
+        }
+        if (absolute_time_diff_us(get_absolute_time(), deadline) <= 0) return false;
+        sleep_ms(2);
+    }
+}
+
+// Reads back what the tuner actually did, which is the one figure that tells a
+// tune that silently went nowhere from one that worked. INTACK clears the STC
+// flag so the next tune can be detected.
+static bool si_read_tune_status(void)
+{
+    const uint8_t cmd[2] = { CMD_TUNE_STATUS, 0x01u };
+    if (!si_cmd(cmd, sizeof cmd)) return false;
+
+    uint8_t r[8] = { 0 };
+    if (i2c_read_blocking(SI_I2C, s_addr, r, sizeof r, false) != (int)sizeof r) {
+        s_last_err = "TUNE_STATUS read failed";
+        return false;
+    }
+    s_rsq_valid = (r[1] & 0x01u) != 0u;
+    s_rsq_afcrl = (r[1] & 0x02u) != 0u;
+    s_read_khz  = (uint16_t)((r[2] << 8) | r[3]);
+    return true;
+}
+
 static bool si_tune(void)
 {
     uint8_t arg1 = 0u;
@@ -364,7 +407,17 @@ static bool si_tune(void)
         0x00u, 0x00u              // ANTCAP = 0: automatic, irrelevant on a
     };                            // 50 ohm driven input
     if (!si_cmd(b, sizeof b)) return false;
-    sleep_ms(30);                 // let the tune settle before RSQ is read
+
+    s_stc_ok = si_wait_stc(250u);
+    if (!s_stc_ok) {
+        s_last_err = "tune did not complete (no STC within 250 ms)";
+        si_log("[SI4732] WARNING: %s", s_last_err);
+    }
+    (void)si_read_tune_status();
+
+    if (s_stc_ok && s_read_khz != (uint16_t)s_khz)
+        si_log("[SI4732] WARNING: asked for %u kHz, tuner reports %u kHz",
+               (unsigned)s_khz, (unsigned)s_read_khz);
     return true;
 }
 
@@ -659,11 +712,14 @@ void si4732_diag_print(void)
            (unsigned)SI_RCLK_HZ, (unsigned)SI_RCLK_PRESCALE, (unsigned)SI_REFCLK_FREQ);
 
     uint8_t rssi = 0u, snr = 0u;
-    if (si4732_read_rsq(&rssi, &snr))
+    if (si4732_read_rsq(&rssi, &snr)) {
         si_log("[SI4732]   rssi=%u dBuV snr=%u dB  valid=%d afc_railed=%d "
                "softmute=%d offset=%d kHz", rssi, snr, (int)s_rsq_valid,
                (int)s_rsq_afcrl, (int)s_rsq_smute, (int)s_rsq_off);
-    else
+    } else {
         si_log("[SI4732]   rsq unavailable (%s)", s_last_err);
+    }
+    si_log("[SI4732]   tuner reports %u kHz, tune complete=%d  (asked for %lu kHz)",
+           (unsigned)s_read_khz, (int)s_stc_ok, (unsigned long)s_khz);
     si_log("[SI4732]   last error: %s", s_last_err);
 }
