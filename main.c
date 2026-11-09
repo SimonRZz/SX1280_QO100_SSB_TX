@@ -1821,6 +1821,13 @@ static void rx_status_print(void) {
                si4732_get_mute() ? 1 : 0,
                have_rsq ? (int)rssi : -1,
                have_rsq ? (int)snr  : -1);
+    // Every setting command ends here, and each one answered "OK" while the
+    // chip was powered down, so values were being stored into a receiver that
+    // was not running and nothing was heard. on=0 was in the line all along and
+    // easy to read past; say it in words.
+    if (si4732_present() && !si4732_is_on())
+        cdc_write_str("NOTE: receiver is OFF — value stored only. "
+                      "Start it with 'rx am' or 'rx usb'.\r\n");
 }
 
 static void cdc_handle_line(char *line) {
