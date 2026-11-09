@@ -1987,12 +1987,21 @@ static void cdc_handle_line(char *line) {
             // Before anything the chip says about itself: whether it has a
             // clock. Without one every figure below it is a zero that means
             // nothing.
-            cdc_printf("[RCLK]  SI5351 CLK2 %s, %u MHz, %u mA%s\r\n",
+            cdc_printf("[CLK]   CLK2 reference %s, %u MHz, %u mA%s\r\n",
                        gpsdo_rclk_enabled() ? "ON" : "OFF",
                        gpsdo_rclk_mhz(), gpsdo_rclk_drive(),
                        gpsdo_rclk_enabled()
                            ? ""
                            : "   <-- the receiver cannot tune; run 'rclk 1'");
+            // Both receive-side clocks are off after every reset, and either
+            // one missing produces the same picture: levels of zero. The
+            // reference stops the tuner; the mixer LO stops the conversion,
+            // so the band goes quiet while the chip reports itself healthy.
+            cdc_printf("[CLK]   CLK0 mixer LO  %s, 144 MHz (x5 = 720 MHz)%s\r\n",
+                       gpsdo_lo_enabled() ? "ON " : "OFF",
+                       gpsdo_lo_enabled()
+                           ? ""
+                           : "   <-- nothing is being converted; run 'lo 1'");
             si4732_diag_print();
             return;
         }
