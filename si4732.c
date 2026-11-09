@@ -137,7 +137,13 @@ static bool          s_xoscen    = false;
 // loopstick wants. A short wire or a 50 ohm feed from a mixer has no
 // inductance to resonate against, so a fixed small value may suit better:
 // the capacitance is 95 fF x ANTCAP + 7 pF, range 1..6143.
-static uint16_t      s_antcap    = 0u;
+// 1, not 0, and this is not a detail. 0 tells the part to tune its own
+// antenna capacitor, which the ROM firmware does and the SSB patch does not:
+// with 0 the sideband tune is accepted, CTS comes back for a moment, and then
+// the chip never finishes another command. The reference library hardcodes
+// ANTCAPH=0 / ANTCAPL=1 in setPowerUp() for every AM and SSB tune and never
+// explains why. This is why.
+static uint16_t      s_antcap    = 1u;
 static bool          s_rev_valid = false;
 static const char   *s_last_err  = "none";
 
@@ -987,7 +993,8 @@ void si4732_ssb_bringup_test(void)
     {
         const uint16_t khz = (uint16_t)s_khz;
         const uint8_t tf[6] = { CMD_TUNE_FREQ, (uint8_t)(TUNE_SB_USB | TUNE_FAST),
-                                (uint8_t)(khz >> 8), (uint8_t)khz, 0u, 0u };
+                                (uint8_t)(khz >> 8), (uint8_t)khz,
+                                (uint8_t)(s_antcap >> 8), (uint8_t)s_antcap };
         const int w = i2c_write_blocking(SI_I2C, s_addr, tf, sizeof tf, false);
         si_log("[SSBTEST] SSB_TUNE_FREQ (FAST) written: %d of %u bytes",
                w, (unsigned)sizeof tf);

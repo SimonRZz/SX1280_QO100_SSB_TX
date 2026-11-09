@@ -85,11 +85,16 @@ int32_t  si4732_get_cal_hz(void);
 void     si4732_set_xoscen(bool on);
 bool     si4732_get_xoscen(void);
 
-// Antenna tuning capacitor, sent with every tune. 0 lets the chip tune its own
-// varactor, which Silicon Labs recommends and which suits a medium-wave
-// loopstick. A short wire, or a 50 ohm feed from a mixer, has no inductance to
-// resonate against; a fixed small value may work better there. The capacitance
-// is 95 fF x ANTCAP + 7 pF, so 1 is about 7.1 pF. Range 0..6143.
+// Antenna tuning capacitor, sent with every tune. Defaults to 1, as the
+// reference library does for every AM and SSB tune.
+//
+// 0 means "tune the varactor yourself". The ROM firmware can; the SSB patch
+// cannot, and asking it to leaves the chip unable to finish another command
+// until the next power-up - which is what "SSB does not tune" was, for weeks.
+// Leave it alone unless you are measuring: in AM it makes no difference worth
+// having on a 50 ohm feed from a mixer, which has no inductance to resonate
+// against anyway. The capacitance is 95 fF x ANTCAP + 7 pF, so 1 is about
+// 7.1 pF. Range 0..6143.
 bool     si4732_set_antcap(uint16_t cap);
 uint16_t si4732_get_antcap(void);
 
