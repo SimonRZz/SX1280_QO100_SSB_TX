@@ -106,3 +106,13 @@ bool gpsdo_rclk_enabled(void);
 // symptom of too weak a reference.
 bool    gpsdo_set_rclk_drive(uint8_t ma);
 uint8_t gpsdo_rclk_drive(void);
+
+// 25 or 36 MHz. 25 is the original and works, but it leaks into the Si4732's
+// AM input at 65 dBuV — only five megahertz from a 19.5 MHz IF, close enough
+// to pull the front-end AGC down across the whole band. 36 MHz comes off the
+// same PLL B through an even integer divisor and sits sixteen megahertz away.
+// Changes only MultiSynth 2; CLK1 (the SX1280's 52 MHz) is on PLL A and is
+// never touched. The matching si4732_set_rclk_hz() must follow, or the
+// receiver tunes to the wrong frequency.
+bool    gpsdo_set_rclk_mhz(uint8_t mhz);
+uint8_t gpsdo_rclk_mhz(void);

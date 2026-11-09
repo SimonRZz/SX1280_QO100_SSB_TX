@@ -120,6 +120,28 @@ bool     si4732_get_mute(void);
 // Received signal quality. rssi is in dBµV, snr in dB. Either may be NULL.
 bool     si4732_read_rsq(uint8_t *rssi_dbuv, uint8_t *snr_db);
 
+// Front-end AGC. The index is an ATTENUATION: 0 is maximum gain, and the AM
+// AGC responds to the whole input rather than the tuned channel, so a single
+// strong carrier anywhere in band turns the front end down for everything.
+// Reading it separates "nothing is arriving" from "the receiver has been made
+// deaf", which look identical in the RSSI alone.
+bool si4732_read_agc(bool *disabled, uint8_t *index);
+
+// Override it. disable=true freezes the attenuation at `index`; disable=false
+// hands control back to the chip and ignores the index.
+bool si4732_set_agc(bool disable, uint8_t index);
+
+// Reference clock on RCLK, in Hz. The prescaler is chosen for an exact
+// division into the 31130..34406 Hz window the chip accepts — inexact would
+// not be a rounding detail, it would scale every tuned frequency. Rejected,
+// leaving the old value in place, when no such divisor exists.
+//
+// Changing this does NOT change what the SI5351 puts on the pin. The caller
+// moves both ends; gpsdo_set_rclk_mhz() is the other one.
+bool     si4732_set_rclk_hz(uint32_t hz);
+uint32_t si4732_rclk_hz(void);
+uint16_t si4732_rclk_prescale(void);
+
 const char *si4732_mode_name(si4732_mode_t mode);
 
 // Where the driver's messages go. Both stdio backends are disabled in this

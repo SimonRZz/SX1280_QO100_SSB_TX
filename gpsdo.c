@@ -54,8 +54,8 @@
 //                                     MS1:   884 ÷ 17 = 52 MHz
 //   CLK0 144 MHz  → receive mixer LO  PLL B: 24 MHz × 36 = 864 MHz
 //                 (off at boot, "lo 1")    MS0: 864 ÷ 6 = 144 MHz
-//   CLK2  25 MHz  → Si4732 RCLK           PLL B, fractional
-//                 (off at boot, "rclk 1")  MS2: 864 ÷ (34+14/25) = 25 MHz
+//   CLK2  25 or 36 MHz → Si4732 RCLK      PLL B; "rclk freq" switches between
+//                 (off at boot, "rclk 1")  MS2: 864 ÷ (34+14/25) or 864 ÷ 24
 //
 // Which receive-side signal sits on which output follows the board, not the
 // other way round; electrically either would do, both are next to CLK1 on the
@@ -95,6 +95,7 @@ static uint8_t s_si_addr = 0x00u;
 static bool s_loOn   = false;  // CLK0, 144 MHz, mixer LO
 static bool s_rclkOn = false;  // CLK2, 25 MHz, Si4732 reference clock
 static uint8_t s_rclkDrive = 3u;  // IDRV field of CLK2_CTRL: 0=2mA .. 3=8mA
+static uint8_t s_rclkMhz   = 25u; // 25 or 36 — see si5351_write_ms2()
 static bool s_pllbReady = false;  // PLL B + MS0/MS2 configured yet?
 
 #define SI_REG_STATUS      0u    // Device status (read-only)
@@ -244,6 +245,36 @@ static bool si5351_init_clocks(void)
 // So the boot path is back to exactly what it was for months: PLL A, MS1,
 // CLK1, nothing else. The receive side is built only when someone asks for it,
 // which cannot happen before the boot gate has seen a locked 52 MHz.
+// MultiSynth 2 and its control byte, for whichever reference the Si4732 is
+// being fed. Both come off PLL B at 864 MHz.
+//
+//   25 MHz: 864 ÷ (34 + 14/25), p1=3911 (0x0F47), p2=17, p3=25 — fractional
+//   36 MHz: 864 ÷ 24,           p1=2560 (0x0A00), p2=0,  p3=1  — even integer
+//
+// 25 MHz was the original choice and it works, but on this board it leaks into
+// the Si4732's AM input at 65 dBuV. With a 19.5 MHz IF that is five megahertz
+// away, inside the front end's reach, and it drags the AGC down across the
+// whole band. 36 MHz moves it to sixteen megahertz away and, being an even
+// integer divisor, lets the MultiSynth run in integer mode, which is quieter
+// again. The Si4732 does not care which it gets: it divides down to about
+// 32 kHz either way (800 and 1125 both divide exactly).
+static bool si5351_write_ms2(void)
+{
+    static const uint8_t ms2_25[8] = {
+        0x00u, 0x19u, 0x00u, 0x0Fu, 0x47u, 0x00u, 0x00u, 0x11u
+    };
+    static const uint8_t ms2_36[8] = {
+        0x00u, 0x01u, 0x00u, 0x0Au, 0x00u, 0x00u, 0x00u, 0x00u
+    };
+    const bool integer = (s_rclkMhz == 36u);
+    if (!si_write_regs(SI_REG_MS2_BASE, integer ? ms2_36 : ms2_25, 8u)) return false;
+
+    // CLK2: PDN=0, MS2_INT per the divisor, MS_SRC=PLL B, CLK_SRC=MS2, IDRV.
+    // 8 mA, because 2 mA left the Si4732 answering on I2C but refusing to tune.
+    return si_write_reg(SI_REG_CLK2_CTRL,
+                        (uint8_t)((integer ? 0x6Cu : 0x2Cu) | (s_rclkDrive & 3u)));
+}
+
 static bool si5351_init_pllb(void)
 {
     if (s_pllbReady) return true;
@@ -260,18 +291,11 @@ static bool si5351_init_pllb(void)
     };
     if (!si_write_regs(SI_REG_MS0_BASE, ms0, 8u)) return false;
 
-    // MS2 (CLK2): p1=3911 (0x0F47), p2=17, p3=25  →  864 ÷ (34+14/25) = 25 MHz
-    static const uint8_t ms2[8] = {
-        0x00u, 0x19u, 0x00u, 0x0Fu, 0x47u, 0x00u, 0x00u, 0x11u
-    };
-    if (!si_write_regs(SI_REG_MS2_BASE, ms2, 8u)) return false;
+    if (!si5351_write_ms2()) return false;
 
     // CLK0: PDN=0, INT=1, PLL B, CLK_SRC=MS0, 8 mA — the mixer LO lives on the
     // 5th harmonic, which only exists because the edges are steep.
     si_write_reg(SI_REG_CLK0_CTRL, 0x6Fu);
-    // CLK2: PDN=0, INT=0 (fractional), PLL B, CLK_SRC=MS2, 8 mA. 2 mA left the
-    // Si4732 answering on I2C but refusing to tune.
-    si_write_reg(SI_REG_CLK2_CTRL, (uint8_t)(0x2Cu | (s_rclkDrive & 3u)));
 
     // PLL B ONLY. 0xA0 would reset PLL A as well and take the SX1280's clock
     // away for milliseconds, in the middle of transmission.
@@ -323,11 +347,35 @@ bool gpsdo_set_rclk_drive(uint8_t ma)
         case 8u: idrv = 3u; break;
         default: return false;
     }
-    // CLK2_CTRL base: PDN=0, INT=0 (fractional), MS_SRC=PLLB, CLK_SRC=MS2.
-    if (!si_write_reg(SI_REG_CLK2_CTRL, (uint8_t)(0x2Cu | idrv))) return false;
+    uint8_t prev = s_rclkDrive;
     s_rclkDrive = idrv;
+    // Through the same writer, so the integer-mode bit cannot drift out of
+    // step with the divisor currently loaded.
+    if (!si5351_write_ms2()) { s_rclkDrive = prev; return false; }
     return true;
 }
+
+// Move the Si4732's reference between 25 and 36 MHz. Only MultiSynth 2
+// changes; PLL B and CLK0's 144 MHz stay as they are. The PLL B reset
+// afterwards is belt and braces for the switch between fractional and integer
+// mode — it disturbs the mixer LO for microseconds and nothing else. CLK1,
+// the SX1280's 52 MHz, is on PLL A and is not touched.
+//
+// This moves one end of the link only. si4732_set_rclk_hz() moves the other,
+// and the receiver tunes wrong until both agree.
+bool gpsdo_set_rclk_mhz(uint8_t mhz)
+{
+    if (mhz != 25u && mhz != 36u) return false;
+    if (s_si_addr == 0x00u) return false;
+    if (!si5351_init_pllb()) return false;
+
+    uint8_t prev = s_rclkMhz;
+    s_rclkMhz = mhz;
+    if (!si5351_write_ms2()) { s_rclkMhz = prev; return false; }
+    return si_write_reg(SI_REG_PLL_RESET, 0x80u);
+}
+
+uint8_t gpsdo_rclk_mhz(void) { return s_rclkMhz; }
 
 uint8_t gpsdo_rclk_drive(void)
 {

@@ -41,6 +41,8 @@
 #define CMD_RSQ_STATUS      0x43u
 #define CMD_GET_INT_STATUS  0x14u
 #define CMD_TUNE_STATUS     0x42u   // AM_TUNE_STATUS == SSB_TUNE_STATUS
+#define CMD_AGC_STATUS      0x47u   // AM_AGC_STATUS
+#define CMD_AGC_OVERRIDE    0x48u   // AM_AGC_OVERRIDE
 
 #define PROP_SSB_BFO             0x0100u
 #define PROP_SSB_MODE            0x0101u
@@ -68,18 +70,32 @@
 // the chip accepts. 25e6 / 800 = 31250 Hz exactly — no rounding error to carry
 // into the tuning.
 // ---------------------------------------------------------------------------
-#define SI_RCLK_HZ          25000000u
-#define SI_RCLK_PRESCALE    800u
-#define SI_REFCLK_FREQ      (SI_RCLK_HZ / SI_RCLK_PRESCALE)
-
 // AN332 gives the usable REFCLK_FREQ window as 31130..34406 Hz and caps the
-// prescaler at 4095. Catch a bad edit here rather than on the bench.
-_Static_assert(SI_RCLK_HZ % SI_RCLK_PRESCALE == 0,
-               "RCLK must divide exactly, otherwise the tuning carries an offset");
-_Static_assert(SI_REFCLK_FREQ >= 31130u && SI_REFCLK_FREQ <= 34406u,
-               "REFCLK_FREQ outside the window the Si473x accepts");
-_Static_assert(SI_RCLK_PRESCALE >= 1u && SI_RCLK_PRESCALE <= 4095u,
-               "REFCLK_PRESCALE is a 12-bit field");
+// prescaler at 4095 (it is a 12-bit field).
+#define SI_REFCLK_MIN       31130u
+#define SI_REFCLK_MAX       34406u
+
+// The reference is switchable at runtime because 25 MHz turned out to be a
+// poor choice on this board: it leaks into the AM input at 65 dBuV, five
+// megahertz from a 19.5 MHz IF, and holds the front-end AGC down. 36 MHz is
+// the same PLL B through an even integer divider and puts the leakage 16 MHz
+// away instead. See gpsdo_set_rclk_mhz(), which moves the other end.
+static uint32_t s_rclk_hz    = 25000000u;
+static uint16_t s_rclk_presc = 800u;        // 25e6 / 800 = 31250 Hz exactly
+
+// Smallest exact divisor that lands REFCLK inside the window. Exactness
+// matters: a remainder here is not a rounding detail, it becomes a fixed
+// multiplicative offset on every frequency the chip tunes.
+static uint16_t si_presc_for(uint32_t rclk_hz)
+{
+    uint32_t d = (rclk_hz + SI_REFCLK_MAX - 1u) / SI_REFCLK_MAX;
+    if (d < 1u) d = 1u;
+    for (; d <= 4095u; d++) {
+        if (rclk_hz / d < SI_REFCLK_MIN) break;
+        if (rclk_hz % d == 0u) return (uint16_t)d;
+    }
+    return 0u;
+}
 
 #define SI_KHZ_MIN          2300u    // SW band, per the Si4732-A10 data sheet
 #define SI_KHZ_MAX          26100u
@@ -549,8 +565,8 @@ bool si4732_set_mode(si4732_mode_t mode)
 
     // Reference clock first: everything downstream derives its frequency from
     // it, so setting it after tuning would leave the first tune offset.
-    bool ok = si_set_prop(PROP_REFCLK_PRESCALE, SI_RCLK_PRESCALE);
-    ok = si_set_prop(PROP_REFCLK_FREQ, SI_REFCLK_FREQ) && ok;
+    bool ok = si_set_prop(PROP_REFCLK_PRESCALE, s_rclk_presc);
+    ok = si_set_prop(PROP_REFCLK_FREQ, (uint16_t)(s_rclk_hz / s_rclk_presc)) && ok;
 
     // Soft mute fights weak SSB signals by ducking exactly when you want to
     // hear them. Off.
@@ -760,6 +776,67 @@ bool si4732_read_rsq(uint8_t *rssi_dbuv, uint8_t *snr_db)
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// Front-end AGC
+//
+// The index is an attenuation, not a gain: 0 means the input stage is wide
+// open. The AM AGC watches the whole input, not the channel you tuned, so one
+// strong carrier anywhere in band turns the front end down for everything —
+// which is exactly the failure mode to rule out before blaming the antenna.
+// Reading it costs one command and settles the question.
+// ---------------------------------------------------------------------------
+bool si4732_read_agc(bool *disabled, uint8_t *index)
+{
+    if (!s_present || !s_on) { s_last_err = "receiver is not powered up"; return false; }
+
+    const uint8_t b[1] = { CMD_AGC_STATUS };
+    if (!si_cmd(b, sizeof b)) return false;
+
+    uint8_t r[3] = { 0 };
+    if (i2c_read_blocking(SI_I2C, s_addr, r, sizeof r, false) != (int)sizeof r) {
+        s_last_err = "AGC status read failed";
+        return false;
+    }
+    if (disabled) *disabled = (r[1] & 0x01u) != 0u;
+    if (index)    *index    = r[2];
+    return true;
+}
+
+bool si4732_set_agc(bool disable, uint8_t index)
+{
+    if (!s_present || !s_on) { s_last_err = "receiver is not powered up"; return false; }
+    const uint8_t b[3] = { CMD_AGC_OVERRIDE, (uint8_t)(disable ? 0x01u : 0x00u), index };
+    return si_cmd(b, sizeof b);
+}
+
+// ---------------------------------------------------------------------------
+// Reference clock
+// ---------------------------------------------------------------------------
+uint32_t si4732_rclk_hz(void)       { return s_rclk_hz; }
+uint16_t si4732_rclk_prescale(void) { return s_rclk_presc; }
+
+bool si4732_set_rclk_hz(uint32_t hz)
+{
+    uint16_t presc = si_presc_for(hz);
+    if (presc == 0u) {
+        s_last_err = "no exact prescaler puts that clock in the 31130..34406 Hz window";
+        return false;
+    }
+    s_rclk_hz    = hz;
+    s_rclk_presc = presc;
+
+    if (!s_present || !s_on) return true;   // adopted; applied at the next power-up
+
+    // Order matters: the prescaler divides the pin, REFCLK_FREQ tells the chip
+    // what came out. Setting the frequency first would briefly describe a
+    // reference that is not there. Then retune, because every frequency the
+    // tuner holds was derived from the old reference.
+    bool ok = si_set_prop(PROP_REFCLK_PRESCALE, s_rclk_presc);
+    ok = si_set_prop(PROP_REFCLK_FREQ, (uint16_t)(s_rclk_hz / s_rclk_presc)) && ok;
+    if (!ok) return false;
+    return si4732_tune_hz(si4732_get_hz());
+}
+
 void si4732_diag_print(void)
 {
     si_log("[SI4732] present=%d addr=0x%02X on=%d patch=%d",
@@ -786,9 +863,9 @@ void si4732_diag_print(void)
     // of zero reads as a broken chip. It has misled us twice.
     if (!s_on) {
         si_log("[SI4732]   not powered up yet — run 'rx on' (or 'rx am' / 'rx usb')");
-        si_log("[SI4732]   xoscen=%d antcap=%u  rclk=%u Hz / %u = refclk %u Hz",
-               (int)s_xoscen, s_antcap, (unsigned)SI_RCLK_HZ,
-               (unsigned)SI_RCLK_PRESCALE, (unsigned)SI_REFCLK_FREQ);
+        si_log("[SI4732]   xoscen=%d antcap=%u  rclk=%lu Hz / %u = refclk %lu Hz",
+               (int)s_xoscen, s_antcap, (unsigned long)s_rclk_hz,
+               s_rclk_presc, (unsigned long)(s_rclk_hz / s_rclk_presc));
         si_log("[SI4732]   stored settings: mode=%s freq=%lu kHz bw=%u Hz vol=%u",
                si4732_mode_name(s_mode), (unsigned long)s_khz, s_bw_hz, s_volume);
         return;
@@ -811,8 +888,19 @@ void si4732_diag_print(void)
     si_log("[SI4732]   xoscen=%d (0 = external clock on RCLK)  antcap=%u%s",
            (int)s_xoscen, s_antcap,
            s_antcap ? "" : " (chip tunes its own varactor)");
-    si_log("[SI4732]   rclk=%u Hz / %u = refclk %u Hz",
-           (unsigned)SI_RCLK_HZ, (unsigned)SI_RCLK_PRESCALE, (unsigned)SI_REFCLK_FREQ);
+    si_log("[SI4732]   rclk=%lu Hz / %u = refclk %lu Hz",
+           (unsigned long)s_rclk_hz, s_rclk_presc,
+           (unsigned long)(s_rclk_hz / s_rclk_presc));
+
+    bool agc_off = false;
+    uint8_t agc_idx = 0u;
+    if (si4732_read_agc(&agc_off, &agc_idx)) {
+        si_log("[SI4732]   agc %s, attenuation index %u%s",
+               agc_off ? "DISABLED (forced)" : "automatic", agc_idx,
+               (!agc_off && agc_idx > 8u)
+                   ? "  <-- front end is being turned down by something strong"
+                   : "");
+    }
 
     uint8_t rssi = 0u, snr = 0u;
     if (si4732_read_rsq(&rssi, &snr)) {

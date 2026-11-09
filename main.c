@@ -1431,16 +1431,21 @@ static void cmd_help(void) {
         "\r\n"
         "Receive (Si4732, QO-100 downlink via LNB + mixer):\r\n"
         "  i2c                  - scan both buses; shows what actually answers\r\n"
-        "  rclk [0|1]           - 25 MHz on SI5351 CLK2 -> Si4732 pin 13. OFF at boot,\r\n"
-        "  rclk drive <2|4|6|8> - drive strength in mA, for finding the level the\r\n"
-        "                         Si4732 needs. 2 mA at boot.\r\n"
+        "  rclk [0|1]           - reference on SI5351 CLK2 -> Si4732 pin 13. OFF at boot,\r\n"
         "                         'rx on' enables it. The receiver needs it to tune.\r\n"
+        "  rclk drive <2|4|6|8> - drive strength in mA. 8 mA at boot; 2 mA left the\r\n"
+        "                         Si4732 talking on I2C but refusing to tune.\r\n"
+        "  rclk freq <25|36>    - reference frequency. 25 MHz leaks into the AM input\r\n"
+        "                         at 65 dBuV, five MHz from a 19.5 MHz IF; 36 moves it\r\n"
+        "                         sixteen MHz away. Moves both ends at once.\r\n"
         "  lo [0|1]             - 144 MHz on SI5351 CLK0, OFF at boot; mixer LO is its 5th\r\n"
         "                         harmonic at 720 MHz. On by default.\r\n"
         "  rx                   - receiver status\r\n"
         "  rx diag              - detailed receiver report\r\n"
         "  rx scan [from] [to] [step]  - sweep in kHz and print a level table,\r\n"
         "                         8 averaged reads each. Default 19400 20100 50.\r\n"
+        "  rx agc [on|off|<n>]  - front-end attenuator. The index is attenuation, so 0\r\n"
+        "                         is full gain. 'off' pins it open for measuring.\r\n"
         "  rx xosc <0|1>        - POWER_UP crystal-oscillator bit; 0 = external RCLK\r\n"
         "  rx antcap <0..6143>  - antenna tuning capacitor; 0 = automatic. Try 1 for a\r\n"
         "                         short wire or a 50 ohm feed.\r\n"
@@ -1894,8 +1899,34 @@ static void cdc_handle_line(char *line) {
                    gpsdo_lo_enabled() ? 1 : 0);
         return;
     }
-    // Si4732 reference clock on SI5351 CLK2: rclk [0|1] | rclk drive <mA>
+    // Si4732 reference clock on SI5351 CLK2:
+    //   rclk [0|1] | rclk drive <mA> | rclk freq <25|36>
     if (streqi(argv[0], "rclk")) {
+        if (argc >= 3 && streqi(argv[1], "freq")) {
+            long mhz = strtol(argv[2], NULL, 10);
+            if (mhz != 25 && mhz != 36) {
+                cdc_write_str("ERR: rclk freq 25|36 (MHz)\r\n");
+                return;
+            }
+            // Both ends or neither: the clock generator and the receiver's
+            // idea of it have to agree, or every tuned frequency is wrong by
+            // the ratio between them. If the second step fails, put the first
+            // one back rather than leave the pair mismatched.
+            if (!gpsdo_set_rclk_mhz((uint8_t)mhz)) {
+                cdc_write_str("ERR: SI5351 not reachable\r\n");
+                return;
+            }
+            if (!si4732_set_rclk_hz((uint32_t)mhz * 1000000u)) {
+                cdc_printf("ERR: receiver rejected it (%s) — clock put back\r\n",
+                           si4732_last_error());
+                gpsdo_set_rclk_mhz((uint8_t)(mhz == 25 ? 36 : 25));
+                return;
+            }
+            cdc_printf("OK rclk freq=%u MHz / %u = refclk %lu Hz\r\n",
+                       gpsdo_rclk_mhz(), si4732_rclk_prescale(),
+                       (unsigned long)(si4732_rclk_hz() / si4732_rclk_prescale()));
+            return;
+        }
         if (argc >= 3 && streqi(argv[1], "drive")) {
             long ma = strtol(argv[2], NULL, 10);
             if (!gpsdo_set_rclk_drive((uint8_t)ma)) {
@@ -1912,9 +1943,11 @@ static void cdc_handle_line(char *line) {
                 return;
             }
         }
-        cdc_printf("OK rclk=%d drive=%u mA (CLK2, 25 MHz -> Si4732 pin 13; "
-                   "divided by 800 to 31250 Hz)\r\n",
-                   gpsdo_rclk_enabled() ? 1 : 0, gpsdo_rclk_drive());
+        cdc_printf("OK rclk=%d freq=%u MHz drive=%u mA (CLK2 -> Si4732 pin 13; "
+                   "divided by %u to %lu Hz)\r\n",
+                   gpsdo_rclk_enabled() ? 1 : 0, gpsdo_rclk_mhz(),
+                   gpsdo_rclk_drive(), si4732_rclk_prescale(),
+                   (unsigned long)(si4732_rclk_hz() / si4732_rclk_prescale()));
         return;
     }
     // Receiver: rx [diag|on|off|usb|lsb|am|freq|vol|bw|bfo|mute]
@@ -2001,6 +2034,49 @@ static void cdc_handle_line(char *line) {
             }
             cdc_printf("OK antcap=%u (%s)\r\n", si4732_get_antcap(),
                        si4732_get_antcap() ? "fixed" : "chip tunes its own varactor");
+            return;
+        }
+        // rx agc [on|off|<index>] — the front-end attenuator.
+        //
+        // The number is attenuation, so 0 is maximum gain. Worth watching
+        // because the AM AGC answers to the whole input rather than the
+        // channel you tuned: one strong carrier anywhere in band turns the
+        // front end down everywhere, and the result looks exactly like a dead
+        // antenna. "rx agc off" pins it wide open so the two can be told
+        // apart — at the price of overloading on anything strong, so it is a
+        // measurement setting, not a listening one.
+        if (streqi(argv[1], "agc")) {
+            if (argc >= 3) {
+                bool ok;
+                if (streqi(argv[2], "on")) {
+                    ok = si4732_set_agc(false, 0u);
+                } else if (streqi(argv[2], "off")) {
+                    ok = si4732_set_agc(true, 0u);
+                } else {
+                    long idx = strtol(argv[2], NULL, 10);
+                    if (idx < 0 || idx > 255) {
+                        cdc_write_str("ERR: rx agc on | off | <attenuation index>\r\n");
+                        return;
+                    }
+                    ok = si4732_set_agc(true, (uint8_t)idx);
+                }
+                if (!ok) {
+                    cdc_printf("ERR: %s\r\n", si4732_last_error());
+                    return;
+                }
+            }
+            bool agc_off = false;
+            uint8_t agc_idx = 0u;
+            if (!si4732_read_agc(&agc_off, &agc_idx)) {
+                cdc_printf("ERR: %s\r\n", si4732_last_error());
+                return;
+            }
+            cdc_printf("OK agc=%s index=%u (0 = no attenuation, full gain)\r\n",
+                       agc_off ? "forced" : "automatic", agc_idx);
+            if (!agc_off && agc_idx > 8u)
+                cdc_printf("NOTE: the chip is holding the front end %u steps down. "
+                           "Something strong is\r\n      in band — compare with "
+                           "'rx agc off'.\r\n", agc_idx);
             return;
         }
         if (streqi(argv[1], "xosc")) {
