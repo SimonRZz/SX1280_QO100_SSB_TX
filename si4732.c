@@ -422,13 +422,18 @@ static bool si_wait_stc(uint32_t timeout_ms)
 // Reads back what the tuner actually did, which is the one figure that tells a
 // tune that silently went nowhere from one that worked. INTACK clears the STC
 // flag so the next tune can be detected.
+// Reads back what the tuner actually did. On ANY failure the read-back
+// frequency is cleared: leaving the previous tune's value in place once had
+// an AM result standing in for an SSB tune that never answered, and the
+// wrong conclusion survived two rounds of measurements.
 static bool si_read_tune_status(void)
 {
     const uint8_t cmd[2] = { CMD_TUNE_STATUS, 0x01u };
-    if (!si_cmd(cmd, sizeof cmd)) return false;
+    if (!si_cmd(cmd, sizeof cmd)) { s_read_khz = 0u; return false; }
 
     uint8_t r[8] = { 0 };
     if (i2c_read_blocking(SI_I2C, s_addr, r, sizeof r, false) != (int)sizeof r) {
+        s_read_khz = 0u;        // never let the previous tune's answer stand in
         s_last_err = "TUNE_STATUS read failed";
         return false;
     }
@@ -967,5 +972,8 @@ void si4732_diag_print(void)
            (unsigned)s_read_khz,
            s_stc_ok ? "ok" : "DID NOT COMPLETE",
            (unsigned long)s_khz);
+    if (!s_stc_ok && s_read_khz == 0u)
+        si_log("[SI4732]   0 kHz here means the chip did not answer, not that it "
+               "tuned to zero");
     si_log("[SI4732]   last error: %s", s_last_err);
 }
