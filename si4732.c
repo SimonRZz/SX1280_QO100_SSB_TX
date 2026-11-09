@@ -1056,6 +1056,39 @@ void si4732_ssb_bringup_test(void)
            (int)si_read_tune_status(), (unsigned)s_read_khz);
     si_cts_now("after TUNE_STATUS");
 
+    // Does a BARE POWER_UP bring it back, with no hardware reset?
+    //
+    // That separates the two remaining explanations, and they need opposite
+    // remedies. A wedged DSP needs the reset line. A part that has dropped out
+    // and is waiting to be started again is what a supply dip looks like from
+    // here - and the SSB patch begins drawing its working current at exactly
+    // the moment we lose it, the tune, which no AM session ever reaches.
+    si_log("[SSBTEST] --- recovery: POWER_UP alone, no reset line ---");
+    {
+        const uint8_t pu[3] = { CMD_POWER_UP,
+                                (uint8_t)((s_xoscen ? PU_XOSCEN : 0u) | PU_FUNC_AM),
+                                PU_OPMODE_ANALOG };
+        const int w = i2c_write_blocking(SI_I2C, s_addr, pu, sizeof pu, false);
+        si_log("[SSBTEST] POWER_UP written: %d of %u bytes", w, (unsigned)sizeof pu);
+        sleep_ms(50);
+    }
+    const bool back = si_cts_now("after bare POWER_UP");
+    if (back) {
+        const uint8_t gr[1] = { CMD_GET_REV };
+        uint8_t rv[9] = { 0 };
+        i2c_write_blocking(SI_I2C, s_addr, gr, 1, false);
+        sleep_ms(10);
+        const int r = i2c_read_blocking(SI_I2C, s_addr, rv, sizeof rv, false);
+        si_log("[SSBTEST] GET_REV now: read %d -> %02X %02X %02X %02X %02X %02X %02X %02X %02X",
+               r, rv[0], rv[1], rv[2], rv[3], rv[4], rv[5], rv[6], rv[7], rv[8]);
+        si_log("[SSBTEST] CAME BACK FROM A POWER_UP ALONE. The chip was not");
+        si_log("[SSBTEST]   wedged, it had dropped out. Measure 3V3 at pin 14.");
+    } else {
+        si_log("[SSBTEST] still dead without the reset line: a genuine lock-up,");
+        si_log("[SSBTEST]   not a supply dip.");
+    }
+    s_on = false;      // whatever state it is in, it is not a tuned receiver
+
     si_log("[SSBTEST] --- the first line that is not ok is the culprit ---");
 #endif
 }
