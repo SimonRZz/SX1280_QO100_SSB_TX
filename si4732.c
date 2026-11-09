@@ -842,6 +842,14 @@ bool si4732_read_rsq(uint8_t *rssi_dbuv, uint8_t *snr_db)
 bool si4732_read_agc(bool *disabled, uint8_t *index)
 {
     if (!s_present || !s_on) { s_last_err = "receiver is not powered up"; return false; }
+    // 0x47 is an AM command. TUNE_STATUS taught us what an AM command costs
+    // once the SSB patch is running: CTS goes away and stays away until the
+    // next power-up. The missing agc line in an SSB diagnosis, with the RSQ
+    // read dead right behind it, has exactly that shape. Not sent there.
+    if (s_mode != SI4732_MODE_AM) {
+        s_last_err = "AGC status is an AM command and is not sent in SSB";
+        return false;
+    }
 
     const uint8_t b[1] = { CMD_AGC_STATUS };
     if (!si_cmd(b, sizeof b)) return false;
@@ -1045,7 +1053,9 @@ void si4732_diag_print(void)
 
     bool agc_off = false;
     uint8_t agc_idx = 0u;
-    if (si4732_read_agc(&agc_off, &agc_idx)) {
+    if (s_mode != SI4732_MODE_AM) {
+        si_log("[SI4732]   agc not read in SSB (0x47 is an AM command)");
+    } else if (si4732_read_agc(&agc_off, &agc_idx)) {
         si_log("[SI4732]   agc %s, attenuation index %u%s",
                agc_off ? "DISABLED (forced)" : "automatic", agc_idx,
                (!agc_off && agc_idx > 8u)

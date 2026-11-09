@@ -2200,6 +2200,11 @@ static void cdc_handle_line(char *line) {
         // apart — at the price of overloading on anything strong, so it is a
         // measurement setting, not a listening one.
         if (streqi(argv[1], "agc")) {
+            if (si4732_get_mode() != SI4732_MODE_AM) {
+                cdc_write_str("ERR: the AGC commands are AM only. In SSB they take the\r\n"
+                              "     chip's CTS away until the next power-up.\r\n");
+                return;
+            }
             if (argc >= 3) {
                 bool ok;
                 if (streqi(argv[2], "on")) {
