@@ -618,29 +618,47 @@ bool si4732_set_mode(si4732_mode_t mode)
     si_hw_reset();
     if (!si_probe(s_addr)) { s_last_err = "gone after reset"; s_on = false; return false; }
 
-    bool want_patch = (mode != SI4732_MODE_AM);
+    const bool want_patch = (mode != SI4732_MODE_AM);
+
+    // The order below is the reference library's, step for step, because
+    // every deviation from it tried tonight has cost an hour. Its loadPatch()
+    // powers up WITH the patch bit, uploads, sets SSB_MODE — and then
+    // setSSB() powers up a SECOND time with the patch bit CLEAR, through
+    // radioPowerUp(), and only afterwards re-sends the reference clock
+    // properties. Nothing in the library says why, and nothing in AN332 says
+    // the patch survives it. It evidently does, and the sequence is what
+    // thousands of working receivers run.
     if (!si_power_up(want_patch)) { s_on = false; return false; }
 
 #ifdef SI4732_SSB_PATCH
     if (want_patch && !si_download_patch()) { s_on = false; return false; }
 #endif
 
-    // Now the revision read means something: the chip is running, and after a
-    // patch upload the patch id proves it landed.
+    // While the patch id is still readable: after the second power-up it is
+    // not, so this is the only moment the upload can be confirmed at all.
     if (!si_read_rev(want_patch)) { s_on = false; return false; }
 
     s_mode = mode;
     s_on   = true;
 
-    // Reference clock first: everything downstream derives its frequency from
-    // it, so setting it after tuning would leave the first tune offset.
-    bool ok = si_set_prop(PROP_REFCLK_PRESCALE, s_rclk_presc);
+    bool ok = true;
+    if (want_patch) {
+        ok = si_apply_bandwidth();              // setSSBConfig()
+        ok = si_power_up(false) && ok;          // radioPowerUp(), PATCH clear
+    }
+
+    // Reference clock. The library sends REFCLK_FREQ before the prescaler and
+    // only after that second power-up, which is also when a power-up would
+    // have cleared them.
     ok = si_set_prop(PROP_REFCLK_FREQ, (uint16_t)(s_rclk_hz / s_rclk_presc)) && ok;
+    ok = si_set_prop(PROP_REFCLK_PRESCALE, s_rclk_presc) && ok;
 
     // Soft mute fights weak SSB signals by ducking exactly when you want to
     // hear them. Off.
     ok = si_set_prop(PROP_AM_SOFT_MUTE_MAX_AT, 0u) && ok;
 
+    // In SSB the bandwidth went in before the second power-up; send it again,
+    // since that power-up is entitled to have cleared it.
     ok = si_apply_bandwidth() && ok;
     ok = si4732_set_volume(s_volume) && ok;
     ok = si4732_set_mute(s_mute) && ok;
