@@ -64,6 +64,9 @@ uint32_t si4732_get_khz(void);
 // an output — so this offset is what stands in for GPS discipline on the
 // receive side. Its TCXO is ±2 ppm, roughly ±10 kHz at 23 °C and ±30 kHz over
 // the full temperature range, so one calibration holds for a session.
+// Why the last call failed. Never NULL.
+const char *si4732_last_error(void);
+
 bool     si4732_set_cal_hz(int32_t hz);
 int32_t  si4732_get_cal_hz(void);
 

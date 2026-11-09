@@ -628,6 +628,8 @@ bool si4732_set_cal_hz(int32_t hz)
 
 int32_t si4732_get_cal_hz(void) { return s_cal_hz; }
 
+const char *si4732_last_error(void) { return s_last_err ? s_last_err : "none"; }
+
 bool si4732_get_xoscen(void) { return s_xoscen; }
 
 uint16_t si4732_get_antcap(void) { return s_antcap; }

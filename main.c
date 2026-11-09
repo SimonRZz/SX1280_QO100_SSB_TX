@@ -1998,9 +1998,16 @@ static void cdc_handle_line(char *line) {
                 return;
             }
             if (!si4732_tune_hz((uint32_t)(khz * 1000.0 + 0.5))) {
-                cdc_printf("ERR: %.3f kHz is outside the band once the %+ld Hz "
-                           "calibration is applied\r\n",
-                           khz, (long)si4732_get_cal_hz());
+                // Say what actually went wrong. This used to blame the
+                // calibration offset unconditionally, which is only one of the
+                // reasons a tune can fail and was wrong every other time —
+                // including at 19450 kHz with the offset at zero, where it sent
+                // us looking in the wrong place entirely.
+                cdc_printf("ERR: tune to %.3f kHz failed: %s\r\n",
+                           khz, si4732_last_error());
+                if (si4732_get_cal_hz() != 0)
+                    cdc_printf("     (calibration offset is %+ld Hz)\r\n",
+                               (long)si4732_get_cal_hz());
                 return;
             }
         } else if (streqi(argv[1], "cal")) {
