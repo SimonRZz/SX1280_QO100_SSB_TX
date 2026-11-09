@@ -211,6 +211,42 @@ static bool si_cmd(const uint8_t *buf, size_t len)
     return si_wait_cts(100u);
 }
 
+// Write a command and read its response in ONE transaction.
+//
+// The Si473x returns its status as the first byte of every response read, so
+// that byte IS the CTS indicator. Polling CTS with a separate one-byte read
+// first, the way si_cmd() does, is one transaction too many: it takes the
+// status byte out of the response. The ROM firmware has tolerated that for
+// months in AM. The patched DSP does not — after an SSB tune, RSQ_STATUS,
+// TUNE_STATUS and AGC_STATUS all left CTS low and never raised it again,
+// which read as "SSB does not work" for weeks.
+//
+// So: write, then read the whole response and look at byte 0. While the chip
+// is still busy that byte comes back without bit 7 and we simply read again.
+static bool si_cmd_resp(const uint8_t *cmd, size_t clen,
+                        uint8_t *resp, size_t rlen, uint32_t timeout_ms)
+{
+    if (i2c_write_blocking(SI_I2C, s_addr, cmd, clen, false) != (int)clen) {
+        s_last_err = "I2C write failed";
+        return false;
+    }
+
+    const absolute_time_t deadline = make_timeout_time_ms(timeout_ms);
+    bool acked = false;
+    for (;;) {
+        sleep_us(500);
+        if (i2c_read_blocking(SI_I2C, s_addr, resp, rlen, false) == (int)rlen) {
+            acked = true;
+            if (resp[0] != 0xFFu && (resp[0] & 0x80u)) return true;
+        }
+        if (absolute_time_diff_us(get_absolute_time(), deadline) <= 0) {
+            s_last_err = acked ? "response never carried CTS"
+                               : "no ACK while reading the response";
+            return false;
+        }
+    }
+}
+
 static bool si_set_prop(uint16_t prop, uint16_t val)
 {
     const uint8_t b[6] = {
@@ -817,18 +853,13 @@ bool si4732_read_rsq(uint8_t *rssi_dbuv, uint8_t *snr_db)
     if (!s_present) { s_last_err = "no Si4732 on the bus";   return false; }
     if (!s_on)      { s_last_err = "receiver is powered down"; return false; }
 
-    const uint8_t b[2] = { CMD_RSQ_STATUS, 0x00u };
-    if (!si_cmd(b, sizeof b)) return false;
-
     // Eight bytes, not six: RESP2 carries VALID and AFCRL, and RESP7 a signed
     // frequency offset in kHz. Those three say whether the chip thinks it is on
     // a real channel and how far off it is — worth far more while hunting for a
     // beacon than the two level figures alone.
+    const uint8_t b[2] = { CMD_RSQ_STATUS, 0x00u };
     uint8_t r[8] = { 0 };
-    if (i2c_read_blocking(SI_I2C, s_addr, r, sizeof r, false) != (int)sizeof r) {
-        s_last_err = "RSQ read failed";
-        return false;
-    }
+    if (!si_cmd_resp(b, sizeof b, r, sizeof r, 100u)) return false;
     s_rsq_valid = (r[2] & 0x01u) != 0u;
     s_rsq_afcrl = (r[2] & 0x02u) != 0u;
     s_rsq_smute = (r[2] & 0x08u) != 0u;
