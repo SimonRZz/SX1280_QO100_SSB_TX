@@ -31,6 +31,10 @@ void gpsdo_task(void);
 // ±2.5 ppm (≈ ±6 kHz at 2.4 GHz).
 bool gpsdo_clock_ok(void);
 
+// Re-sends the whole SI5351 configuration. The boot gate uses this when PLL A
+// has not locked after a few seconds instead of waiting indefinitely.
+bool gpsdo_retry_clock(void);
+
 // Returns true once gpsdo_clock_ok() AND the GPS has delivered a UTC
 // timestamp, meaning the 24 MHz TIMEPULSE is satellite-disciplined.
 // This is the condition for allowing transmission.

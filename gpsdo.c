@@ -95,6 +95,7 @@ static uint8_t s_si_addr = 0x00u;
 static bool s_loOn   = false;  // CLK0, 144 MHz, mixer LO
 static bool s_rclkOn = false;  // CLK2, 25 MHz, Si4732 reference clock
 static uint8_t s_rclkDrive = 3u;  // IDRV field of CLK2_CTRL: 0=2mA .. 3=8mA
+static bool s_pllbReady = false;  // PLL B + MS0/MS2 configured yet?
 
 #define SI_REG_STATUS      0u    // Device status (read-only)
 #define SI_STATUS_SYS_INIT (1u << 7) // 1 = calibrating (not ready)
@@ -186,25 +187,15 @@ static bool si5351_init_clocks(void)
     // Disable all outputs while configuring.
     if (!si_write_reg(SI_REG_OEB, SI_OEB_ALL_OFF)) return false;
 
-    // CLK0: PDN=0, INT=1, MS_SRC=PLLB, INV=0, CLK_SRC=MS0=0b11, IDRV=8mA=0b11
-    //   Byte: 0b 0 1 1 0 11 11 = 0x6F
-    // 8 mA is deliberate: the wanted signal is the 5th harmonic, which only
-    // exists because the edges are steep.
-    si_write_reg(SI_REG_CLK0_CTRL, 0x6Fu);
+    // Power down both receive-side outputs. PLL B and their MultiSynths are
+    // NOT configured here — see si5351_init_pllb() for why.
+    si_write_reg(SI_REG_CLK0_CTRL, 0x80u);
+    si_write_reg(SI_REG_CLK2_CTRL, 0x80u);
 
     // CLK1: PDN=0, INT=1 (integer mode), MS_SRC=PLLA, INV=0,
     //        CLK_SRC=MS1(self)=0b11, IDRV=4mA=0b01
     //   Byte: 0b 0 1 0 0 11 01 = 0x4D
     si_write_reg(SI_REG_CLK1_CTRL, 0x4Du);
-
-    // CLK2: PDN=0, INT=0 (fractional), MS_SRC=PLLB, INV=0, CLK_SRC=MS2, IDRV=8mA
-    //   Byte: 0b 0 0 1 0 11 11 = 0x2F
-    // 8 mA, found on the bench. At 2 mA the Si4732 answered on I2C but refused
-    // to tune — "tune did not complete", 0 kHz read back — which looks exactly
-    // like a dead antenna and is not. Its RCLK input wants a hard-driven CMOS
-    // clock, not the gentle level a crystal oscillator would present.
-    // Changeable at runtime with "rclk drive".
-    si_write_reg(SI_REG_CLK2_CTRL, 0x2Fu);
 
     // Crystal load capacitance: 8 pF (bits[7:6]=0b10) + reserved 0x12.
     si_write_reg(SI_REG_XTAL_LOAD, 0x92u);
@@ -232,57 +223,61 @@ static bool si5351_init_clocks(void)
     };
     if (!si_write_regs(SI_REG_MS1_BASE, ms1, 8u)) return false;
 
+    si_write_reg(SI_REG_PLL_RESET, 0xA0u);
+
+    s_pllbReady = false;
+    s_loOn      = false;
+    s_rclkOn    = false;
+    si_write_oeb();
+
+    return true;
+}
+
+// Configures PLL B and the two receive-side MultiSynths, once, on first use.
+//
+// This used to happen during gpsdo_init(), and the transmitter then started
+// hanging at "SI5351: PLL unlocked" — sporadically at first, then every time.
+// PLL A is the SX1280's only clock, and bringing a second PLL and two more
+// MultiSynths up alongside it costs supply current on a 3V3 rail that already
+// carries the OLED, the GPS, the microphone amplifier and now the Si4732.
+//
+// So the boot path is back to exactly what it was for months: PLL A, MS1,
+// CLK1, nothing else. The receive side is built only when someone asks for it,
+// which cannot happen before the boot gate has seen a locked 52 MHz.
+static bool si5351_init_pllb(void)
+{
+    if (s_pllbReady) return true;
+
     // PLL B: p1=4096=0x1000, p2=0, p3=1  →  24 MHz × 36 = 864 MHz
     static const uint8_t pllb[8] = {
-        0x00u, 0x01u,   // p3=1
-        0x00u,          // p1[17:16]=0
-        0x10u, 0x00u,   // p1[15:8]=0x10, p1[7:0]=0x00  (4096)
-        0x00u,          // upper nibbles of p3/p2 = 0
-        0x00u, 0x00u    // p2=0
+        0x00u, 0x01u, 0x00u, 0x10u, 0x00u, 0x00u, 0x00u, 0x00u
     };
     if (!si_write_regs(SI_REG_PLLB_BASE, pllb, 8u)) return false;
 
-    // MS0 (CLK0): p1=256=0x0100, p2=0, p3=1  →  864 ÷ 6 = 144 MHz
+    // MS0 (CLK0): p1=256=0x0100  →  864 ÷ 6 = 144 MHz, integer, even divider
     static const uint8_t ms0[8] = {
-        0x00u, 0x01u,   // p3=1
-        0x00u,          // R_DIV=/1, DIVBY4=0, p1[17:16]=0
-        0x01u, 0x00u,   // p1[15:8]=0x01, p1[7:0]=0x00  (256)
-        0x00u,          // upper nibbles = 0
-        0x00u, 0x00u    // p2=0
+        0x00u, 0x01u, 0x00u, 0x01u, 0x00u, 0x00u, 0x00u, 0x00u
     };
     if (!si_write_regs(SI_REG_MS0_BASE, ms0, 8u)) return false;
 
-    // MS2 (CLK2): 864 ÷ (34 + 14/25) = 25 MHz exactly → Si4732 reference clock.
-    //   p1=3911 (0x0F47), p2=17, p3=25
+    // MS2 (CLK2): p1=3911 (0x0F47), p2=17, p3=25  →  864 ÷ (34+14/25) = 25 MHz
     static const uint8_t ms2[8] = {
-        0x00u, 0x19u,   // p3=25
-        0x00u,          // R_DIV=/1, DIVBY4=0, p1[17:16]=0
-        0x0Fu, 0x47u,   // p1[15:8]=0x0F, p1[7:0]=0x47  (3911)
-        0x00u,          // upper nibbles of p3/p2 = 0
-        0x00u, 0x11u    // p2=17
+        0x00u, 0x19u, 0x00u, 0x0Fu, 0x47u, 0x00u, 0x00u, 0x11u
     };
     if (!si_write_regs(SI_REG_MS2_BASE, ms2, 8u)) return false;
 
-    // Reset both PLLs to lock them to the new multisynth settings. Safe here
-    // because nothing depends on either clock yet — the SX1280 is still held in
-    // reset. At runtime PLL A must never be reset: the SX1280 would lose its
-    // clock for milliseconds. Reset B alone with 0x80 if that is ever needed.
-    si_write_reg(SI_REG_PLL_RESET, 0xA0u);
+    // CLK0: PDN=0, INT=1, PLL B, CLK_SRC=MS0, 8 mA — the mixer LO lives on the
+    // 5th harmonic, which only exists because the edges are steep.
+    si_write_reg(SI_REG_CLK0_CTRL, 0x6Fu);
+    // CLK2: PDN=0, INT=0 (fractional), PLL B, CLK_SRC=MS2, 8 mA. 2 mA left the
+    // Si4732 answering on I2C but refusing to tune.
+    si_write_reg(SI_REG_CLK2_CTRL, (uint8_t)(0x2Cu | (s_rclkDrive & 3u)));
 
-    // CLK1 only. Both receive-side outputs stay OFF until asked for.
-    //
-    // The mixer LO used to come up enabled, a mistake: gpsdo_init() runs
-    // before the boot gate that waits for a locked 52 MHz, so anything wrong on
-    // a receive-side line — stray DC from an amplifier module, a supply droop
-    // from the extra output current, 144 MHz coupling into the 24 MHz reference
-    // on XA — could stop the transmitter from starting at all. The receive side
-    // must never be able to do that. All the MultiSynths and control registers
-    // are configured above, so enabling an output only flips its output-enable
-    // bit; both PLLs are already locked by then.
-    s_loOn   = false;
-    s_rclkOn = false;
-    si_write_oeb();
+    // PLL B ONLY. 0xA0 would reset PLL A as well and take the SX1280's clock
+    // away for milliseconds, in the middle of transmission.
+    if (!si_write_reg(SI_REG_PLL_RESET, 0x80u)) return false;
 
+    s_pllbReady = true;
     return true;
 }
 
@@ -291,6 +286,7 @@ static bool si5351_init_clocks(void)
 bool gpsdo_set_lo_enabled(bool on)
 {
     if (s_si_addr == 0x00u) return false;
+    if (on && !si5351_init_pllb()) return false;
     bool prev = s_loOn;
     s_loOn = on;
     if (!si_write_oeb()) { s_loOn = prev; return false; }
@@ -302,6 +298,7 @@ bool gpsdo_set_lo_enabled(bool on)
 bool gpsdo_set_rclk_enabled(bool on)
 {
     if (s_si_addr == 0x00u) return false;
+    if (on && !si5351_init_pllb()) return false;
     bool prev = s_rclkOn;
     s_rclkOn = on;
     if (!si_write_oeb()) { s_rclkOn = prev; return false; }
@@ -317,6 +314,7 @@ bool gpsdo_rclk_enabled(void) { return s_rclkOn; }
 bool gpsdo_set_rclk_drive(uint8_t ma)
 {
     if (s_si_addr == 0x00u) return false;
+    if (!si5351_init_pllb()) return false;
     uint8_t idrv;
     switch (ma) {
         case 2u: idrv = 0u; break;
@@ -796,6 +794,21 @@ void gpsdo_task(void)
         s_gpsdoReady = true;
         printf("[GPSDO] READY — SI5351 locked + GPS UTC received, TX enabled\n");
     }
+}
+
+// Re-runs the clock configuration from scratch. The boot gate calls this when
+// PLL A has not locked after a few seconds, rather than waiting forever: a
+// single write lost on the I2C bus, or a PLL that came up unlocked, is worth one
+// more attempt before telling the operator the transmitter cannot start.
+bool gpsdo_retry_clock(void)
+{
+    s_clk1Ok = si5351_init_clocks();
+    if (s_clk1Ok) {
+        sleep_ms(50u);
+        si_read_reg(SI_REG_STATUS, &s_si5351_status);
+        s_si5351_pollMs = gpsdo_ms();
+    }
+    return s_clk1Ok;
 }
 
 bool gpsdo_clock_ok(void)

@@ -3728,6 +3728,8 @@ int main(void) {
         uint32_t last_status_ms  = 0u;
         uint32_t last_oled_ms    = 0u;
         uint8_t  si_warn_printed = 0u;
+        uint32_t last_retry_ms   = 0u;
+        uint8_t  retries         = 0u;
         while (!gpsdo_clock_ok()) {
             gpsdo_task();
             tud_task();
@@ -3738,6 +3740,20 @@ int main(void) {
             if ((now_ms - last_oled_ms) >= 1000u) {
                 last_oled_ms = now_ms;
                 oled_draw_boot_wait(now_ms - boot_ms);
+            }
+            // Rather than wait forever: if the SI5351 is there but PLL A has
+            // not locked, re-send the whole configuration every 5 s. A write
+            // lost on the bus, or a PLL that came up unlocked, then costs five
+            // seconds instead of the whole session.
+            if (gpsdo_si5351_ok() && retries < 12u
+                && (now_ms - boot_ms) >= 5000u
+                && (now_ms - last_retry_ms) >= 5000u) {
+                last_retry_ms = now_ms;
+                retries++;
+                if (tud_cdc_connected())
+                    cdc_printf("GPSDO: PLL A still unlocked — resending the SI5351 "
+                               "configuration (attempt %u)\r\n", (unsigned)retries);
+                gpsdo_retry_clock();
             }
             if (tud_cdc_connected()) {
                 if (!si_warn_printed && !gpsdo_si5351_ok()) {
