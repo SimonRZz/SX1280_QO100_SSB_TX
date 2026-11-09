@@ -1814,6 +1814,30 @@ static void bootlog_flush(void) {
 
 // One machine-readable line, in the same shape as the other "!" pushes so the
 // GUI can pick it apart: !R on= mode= freq= bw= bfo= vol= mute= rssi= snr=
+// The Si4732 has no crystal of its own. With SI5351 CLK2 switched off it still
+// answers on I2C, still accepts every command and still acknowledges a tune —
+// it just never completes one, and then every level reads 0. From the outside
+// that is indistinguishable from a dead antenna, and it has already cost one
+// bench session and the wrong conclusion that the chip was deaf.
+//
+// CLK2 cannot simply be on from boot: gpsdo_init() runs before the gate that
+// waits for a locked 52 MHz, and nothing on the receive side may be able to
+// stop the transmitter from starting. So it is switched on here instead, at
+// every point where the receiver is about to be used.
+static bool rx_ensure_rclk(void)
+{
+    if (gpsdo_rclk_enabled()) return true;
+    if (gpsdo_set_rclk_enabled(true)) {
+        cdc_printf("NOTE: reference clock was off — CLK2 (%u MHz) enabled\r\n",
+                   gpsdo_rclk_mhz());
+        return true;
+    }
+    cdc_write_str("WARN: no reference clock on Si4732 pin 13 (SI5351 unreachable).\r\n"
+                  "      The receiver cannot tune at all without it: every level\r\n"
+                  "      will read 0, which looks exactly like a dead antenna.\r\n");
+    return false;
+}
+
 static void rx_status_print(void) {
     uint8_t rssi = 0, snr = 0;
     bool have_rsq = si4732_read_rsq(&rssi, &snr);
@@ -1959,7 +1983,19 @@ static void cdc_handle_line(char *line) {
         }
         if (argc < 2) { rx_status_print(); return; }
 
-        if (streqi(argv[1], "diag")) { si4732_diag_print(); return; }
+        if (streqi(argv[1], "diag")) {
+            // Before anything the chip says about itself: whether it has a
+            // clock. Without one every figure below it is a zero that means
+            // nothing.
+            cdc_printf("[RCLK]  SI5351 CLK2 %s, %u MHz, %u mA%s\r\n",
+                       gpsdo_rclk_enabled() ? "ON" : "OFF",
+                       gpsdo_rclk_mhz(), gpsdo_rclk_drive(),
+                       gpsdo_rclk_enabled()
+                           ? ""
+                           : "   <-- the receiver cannot tune; run 'rclk 1'");
+            si4732_diag_print();
+            return;
+        }
 
         // rx scan <from kHz> <to kHz> <step kHz>
         //
@@ -1970,6 +2006,7 @@ static void cdc_handle_line(char *line) {
         // width, so it shows up as a run of neighbouring frequencies reading
         // high, not as one spike.
         if (streqi(argv[1], "scan")) {
+            rx_ensure_rclk();
             if (!si4732_is_on()) {
                 cdc_write_str("ERR: receiver is off — 'rx am' or 'rx usb' first\r\n");
                 return;
@@ -2101,12 +2138,7 @@ static void cdc_handle_line(char *line) {
         if (streqi(argv[1], "on") || streqi(argv[1], "off")) {
             bool on = streqi(argv[1], "on");
             if (on) {
-                // The chip cannot tune without its reference clock, and that
-                // comes up disabled so the receive side can never block the
-                // transmitter from booting. Turn it on before powering up.
-                if (!gpsdo_rclk_enabled() && !gpsdo_set_rclk_enabled(true))
-                    cdc_write_str("WARN: could not enable the 25 MHz reference "
-                                  "(SI5351 unreachable) — receiver will not tune\r\n");
+                rx_ensure_rclk();
                 if (!si4732_set_mode(si4732_get_mode())) {
                     cdc_write_str("ERR: receiver power-up failed — 'rx diag' for why\r\n");
                     return;
@@ -2122,6 +2154,7 @@ static void cdc_handle_line(char *line) {
             si4732_mode_t m = streqi(argv[1], "usb") ? SI4732_MODE_USB
                             : streqi(argv[1], "lsb") ? SI4732_MODE_LSB
                                                      : SI4732_MODE_AM;
+            rx_ensure_rclk();
             if (!si4732_set_mode(m)) {
                 cdc_write_str(si4732_has_ssb()
                     ? "ERR: mode change failed — 'rx diag' for why\r\n"

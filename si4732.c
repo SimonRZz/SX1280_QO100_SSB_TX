@@ -458,10 +458,20 @@ static bool si_tune(void)
     // diagnosis behind one flag.
     const char *err_before = s_last_err;
     s_stc_ok = si_wait_stc(300u);
-    if (!s_stc_ok)
-        si_log("[SI4732] note: no seek/tune-complete within 300 ms");
     (void)si_read_tune_status();
-    if (s_stc_ok) s_last_err = err_before;
+    if (s_stc_ok) {
+        s_last_err = err_before;
+    } else {
+        // Name the overwhelmingly likely cause. The chip has no crystal, so
+        // with SI5351 CLK2 off it still answers every command and still
+        // acknowledges the tune — it simply never completes one, and then
+        // every level reads 0. That is identical to a dead antenna from the
+        // outside, and reporting "none" here once cost a whole bench session
+        // and the wrong conclusion that the part was deaf.
+        s_last_err = "tune never completed — no reference clock on pin 13? ('rclk')";
+        si_log("[SI4732] note: no seek/tune-complete within 300 ms");
+        si_log("[SI4732]       this chip has no crystal: check 'rclk' is 1");
+    }
 
     if (s_stc_ok && s_read_khz != (uint16_t)s_khz)
         si_log("[SI4732] WARNING: asked for %u kHz, tuner reports %u kHz",
