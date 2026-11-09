@@ -153,4 +153,10 @@ void     si4732_set_log(si4732_log_fn fn);
 // Multi-line report through the log sink.
 void     si4732_diag_print(void);
 
+// Walks the SSB bring-up one command at a time and reports the chip's status
+// byte after each, ERR bit included. For the open question of why the part
+// stops answering after an SSB tune while AM is fine on the same hardware.
+// Leaves the receiver powered up in USB, however far it got.
+void     si4732_ssb_bringup_test(void);
+
 #endif // SI4732_H

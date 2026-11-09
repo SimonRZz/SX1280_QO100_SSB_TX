@@ -892,6 +892,103 @@ bool si4732_set_rclk_hz(uint32_t hz)
     return si4732_tune_hz(si4732_get_hz());
 }
 
+// ---------------------------------------------------------------------------
+// Step-by-step SSB bring-up, to find which command stops the answers
+// ---------------------------------------------------------------------------
+// After an SSB tune this chip stops answering CTS, while AM on the same
+// hardware is fine and a plain power-up brings it straight back without a
+// reset. That rules out a crash and makes it a state that something in this
+// one sequence puts it into. So walk the sequence and read the status byte
+// after every single command.
+//
+// The status byte is worth more than CTS alone: bit 6 is ERR, which the part
+// sets when it rejects a command or a property. A property that is valid in
+// AM and not in SSB would show up there and nowhere else.
+static bool si_cts_now(const char *what)
+{
+    uint8_t st = 0xFFu;
+    const bool got = (i2c_read_blocking(SI_I2C, s_addr, &st, 1, false) == 1);
+    const char *verdict;
+    if (!got)              verdict = "NO ACK - chip is not on the bus";
+    else if (st == 0xFFu)  verdict = "0xFF - bus idle, nothing answered";
+    else if (!(st & 0x80u))verdict = "busy, CTS still low";
+    else if (st & 0x40u)   verdict = "CTS, but ERR SET - command refused";
+    else                   verdict = "ok";
+    si_log("[SSBTEST] %-20s status=0x%02X  %s", what, st, verdict);
+    return got && st != 0xFFu && (st & 0x80u) && !(st & 0x40u);
+}
+
+void si4732_ssb_bringup_test(void)
+{
+    if (!s_present) { si_log("[SSBTEST] no Si4732 on the bus"); return; }
+#ifndef SI4732_SSB_PATCH
+    si_log("[SSBTEST] no SSB patch compiled in - run tools/fetch_ssb_patch.sh");
+#else
+    si_log("[SSBTEST] --- step-by-step SSB bring-up, %lu kHz ---",
+           (unsigned long)s_khz);
+
+    si_hw_reset();
+    si_log("[SSBTEST] probe after reset: %d", (int)si_probe(s_addr));
+
+    si_log("[SSBTEST] POWER_UP(patch): %d", (int)si_power_up(true));
+    si_cts_now("after POWER_UP");
+
+    si_log("[SSBTEST] patch upload: %d", (int)si_download_patch());
+    si_cts_now("after patch");
+
+    s_on   = true;
+    s_mode = SI4732_MODE_USB;
+
+    si_log("[SSBTEST] GET_REV: %d", (int)si_read_rev(true));
+    si_cts_now("after GET_REV");
+
+    si_log("[SSBTEST] REFCLK_PRESCALE: %d",
+           (int)si_set_prop(PROP_REFCLK_PRESCALE, s_rclk_presc));
+    si_cts_now("after PRESCALE");
+
+    si_log("[SSBTEST] REFCLK_FREQ: %d",
+           (int)si_set_prop(PROP_REFCLK_FREQ, (uint16_t)(s_rclk_hz / s_rclk_presc)));
+    si_cts_now("after REFCLK_FREQ");
+
+    si_log("[SSBTEST] AM_SOFT_MUTE_MAX: %d",
+           (int)si_set_prop(PROP_AM_SOFT_MUTE_MAX_AT, 0u));
+    si_cts_now("after SOFT_MUTE");
+
+    si_log("[SSBTEST] SSB_MODE+bandwidth: %d", (int)si_apply_bandwidth());
+    si_cts_now("after SSB_MODE");
+
+    si_log("[SSBTEST] RX_VOLUME: %d", (int)si_set_prop(PROP_RX_VOLUME, s_volume));
+    si_cts_now("after VOLUME");
+
+    si_log("[SSBTEST] SSB_BFO: %d", (int)si_set_prop(PROP_SSB_BFO, 0u));
+    si_cts_now("after BFO");
+
+    // The tune itself, by hand, so a CTS timeout inside si_cmd() cannot hide
+    // what the chip did with it.
+    {
+        const uint16_t khz = (uint16_t)s_khz;
+        const uint8_t tf[6] = { CMD_TUNE_FREQ, TUNE_SB_USB,
+                                (uint8_t)(khz >> 8), (uint8_t)khz, 0u, 0u };
+        const int w = i2c_write_blocking(SI_I2C, s_addr, tf, sizeof tf, false);
+        si_log("[SSBTEST] SSB_TUNE_FREQ written: %d of %u bytes",
+               w, (unsigned)sizeof tf);
+    }
+    sleep_ms(10);  si_cts_now("10 ms after tune");
+    sleep_ms(90);  si_cts_now("100 ms after tune");
+    sleep_ms(400); si_cts_now("500 ms after tune");
+
+    si_log("[SSBTEST] TUNE_STATUS: %d  -> %u kHz",
+           (int)si_read_tune_status(), (unsigned)s_read_khz);
+    si_cts_now("after TUNE_STATUS");
+
+    uint8_t rssi = 0u, snr = 0u;
+    si_log("[SSBTEST] RSQ: %d  rssi=%u snr=%u",
+           (int)si4732_read_rsq(&rssi, &snr), rssi, snr);
+
+    si_log("[SSBTEST] --- the first line that is not ok is the culprit ---");
+#endif
+}
+
 void si4732_diag_print(void)
 {
     si_log("[SI4732] present=%d addr=0x%02X on=%d patch=%d",

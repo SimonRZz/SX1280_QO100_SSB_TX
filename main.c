@@ -1503,6 +1503,8 @@ static void cmd_help(void) {
         "  rx diag              - detailed receiver report\r\n"
         "  rx scan [from] [to] [step]  - sweep in kHz and print a level table,\r\n"
         "                         8 averaged reads each. Default 19400 20100 50.\r\n"
+        "  rx ssbtest           - walk the SSB bring-up one command at a time and\r\n"
+        "                         report the chip status after each\r\n"
         "  rx mon [0|1]         - receive audio into the headphones (Si4732 LOUT -> GP27).\r\n"
         "                         Takes the ADC from the microphone, so transmit audio\r\n"
         "                         switches to PC while it is on.\r\n"
@@ -2047,6 +2049,11 @@ static void cdc_handle_line(char *line) {
         }
         if (argc < 2) { rx_status_print(); return; }
 
+        if (streqi(argv[1], "ssbtest")) {
+            rx_ensure_rclk();
+            si4732_ssb_bringup_test();
+            return;
+        }
         if (streqi(argv[1], "diag")) {
             // Before anything the chip says about itself: whether it has a
             // clock. Without one every figure below it is a zero that means
