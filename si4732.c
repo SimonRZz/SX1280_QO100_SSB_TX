@@ -441,6 +441,9 @@ static bool si_tune(void)
     // symptom we were chasing — seek/tune-complete never arriving and the
     // read-back frequency coming out as zero. A tune that takes a few more
     // milliseconds and reports honestly is worth more here.
+    //
+    // How the result is checked then differs by mode, see below: AM has the
+    // flag, SSB does not.
     uint8_t arg1 = 0u;
     if (s_mode == SI4732_MODE_LSB)      arg1 = TUNE_SB_LSB;
     else if (s_mode == SI4732_MODE_USB) arg1 = TUNE_SB_USB;
@@ -453,10 +456,32 @@ static bool si_tune(void)
     };
     if (!si_cmd(b, sizeof b)) return false;
 
+    const char *err_before = s_last_err;
+    const bool ssb = (s_mode != SI4732_MODE_AM);
+
+    // In SSB the chip does not raise seek/tune-complete, and polling for it
+    // does active harm. The reference library never waits for it there — it
+    // sends the tune and delays — and now we know why: 150 GET_INT_STATUS
+    // reads in 300 ms leave the part unable to answer CTS afterwards, so the
+    // very next RSQ read times out. The tune itself was fine all along; the
+    // read-back frequency was correct while the flag said it had failed.
+    //
+    // So: AM waits for the flag, SSB waits on the clock.
+    if (ssb) {
+        sleep_ms(40);                 // library uses 30; a little margin
+        s_stc_ok = si_read_tune_status() && (s_read_khz == (uint16_t)s_khz);
+        if (s_stc_ok) {
+            s_last_err = err_before;
+        } else if (s_read_khz != (uint16_t)s_khz) {
+            si_log("[SI4732] WARNING: asked for %u kHz, tuner reports %u kHz",
+                   (unsigned)s_khz, (unsigned)s_read_khz);
+        }
+        return true;
+    }
+
     // Advisory only: a tune that does not announce itself may still have
     // worked, and failing the whole call here would hide the rest of the
     // diagnosis behind one flag.
-    const char *err_before = s_last_err;
     s_stc_ok = si_wait_stc(300u);
     (void)si_read_tune_status();
     if (s_stc_ok) {
@@ -920,7 +945,12 @@ void si4732_diag_print(void)
     } else {
         si_log("[SI4732]   rsq unavailable (%s)", s_last_err);
     }
-    si_log("[SI4732]   tuner reports %u kHz, tune complete=%d  (asked for %lu kHz)",
-           (unsigned)s_read_khz, (int)s_stc_ok, (unsigned long)s_khz);
+    // "tune complete" is the chip's seek/tune flag, which only AM raises. In
+    // SSB the same column reports whether the read-back frequency matches
+    // what was asked for, which is the honest equivalent.
+    si_log("[SI4732]   tuner reports %u kHz, tune %s  (asked for %lu kHz)",
+           (unsigned)s_read_khz,
+           s_stc_ok ? "ok" : "DID NOT COMPLETE",
+           (unsigned long)s_khz);
     si_log("[SI4732]   last error: %s", s_last_err);
 }
