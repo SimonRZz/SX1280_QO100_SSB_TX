@@ -274,8 +274,43 @@ typedef enum {
     UI_PARAM_RATIO,      // dah length in dits
     UI_PARAM_TONE,       // sidetone pitch
     UI_PARAM_MICGAIN,
-    UI_PARAM_MICGATE
+    UI_PARAM_MICGATE,
+    // --- receive page ---
+    UI_PARAM_RXSTEP,     // tuning step of the encoder
+    UI_PARAM_RXMODE,     // AM / LSB / USB
+    UI_PARAM_RXBW,       // channel filter
+    UI_PARAM_RXMON,      // headphone monitor level, 0 = off
+    UI_PARAM_RXVOL,      // how hard the Si4732 drives the ADC
+    UI_PARAM_RXAGC       // audio AGC
 } ui_param_t;
+
+// Encoder steps for receive tuning. 10 Hz is what SSB needs, 9 kHz is the
+// channel spacing of the broadcast bands outside the Americas.
+static const uint32_t k_rx_steps[]  = { 10u, 100u, 1000u, 5000u, 9000u };
+static const char * const k_rx_step_names[] = { "10 Hz", "100 Hz", "1 kHz", "5 kHz", "9 kHz" };
+#define RX_STEP_N  (sizeof k_rx_steps / sizeof k_rx_steps[0])
+static volatile uint8_t g_rx_step_idx = 2;      // 1 kHz
+
+// The filters the Si4732 actually has; si4732_set_bandwidth_hz() snaps to the
+// nearest, so stepping through this list cannot land between two of them.
+static const uint16_t k_rx_bws[] = { 1000u, 1800u, 2000u, 2500u, 3000u, 4000u, 6000u };
+#define RX_BW_N    (sizeof k_rx_bws / sizeof k_rx_bws[0])
+
+// Signal quality for the display, refreshed on a timer by rxmon_task(). Read
+// directly in the draw path it would put an I2C transfer inside the frame
+// that is also built from the transmit wait loops.
+static volatile uint8_t g_rx_rssi = 0, g_rx_snr = 0;
+
+// Where the dial has been turned to. A tune is an I2C exchange that waits for
+// the chip's tune-complete flag, so doing one per encoder detent would make
+// the dial stick. The encoder only writes this; rxmon_task() applies it, at
+// most every 30 ms, so spinning the knob costs one tune and not fifty.
+static volatile uint32_t g_rx_want_hz  = 0;
+static volatile bool     g_rx_want     = false;
+
+static inline uint32_t rx_shown_hz(void) {
+    return g_rx_want ? g_rx_want_hz : si4732_get_hz();
+}
 
 typedef enum {
     UI_STATE_IDLE = 0,   // encoder = frequency; click = browse tiles; hold = next page
@@ -283,15 +318,28 @@ typedef enum {
     UI_STATE_EDITING     // tile inverted, rotate adjusts value; hold = back
 } ui_state_t;
 
-#define UI_PAGES         3
+#define UI_PAGES         4                    // 0 operating, 1 CW/audio, 2 GPS, 3 receive
 #define UI_TILES         6                    // 2 columns x 3 rows on tile pages
 #define UI_TIMEOUT_MS    5000                 // BROWSE/EDITING fall back to IDLE
 #define UI_LONG_PRESS_MS 500
 
-static const ui_param_t k_page_tiles[2][UI_TILES] = {
+static const ui_param_t k_page_tiles[3][UI_TILES] = {
     { UI_PARAM_MODE,  UI_PARAM_TUNE,  UI_PARAM_WPM, UI_PARAM_TX,   UI_PARAM_VOL,     UI_PARAM_PWR     },
     { UI_PARAM_KEYER, UI_PARAM_RATIO, UI_PARAM_WPM, UI_PARAM_TONE, UI_PARAM_MICGAIN, UI_PARAM_MICGATE },
+    { UI_PARAM_RXSTEP, UI_PARAM_RXMODE, UI_PARAM_RXBW, UI_PARAM_RXMON, UI_PARAM_RXVOL, UI_PARAM_RXAGC },
 };
+
+// Which row of k_page_tiles a page uses; -1 for a page that has no tiles.
+// Page 2 (GPS) is display-only, so the mapping is not the identity.
+static int ui_tile_row(uint8_t page)
+{
+    switch (page) {
+        case 0:  return 0;
+        case 1:  return 1;
+        case 3:  return 2;
+        default: return -1;
+    }
+}
 
 static volatile ui_state_t g_ui_state = UI_STATE_IDLE;
 static volatile uint8_t    g_ui_page = 0;                  // 0 operating, 1 CW/audio, 2 GPS info
@@ -299,7 +347,7 @@ static volatile uint8_t    g_ui_cursor_idx = 0;            // tile index on the 
 static volatile ui_param_t g_ui_cursor = UI_PARAM_MODE;    // param under the cursor (derived)
 static volatile ui_param_t g_ui_editing = UI_PARAM_MODE;   // which param is being edited
 static volatile uint32_t   g_ui_last_activity_ms = 0;      // for auto-timeout
-static volatile uint8_t    g_oled_flip = 0;                // 180 degree rotation
+static volatile uint8_t    g_oled_flip = 1;                // 180 degree rotation; 1 suits how the box is built
 
 // Blink phase for warnings on the display (2 Hz; the panel refreshes at 5 fps)
 static inline bool ui_blink(void) {
@@ -1404,7 +1452,7 @@ static void cmd_help(void) {
         "  gpsgate 0|1   - 1: TX only with GPS UTC (default); 0: override for bench tests\r\n"
         "  save          - write freq/ppm/txpwr/mode/DSP to flash now (autosaves 5 s after idle)\r\n"
         "  defaults      - restore compile-time defaults and save\r\n"
-        "  oled flip 0|1 - rotate the display by 180 degrees\r\n"
+        "  oled flip 0|1 - rotate the display by 180 degrees (default 1)\r\n"
         "  ptt 0|1       - 1: MIC mode transmits only while a CW paddle contact is held\r\n"
         "  src pc|mic    - audio source: USB from PC, or MAX4466 mic on GP26\r\n"
         "  mic [gain <1..50> | gate <0..0.5>] - mic gain and noise-gate threshold\r\n"
@@ -2295,7 +2343,7 @@ static void cdc_handle_line(char *line) {
         g_mic_gain         = 10.0f;
         g_mic_gate         = 0.02f;
         g_ptt_required     = 1;
-        if (g_oled_flip) { g_oled_flip = 0; ssd1306_set_flip(OLED_I2C, false); }
+        if (!g_oled_flip) { g_oled_flip = 1; ssd1306_set_flip(OLED_I2C, true); }
         // Receive side back to the planned QO-100 IF, no LNB calibration.
         si4732_restore(SI4732_MODE_USB, 19500000u, 32u, 2200u, 0);
         keyer_reset();
@@ -2716,6 +2764,31 @@ static void oled_prepare_frame(void) {
 
     ssd1306_clear();
 
+    if (g_ui_page == 3) {
+        // --- Page 3: receive ---
+        // The uplink/downlink pair belongs to the transmitter and only
+        // distracts here. What matters is where the receiver sits and how
+        // strong what it hears is.
+        char hbuf[28];
+        const uint32_t rhz = rx_shown_hz();
+        snprintf(hbuf, sizeof(hbuf), "%lu.%02lu",
+                 (unsigned long)(rhz / 1000u), (unsigned long)((rhz % 1000u) / 10u));
+        int hlen = 0; { const char *q = hbuf; while (*q++) hlen++; }
+        ssd1306_draw_string_2x(128 - hlen * 12, 0, hbuf);
+        ssd1306_draw_string_bold_y(0, 4, "RX");
+
+        if (si4732_is_on()) {
+            const unsigned bw = si4732_get_bandwidth_hz();
+            snprintf(hbuf, sizeof(hbuf), "%s %u.%uk  %u/%u%s",
+                     si4732_mode_name(si4732_get_mode()),
+                     bw / 1000u, (bw % 1000u) / 100u,
+                     (unsigned)g_rx_rssi, (unsigned)g_rx_snr,
+                     rxmon_is_on() ? "  MON" : "");
+        } else {
+            snprintf(hbuf, sizeof(hbuf), "receiver off");
+        }
+        ssd1306_draw_string_bold_y(0, 18, hbuf);
+    } else {
     // --- Row 0 (pages 0-1): ↑ arrow + right-justified uplink freq ---
     draw_arrow_up_2x(0, 0);
     {
@@ -2741,6 +2814,8 @@ static void oled_prepare_frame(void) {
         int len = 0; { const char *p = buf; while (*p++) len++; }
         int x_start = 128 - len * 12;
         ssd1306_draw_string_2x(x_start, 2, buf);
+    }
+
     }
 
     // --- Page 2: GPS / time (display only). No separator: the 2x clock uses y 32..47 ---
@@ -2833,7 +2908,7 @@ static void oled_prepare_frame(void) {
         char pwr_buf[12];
         snprintf(pwr_buf, sizeof(pwr_buf), "%+ddBm", g_tx_power_max_dbm);
         DRAW_R(ROW2_Y, pwr_buf, UI_PARAM_PWR);
-    } else {
+    } else if (g_ui_page == 1) {
         // --- Page 1: CW & audio ---
         DRAW_L(ROW0_Y, g_cw_mode == KEYER_STRAIGHT ? "STRAIGHT" : g_cw_mode == KEYER_IAMBIC_A ? "IAMBIC A" : "IAMBIC B",
                UI_PARAM_KEYER);
@@ -2854,6 +2929,26 @@ static void oled_prepare_frame(void) {
         char gate_buf[12];
         snprintf(gate_buf, sizeof(gate_buf), "GATE %.3f", (double)g_mic_gate);
         DRAW_R(ROW2_Y, gate_buf, UI_PARAM_MICGATE);
+    } else {
+        // --- Page 3: receive ---
+        DRAW_L(ROW0_Y, k_rx_step_names[g_rx_step_idx % RX_STEP_N], UI_PARAM_RXSTEP);
+        DRAW_L(ROW1_Y, si4732_mode_name(si4732_get_mode()), UI_PARAM_RXMODE);
+
+        char rbw_buf[12];
+        { const unsigned bw = si4732_get_bandwidth_hz();
+          snprintf(rbw_buf, sizeof(rbw_buf), "BW %u.%u", bw / 1000u, (bw % 1000u) / 100u); }
+        DRAW_L(ROW2_Y, rbw_buf, UI_PARAM_RXBW);
+
+        char rmon_buf[12];
+        if (rxmon_is_on()) snprintf(rmon_buf, sizeof(rmon_buf), "MON %u", (unsigned)rxmon_vol_pct());
+        else               snprintf(rmon_buf, sizeof(rmon_buf), "MON off");
+        DRAW_R(ROW0_Y, rmon_buf, UI_PARAM_RXMON);
+
+        char rvol_buf[12];
+        snprintf(rvol_buf, sizeof(rvol_buf), "LVL %u", (unsigned)si4732_get_volume());
+        DRAW_R(ROW1_Y, rvol_buf, UI_PARAM_RXVOL);
+
+        DRAW_R(ROW2_Y, rxmon_agc_on() ? "AGC on" : "AGC off", UI_PARAM_RXAGC);
     }
 
     #undef DRAW_ITEM
@@ -3424,6 +3519,34 @@ static void adc_select_source(uint8_t which)
 // produced, levels it, and hands finished 8 kHz samples to the interrupt.
 static void rxmon_task(void)
 {
+    // Apply whatever the dial was turned to, coalesced. Rate-limited so a
+    // fast spin produces one tune at the end instead of one per detent.
+    if (g_rx_want) {
+        static uint32_t s_tune_due = 0;
+        const uint32_t now = to_ms_since_boot(get_absolute_time());
+        if ((int32_t)(now - s_tune_due) >= 0) {
+            s_tune_due = now + 30u;
+            const uint32_t want = g_rx_want_hz;
+            g_rx_want = false;
+            si4732_tune_hz(want);
+            persist_mark_dirty();
+        }
+    }
+
+    // Signal quality for the display, on a timer. The draw path runs from the
+    // transmit wait loops too, so it must not do I2C of its own; five times a
+    // second is plenty for a meter, and never while the key is down.
+    {
+        static uint32_t s_rsq_due = 0;
+        const uint32_t now = to_ms_since_boot(get_absolute_time());
+        if ((int32_t)(now - s_rsq_due) >= 0 && !g_keyer_key && !g_tune_active) {
+            s_rsq_due = now + 200u;
+            uint8_t r = 0, n = 0;
+            if (si4732_is_on() && si4732_read_rsq(&r, &n)) { g_rx_rssi = r; g_rx_snr = n; }
+            else                                           { g_rx_rssi = 0; g_rx_snr = 0; }
+        }
+    }
+
     if (!s_rxmon_on || s_adc_input != 1u) return;
     mic_dma_rearm_if_done();
 
@@ -3590,6 +3713,21 @@ static void encoder_poll(void) {
 
     switch (g_ui_state) {
         case UI_STATE_IDLE:
+            // On the receive page the encoder tunes the receiver instead of
+            // the transmitter. Nothing else about the page changes, so the
+            // dial always means "the frequency you are looking at".
+            if (g_ui_page == 3) {
+                const uint32_t st = k_rx_steps[g_rx_step_idx % RX_STEP_N];
+                int64_t hz = (int64_t)rx_shown_hz() + (int64_t)step * (int64_t)st;
+                // Snap to the step grid, so a 9 kHz step keeps landing on
+                // broadcast channels after a stray 10 Hz nudge.
+                if (st >= 1000u) hz = ((hz + (int64_t)st / 2) / (int64_t)st) * (int64_t)st;
+                if (hz < 2300000)  hz = 2300000;
+                if (hz > 26100000) hz = 26100000;
+                g_rx_want_hz = (uint32_t)hz;
+                g_rx_want    = true;
+                break;
+            }
             // Default: encoder adjusts frequency
             {
                 double f = g_target_freq_hz + step * ENC_FREQ_STEP_HZ;
@@ -3608,7 +3746,8 @@ static void encoder_poll(void) {
                 if (c < 0) c = UI_TILES - 1;
                 if (c >= UI_TILES) c = 0;
                 g_ui_cursor_idx = (uint8_t)c;
-                g_ui_cursor = k_page_tiles[g_ui_page < 2 ? g_ui_page : 0][c];
+                const int row = ui_tile_row(g_ui_page);
+                g_ui_cursor = k_page_tiles[row < 0 ? 0 : row][c];
             }
             break;
 
@@ -3657,6 +3796,66 @@ static void encoder_poll(void) {
                         sidetone_update_params();
                         persist_mark_dirty();
                     }
+                    break;
+                case UI_PARAM_RXSTEP:
+                    {
+                        int i = (int)g_rx_step_idx + step;
+                        if (i < 0) i = (int)RX_STEP_N - 1;
+                        if (i >= (int)RX_STEP_N) i = 0;
+                        g_rx_step_idx = (uint8_t)i;
+                    }
+                    break;
+                case UI_PARAM_RXMODE:
+                    {
+                        int m = (int)si4732_get_mode() + step;
+                        if (m < 0) m = 2;
+                        if (m > 2) m = 0;
+                        si4732_set_mode((si4732_mode_t)m);
+                        persist_mark_dirty();
+                    }
+                    break;
+                case UI_PARAM_RXBW:
+                    {
+                        // Find where we are now, then move: the chip may have
+                        // snapped to a filter we never asked for.
+                        uint16_t cur = si4732_get_bandwidth_hz();
+                        int i = 0;
+                        for (int k = 0; k < (int)RX_BW_N; k++)
+                            if (k_rx_bws[k] <= cur) i = k;
+                        i += step;
+                        if (i < 0) i = 0;
+                        if (i >= (int)RX_BW_N) i = (int)RX_BW_N - 1;
+                        si4732_set_bandwidth_hz(k_rx_bws[i]);
+                        persist_mark_dirty();
+                    }
+                    break;
+                case UI_PARAM_RXMON:
+                    {
+                        int v = (int)rxmon_vol_pct() + step * 5;
+                        if (v < 0)   v = 0;
+                        if (v > 100) v = 100;
+                        rxmon_set_vol((uint8_t)v);
+                        // Zero means off, and off has to give the ADC back to
+                        // the microphone, so the two track each other.
+                        if (v > 0 && !rxmon_is_on()) {
+                            if (g_audio_src == AUDIO_SRC_MIC) g_audio_src = AUDIO_SRC_PC;
+                            rxmon_set(true);
+                        } else if (v == 0 && rxmon_is_on()) {
+                            rxmon_set(false);
+                        }
+                    }
+                    break;
+                case UI_PARAM_RXVOL:
+                    {
+                        int v = (int)si4732_get_volume() + step * 2;
+                        if (v < 0)  v = 0;
+                        if (v > 63) v = 63;
+                        si4732_set_volume((uint8_t)v);
+                        persist_mark_dirty();
+                    }
+                    break;
+                case UI_PARAM_RXAGC:
+                    rxmon_set_agc(!rxmon_agc_on());
                     break;
                 case UI_PARAM_PWR:
                     {
@@ -3741,12 +3940,12 @@ static void button_poll(void) {
             ui_touch();
             switch (g_ui_state) {
                 case UI_STATE_IDLE:
-                    if (g_ui_page == 2) {
+                    if (ui_tile_row(g_ui_page) < 0) {
                         g_ui_page = 0;            // GPS page has no tiles — click returns to page 0
                     } else {
                         g_ui_state = UI_STATE_BROWSE;
                         g_ui_cursor_idx = 0;
-                        g_ui_cursor = k_page_tiles[g_ui_page][0];
+                        g_ui_cursor = k_page_tiles[ui_tile_row(g_ui_page)][0];
                     }
                     break;
                 case UI_STATE_BROWSE:
