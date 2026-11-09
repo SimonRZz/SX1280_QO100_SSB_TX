@@ -324,6 +324,10 @@ static bool si_download_patch(void)
     int ms = (int)(absolute_time_diff_us(t0, get_absolute_time()) / 1000);
     si_log("[SI4732] SSB patch uploaded: %u bytes in %d ms",
            (unsigned)SSB_PATCH_SIZE, ms);
+    // Fifteen kilobytes of firmware have just been pushed into a running DSP.
+    // The first tune after it was coming back as 0 kHz; give the part a
+    // moment before asking it to do anything.
+    sleep_ms(100);
     return true;
 }
 #endif
@@ -468,13 +472,23 @@ static bool si_tune(void)
     //
     // So: AM waits for the flag, SSB waits on the clock.
     if (ssb) {
-        sleep_ms(40);                 // library uses 30; a little margin
-        s_stc_ok = si_read_tune_status() && (s_read_khz == (uint16_t)s_khz);
+        // SSB wants time, not questions. One read 40 ms after the command is
+        // routinely too early — straight after a 2.9 s patch upload it comes
+        // back as 0 kHz — and that is exactly what the old 300 ms of polling
+        // was accidentally providing. So wait the same total, but ask eight
+        // times instead of a hundred and fifty.
+        s_stc_ok = false;
+        for (int attempt = 0; attempt < 8 && !s_stc_ok; attempt++) {
+            sleep_ms(40);
+            if (si_read_tune_status() && s_read_khz == (uint16_t)s_khz)
+                s_stc_ok = true;
+        }
         if (s_stc_ok) {
             s_last_err = err_before;
-        } else if (s_read_khz != (uint16_t)s_khz) {
-            si_log("[SI4732] WARNING: asked for %u kHz, tuner reports %u kHz",
-                   (unsigned)s_khz, (unsigned)s_read_khz);
+        } else {
+            s_last_err = "SSB tuner never reported the frequency back";
+            si_log("[SI4732] WARNING: asked for %u kHz, tuner reports %u kHz "
+                   "after 320 ms", (unsigned)s_khz, (unsigned)s_read_khz);
         }
         return true;
     }
@@ -788,7 +802,8 @@ bool si4732_set_mute(bool mute)
 
 bool si4732_read_rsq(uint8_t *rssi_dbuv, uint8_t *snr_db)
 {
-    if (!s_present || !s_on) return false;
+    if (!s_present) { s_last_err = "no Si4732 on the bus";   return false; }
+    if (!s_on)      { s_last_err = "receiver is powered down"; return false; }
 
     const uint8_t b[2] = { CMD_RSQ_STATUS, 0x00u };
     if (!si_cmd(b, sizeof b)) return false;
