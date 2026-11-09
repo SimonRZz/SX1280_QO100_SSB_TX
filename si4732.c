@@ -211,42 +211,6 @@ static bool si_cmd(const uint8_t *buf, size_t len)
     return si_wait_cts(100u);
 }
 
-// Write a command and read its response in ONE transaction.
-//
-// The Si473x returns its status as the first byte of every response read, so
-// that byte IS the CTS indicator. Polling CTS with a separate one-byte read
-// first, the way si_cmd() does, is one transaction too many: it takes the
-// status byte out of the response. The ROM firmware has tolerated that for
-// months in AM. The patched DSP does not — after an SSB tune, RSQ_STATUS,
-// TUNE_STATUS and AGC_STATUS all left CTS low and never raised it again,
-// which read as "SSB does not work" for weeks.
-//
-// So: write, then read the whole response and look at byte 0. While the chip
-// is still busy that byte comes back without bit 7 and we simply read again.
-static bool si_cmd_resp(const uint8_t *cmd, size_t clen,
-                        uint8_t *resp, size_t rlen, uint32_t timeout_ms)
-{
-    if (i2c_write_blocking(SI_I2C, s_addr, cmd, clen, false) != (int)clen) {
-        s_last_err = "I2C write failed";
-        return false;
-    }
-
-    const absolute_time_t deadline = make_timeout_time_ms(timeout_ms);
-    bool acked = false;
-    for (;;) {
-        sleep_us(500);
-        if (i2c_read_blocking(SI_I2C, s_addr, resp, rlen, false) == (int)rlen) {
-            acked = true;
-            if (resp[0] != 0xFFu && (resp[0] & 0x80u)) return true;
-        }
-        if (absolute_time_diff_us(get_absolute_time(), deadline) <= 0) {
-            s_last_err = acked ? "response never carried CTS"
-                               : "no ACK while reading the response";
-            return false;
-        }
-    }
-}
-
 static bool si_set_prop(uint16_t prop, uint16_t val)
 {
     const uint8_t b[6] = {
@@ -492,17 +456,19 @@ static bool si_read_tune_status(void)
 
 static bool si_tune(void)
 {
-    // No FAST bit. The data sheet says of it: "executes fast and invalidated
-    // tune. The tune status will not be accurate." That is precisely the
-    // symptom we were chasing — seek/tune-complete never arriving and the
-    // read-back frequency coming out as zero. A tune that takes a few more
-    // milliseconds and reports honestly is worth more here.
+    // AM: no FAST bit. The data sheet says of it, "executes fast and
+    // invalidated tune; the tune status will not be accurate", and AM's tune
+    // status is worth having - it is what showed the reference clock was off.
     //
-    // How the result is checked then differs by mode, see below: AM has the
-    // flag, SSB does not.
+    // SSB: FAST, always. The reference library sets it unconditionally in the
+    // sideband branch of setFrequency(), right under a comment claiming the
+    // bit is "used just on AM and FM". It is not decoration. Without it the
+    // part starts a validated tune, and the SSB patch does not finish one: the
+    // tune itself reports CTS, and then every command after it leaves CTS low
+    // for good. Weeks of "SSB does not tune" were this one bit.
     uint8_t arg1 = 0u;
-    if (s_mode == SI4732_MODE_LSB)      arg1 = TUNE_SB_LSB;
-    else if (s_mode == SI4732_MODE_USB) arg1 = TUNE_SB_USB;
+    if (s_mode == SI4732_MODE_LSB)      arg1 = TUNE_SB_LSB | TUNE_FAST;
+    else if (s_mode == SI4732_MODE_USB) arg1 = TUNE_SB_USB | TUNE_FAST;
 
     uint16_t khz = (uint16_t)s_khz;
     const uint8_t b[6] = {
@@ -853,17 +819,24 @@ bool si4732_read_rsq(uint8_t *rssi_dbuv, uint8_t *snr_db)
     if (!s_present) { s_last_err = "no Si4732 on the bus";   return false; }
     if (!s_on)      { s_last_err = "receiver is powered down"; return false; }
 
-    // Eight bytes, not six: RESP2 carries VALID and AFCRL, and RESP7 a signed
-    // frequency offset in kHz. Those three say whether the chip thinks it is on
-    // a real channel and how far off it is — worth far more while hunting for a
-    // beacon than the two level figures alone.
     const uint8_t b[2] = { CMD_RSQ_STATUS, 0x00u };
+    if (!si_cmd(b, sizeof b)) return false;
+
+    // AM takes eight bytes: RESP2 carries VALID and AFCRL and RESP7 a signed
+    // frequency offset in kHz, which is worth having while hunting a beacon.
+    // SSB takes the six the reference library reads, because the patched DSP
+    // is the part of this chip whose behaviour nobody has documented and this
+    // is not the place to be inventive.
+    const size_t rlen = (s_mode == SI4732_MODE_AM) ? 8u : 6u;
     uint8_t r[8] = { 0 };
-    if (!si_cmd_resp(b, sizeof b, r, sizeof r, 100u)) return false;
+    if (i2c_read_blocking(SI_I2C, s_addr, r, rlen, false) != (int)rlen) {
+        s_last_err = "RSQ read failed";
+        return false;
+    }
     s_rsq_valid = (r[2] & 0x01u) != 0u;
     s_rsq_afcrl = (r[2] & 0x02u) != 0u;
     s_rsq_smute = (r[2] & 0x08u) != 0u;
-    s_rsq_off   = (int8_t)r[7];
+    s_rsq_off   = (s_mode == SI4732_MODE_AM) ? (int8_t)r[7] : (int8_t)0;
     if (rssi_dbuv) *rssi_dbuv = r[4];
     if (snr_db)    *snr_db    = r[5];
     return true;
