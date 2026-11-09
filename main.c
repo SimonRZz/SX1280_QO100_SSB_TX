@@ -1503,6 +1503,7 @@ static void cmd_help(void) {
         "  rx diag              - detailed receiver report\r\n"
         "  rx scan [from] [to] [step]  - sweep in kHz and print a level table,\r\n"
         "                         8 averaged reads each. Default 19400 20100 50.\r\n"
+        "  rx raw <n> <hex...>  - send a raw command, read n response bytes, dump them\r\n"
         "  rx ssbtest           - walk the SSB bring-up one command at a time and\r\n"
         "                         report the chip status after each\r\n"
         "  rx mon [0|1]         - receive audio into the headphones (Si4732 LOUT -> GP27).\r\n"
@@ -2049,6 +2050,17 @@ static void cdc_handle_line(char *line) {
         }
         if (argc < 2) { rx_status_print(); return; }
 
+        // rx raw <resp_bytes> <hex> [hex ...]
+        if (streqi(argv[1], "raw") && argc >= 3) {
+            long rl = strtol(argv[2], NULL, 10);
+            if (rl < 0 || rl > 16) { cdc_write_str("ERR: response length 0..16\r\n"); return; }
+            uint8_t cmd[8]; size_t n = 0;
+            for (int i = 3; i < argc && n < sizeof cmd; i++)
+                cmd[n++] = (uint8_t)strtol(argv[i], NULL, 16);
+            if (n == 0) { cdc_write_str("ERR: rx raw <resp_bytes> <hex> [hex ...]\r\n"); return; }
+            si4732_raw(cmd, n, (size_t)rl);
+            return;
+        }
         if (streqi(argv[1], "ssbtest")) {
             rx_ensure_rclk();
             si4732_ssb_bringup_test();

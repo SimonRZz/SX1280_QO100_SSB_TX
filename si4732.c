@@ -1035,6 +1035,61 @@ void si4732_ssb_bringup_test(void)
 #endif
 }
 
+// Send an arbitrary command and dump whatever comes back.
+//
+// SSB has now survived four wrong theories in one evening - the FAST bit, the
+// patch, XOSCEN, the supply, the polling, the transaction shape - and each one
+// cost a build and a flash. The open questions left are all of the form "does
+// this command want a different argument, or a different response length",
+// and those are bench questions. So: a way to ask them without me guessing.
+//
+//   rx raw <resp_bytes> <hex> [hex ...]
+//
+// Reports the bytes, how long CTS took, and the status bits. Reads nothing
+// when resp_bytes is 0, which is how to send a command without disturbing
+// whatever response it queues.
+void si4732_raw(const uint8_t *cmd, size_t clen, size_t rlen)
+{
+    if (!s_present) { si_log("[RAW] no Si4732 on the bus"); return; }
+    if (rlen > 16u) rlen = 16u;
+
+    char hex[64]; size_t o = 0;
+    for (size_t i = 0; i < clen && o + 3u < sizeof hex; i++)
+        o += (size_t)snprintf(hex + o, sizeof hex - o, "%02X ", cmd[i]);
+    hex[o] = '\0';
+
+    const int w = i2c_write_blocking(SI_I2C, s_addr, cmd, clen, false);
+    si_log("[RAW] wrote %s-> %d of %u bytes", hex, w, (unsigned)clen);
+    if (w != (int)clen) { si_log("[RAW] write was not acknowledged"); return; }
+    if (rlen == 0u)     { si_log("[RAW] no response read, as asked"); return; }
+
+    uint8_t r[16] = { 0 };
+    const absolute_time_t t0 = get_absolute_time();
+    const absolute_time_t deadline = make_timeout_time_ms(300u);
+    int tries = 0;
+    bool got_cts = false, acked = false;
+    for (;;) {
+        tries++;
+        if (i2c_read_blocking(SI_I2C, s_addr, r, rlen, false) == (int)rlen) {
+            acked = true;
+            if (r[0] != 0xFFu && (r[0] & 0x80u)) { got_cts = true; break; }
+        }
+        if (absolute_time_diff_us(get_absolute_time(), deadline) <= 0) break;
+        sleep_us(500);
+    }
+    const int ms = (int)(absolute_time_diff_us(t0, get_absolute_time()) / 1000);
+
+    o = 0;
+    for (size_t i = 0; i < rlen && o + 3u < sizeof hex; i++)
+        o += (size_t)snprintf(hex + o, sizeof hex - o, "%02X ", r[i]);
+    hex[o] = '\0';
+
+    si_log("[RAW] read  %s", hex);
+    si_log("[RAW] %s after %d ms / %d reads%s",
+           got_cts ? "CTS" : (acked ? "NO CTS" : "NO ACK"), ms, tries,
+           (got_cts && (r[0] & 0x40u)) ? "   ERR BIT SET - command refused" : "");
+}
+
 void si4732_diag_print(void)
 {
     si_log("[SI4732] present=%d addr=0x%02X on=%d patch=%d",

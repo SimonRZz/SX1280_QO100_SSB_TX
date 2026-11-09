@@ -2,6 +2,7 @@
 #define SI4732_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 // ---------------------------------------------------------------------------
@@ -158,5 +159,11 @@ void     si4732_diag_print(void);
 // stops answering after an SSB tune while AM is fine on the same hardware.
 // Leaves the receiver powered up in USB, however far it got.
 void     si4732_ssb_bringup_test(void);
+
+// Send an arbitrary command and dump the response. For the bench, when the
+// question is "does this command want a different argument or a different
+// response length" - which is not a question worth a build and a flash each
+// time. rlen 0 sends the command and reads nothing.
+void     si4732_raw(const uint8_t *cmd, size_t clen, size_t rlen);
 
 #endif // SI4732_H
