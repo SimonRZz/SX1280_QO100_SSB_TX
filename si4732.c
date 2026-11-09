@@ -986,23 +986,50 @@ void si4732_ssb_bringup_test(void)
     // what the chip did with it.
     {
         const uint16_t khz = (uint16_t)s_khz;
-        const uint8_t tf[6] = { CMD_TUNE_FREQ, TUNE_SB_USB,
+        const uint8_t tf[6] = { CMD_TUNE_FREQ, (uint8_t)(TUNE_SB_USB | TUNE_FAST),
                                 (uint8_t)(khz >> 8), (uint8_t)khz, 0u, 0u };
         const int w = i2c_write_blocking(SI_I2C, s_addr, tf, sizeof tf, false);
-        si_log("[SSBTEST] SSB_TUNE_FREQ written: %d of %u bytes",
+        si_log("[SSBTEST] SSB_TUNE_FREQ (FAST) written: %d of %u bytes",
                w, (unsigned)sizeof tf);
     }
     sleep_ms(10);  si_cts_now("10 ms after tune");
     sleep_ms(90);  si_cts_now("100 ms after tune");
     sleep_ms(400); si_cts_now("500 ms after tune");
 
+    // GET_REV first, and this is the whole point of the run. It returns nine
+    // bytes and it works BEFORE the tune - we have seen the patch id come back
+    // from it every single time. If it still works here, then response reads
+    // as such are fine after an SSB tune and the fault is in 0x42/0x43/0x47
+    // specifically. If it dies here too, the tune has wedged the part for any
+    // command that answers, and the three are innocent.
+    {
+        const uint8_t gr[1] = { CMD_GET_REV };
+        uint8_t rv[9] = { 0 };
+        int w = i2c_write_blocking(SI_I2C, s_addr, gr, 1, false);
+        sleep_ms(10);
+        int r = i2c_read_blocking(SI_I2C, s_addr, rv, sizeof rv, false);
+        si_log("[SSBTEST] GET_REV after tune: wrote %d read %d -> "
+               "%02X %02X %02X %02X %02X %02X %02X %02X %02X",
+               w, r, rv[0], rv[1], rv[2], rv[3], rv[4], rv[5], rv[6], rv[7], rv[8]);
+    }
+    si_cts_now("after GET_REV");
+
+    // Then the three suspects, each with the status read between them so one
+    // cannot be blamed for the damage done by the one before.
+    {
+        const uint8_t rq[2] = { CMD_RSQ_STATUS, 0x00u };
+        uint8_t rr[6] = { 0 };
+        int w = i2c_write_blocking(SI_I2C, s_addr, rq, 2, false);
+        sleep_ms(10);
+        int r = i2c_read_blocking(SI_I2C, s_addr, rr, sizeof rr, false);
+        si_log("[SSBTEST] RSQ 6 bytes: wrote %d read %d -> %02X %02X %02X %02X %02X %02X",
+               w, r, rr[0], rr[1], rr[2], rr[3], rr[4], rr[5]);
+    }
+    si_cts_now("after RSQ");
+
     si_log("[SSBTEST] TUNE_STATUS: %d  -> %u kHz",
            (int)si_read_tune_status(), (unsigned)s_read_khz);
     si_cts_now("after TUNE_STATUS");
-
-    uint8_t rssi = 0u, snr = 0u;
-    si_log("[SSBTEST] RSQ: %d  rssi=%u snr=%u",
-           (int)si4732_read_rsq(&rssi, &snr), rssi, snr);
 
     si_log("[SSBTEST] --- the first line that is not ok is the culprit ---");
 #endif
