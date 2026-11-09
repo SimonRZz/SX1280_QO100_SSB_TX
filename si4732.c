@@ -97,6 +97,9 @@ static uint16_t si_presc_for(uint32_t rclk_hz)
     return 0u;
 }
 
+// Sentinel for s_read_khz: sideband has no usable read-back, see si_tune().
+#define SI_KHZ_NOT_READ     0xFFFFu
+
 #define SI_KHZ_MIN          2300u    // SW band, per the Si4732-A10 data sheet
 #define SI_KHZ_MAX          26100u
 
@@ -477,24 +480,20 @@ static bool si_tune(void)
     //
     // So: AM waits for the flag, SSB waits on the clock.
     if (ssb) {
-        // SSB wants time, not questions. One read 40 ms after the command is
-        // routinely too early — straight after a 2.9 s patch upload it comes
-        // back as 0 kHz — and that is exactly what the old 300 ms of polling
-        // was accidentally providing. So wait the same total, but ask eight
-        // times instead of a hundred and fifty.
-        s_stc_ok = false;
-        for (int attempt = 0; attempt < 8 && !s_stc_ok; attempt++) {
-            sleep_ms(40);
-            if (si_read_tune_status() && s_read_khz == (uint16_t)s_khz)
-                s_stc_ok = true;
-        }
-        if (s_stc_ok) {
-            s_last_err = err_before;
-        } else {
-            s_last_err = "SSB tuner never reported the frequency back";
-            si_log("[SI4732] WARNING: asked for %u kHz, tuner reports %u kHz "
-                   "after 320 ms", (unsigned)s_khz, (unsigned)s_read_khz);
-        }
+        // No read-back in sideband. "rx ssbtest" walked this whole sequence
+        // one command at a time and every step answered status=0x80, the tune
+        // included, still fine 500 ms later. The chip only stops answering
+        // when TUNE_STATUS is sent afterwards, and then it stays that way
+        // until the next power-up.
+        //
+        // So the read-back added to find out why SSB did not work was what
+        // stopped SSB working. The tune was never the problem. Here it is
+        // confirmed by the only thing sideband will tell us: that the part is
+        // still answering.
+        sleep_ms(40);
+        s_read_khz = SI_KHZ_NOT_READ;
+        s_stc_ok   = si_wait_cts(200u);
+        s_last_err = s_stc_ok ? err_before : "no CTS after the SSB tune";
         return true;
     }
 
@@ -1065,12 +1064,18 @@ void si4732_diag_print(void)
     // "tune complete" is the chip's seek/tune flag, which only AM raises. In
     // SSB the same column reports whether the read-back frequency matches
     // what was asked for, which is the honest equivalent.
-    si_log("[SI4732]   tuner reports %u kHz, tune %s  (asked for %lu kHz)",
-           (unsigned)s_read_khz,
-           s_stc_ok ? "ok" : "DID NOT COMPLETE",
-           (unsigned long)s_khz);
-    if (!s_stc_ok && s_read_khz == 0u)
-        si_log("[SI4732]   0 kHz here means the chip did not answer, not that it "
-               "tuned to zero");
+    if (s_read_khz == SI_KHZ_NOT_READ) {
+        si_log("[SI4732]   tune %s at %lu kHz  (no read-back in SSB: asking the "
+               "chip stops it answering)",
+               s_stc_ok ? "ok" : "NO CTS AFTERWARDS", (unsigned long)s_khz);
+    } else {
+        si_log("[SI4732]   tuner reports %u kHz, tune %s  (asked for %lu kHz)",
+               (unsigned)s_read_khz,
+               s_stc_ok ? "ok" : "DID NOT COMPLETE",
+               (unsigned long)s_khz);
+        if (!s_stc_ok && s_read_khz == 0u)
+            si_log("[SI4732]   0 kHz here means the chip did not answer, not that "
+                   "it tuned to zero");
+    }
     si_log("[SI4732]   last error: %s", s_last_err);
 }
