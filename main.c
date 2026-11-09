@@ -205,6 +205,16 @@ static volatile float   g_mic_gain  = 10.0f;   // 1..50, applied after DC remova
 static volatile float   g_mic_gate  = 0.02f;   // 0..0.5, noise gate threshold on the gained signal
 static const char *audio_src_name(uint8_t s);
 static void mic_diag_print(void);
+
+// --- Receive audio monitor (Si4732 LOUT on GP27 / ADC1 -> headphones) ---
+// Defined down with the microphone, which owns the ADC it borrows.
+static void    rxmon_set(bool on);
+static bool    rxmon_is_on(void);
+static void    rxmon_set_vol(uint8_t pct);
+static uint8_t rxmon_vol_pct(void);
+static void    rxmon_set_agc(bool on);
+static bool    rxmon_agc_on(void);
+static void    rxmon_diag_print(void);
 // GPS gate: 1 = TX only when gpsdo_is_ready() (default), 0 = override for bench tests.
 // Deliberately not persisted — resets to enforced on every boot.
 static volatile uint8_t g_gps_gate = 1;
@@ -1444,6 +1454,11 @@ static void cmd_help(void) {
         "  rx diag              - detailed receiver report\r\n"
         "  rx scan [from] [to] [step]  - sweep in kHz and print a level table,\r\n"
         "                         8 averaged reads each. Default 19400 20100 50.\r\n"
+        "  rx mon [0|1]         - receive audio into the headphones (Si4732 LOUT -> GP27).\r\n"
+        "                         Takes the ADC from the microphone, so transmit audio\r\n"
+        "                         switches to PC while it is on.\r\n"
+        "  rx mon vol <0..100>  - monitor level in the headphones\r\n"
+        "  rx mon agc [0|1]     - audio AGC: down fast, up slowly, with a hard limiter\r\n"
         "  rx agc [on|off|<n>]  - front-end attenuator. The index is attenuation, so 0\r\n"
         "                         is full gain. 'off' pins it open for measuring.\r\n"
         "  rx xosc <0|1>        - POWER_UP crystal-oscillator bit; 0 = external RCLK\r\n"
@@ -2082,6 +2097,31 @@ static void cdc_handle_line(char *line) {
                        si4732_get_antcap() ? "fixed" : "chip tunes its own varactor");
             return;
         }
+        // rx mon [0|1] | rx mon vol <0..100> | rx mon agc [0|1]
+        if (streqi(argv[1], "mon")) {
+            if (argc >= 4 && streqi(argv[2], "vol")) {
+                long v = strtol(argv[3], NULL, 10);
+                if (v < 0 || v > 100) { cdc_write_str("ERR: rx mon vol 0..100\r\n"); return; }
+                rxmon_set_vol((uint8_t)v);
+            } else if (argc >= 4 && streqi(argv[2], "agc")) {
+                rxmon_set_agc(strtol(argv[3], NULL, 10) != 0);
+            } else if (argc >= 3) {
+                bool on = (strtol(argv[2], NULL, 10) != 0);
+                if (on && g_audio_src == AUDIO_SRC_MIC) {
+                    // One ADC, and the modulator must never be handed receive
+                    // audio. Say so rather than fail quietly.
+                    g_audio_src = AUDIO_SRC_PC;
+                    cdc_write_str("NOTE: transmit audio source switched to PC — the monitor\r\n"
+                                  "      needs the ADC that the microphone was using.\r\n");
+                }
+                rxmon_set(on);
+                if (on && !si4732_is_on())
+                    cdc_write_str("NOTE: the receiver is off — 'rx am' to start it.\r\n");
+            }
+            rxmon_diag_print();
+            return;
+        }
+
         // rx agc [on|off|<index>] — the front-end attenuator.
         //
         // The number is attenuation, so 0 is maximum gain. Worth watching
@@ -3040,6 +3080,34 @@ static void keyer_diag_print(void) {
 }
 
 // ==========================================================
+// Receive audio monitor — shared state
+// ==========================================================
+// The Si4732's audio pin drives nothing on this board. It goes into ADC1 on
+// GP27, is levelled by rxmon_task() on core 0 and lands in this ring; the
+// sidetone's DMA interrupt reads it out and mixes it into the same PWM that
+// feeds the headphone jack. Producer on core 0, consumer in the IRQ, one
+// reader and one writer each, so the two indices need no lock.
+//
+// The levelling is deliberately NOT done here: this ring already holds
+// finished 8 kHz samples, which keeps the interrupt integer-only.
+#define RXO_SAMPLES 256u                          /* 32 ms */
+#define RXO_MASK    (RXO_SAMPLES - 1u)
+#define RX_PH_INC   ((8000u << 16) / 48000u)      /* 10922, Q16 */
+
+static int16_t           s_rxo[RXO_SAMPLES];
+static volatile uint32_t s_rxo_wr = 0;
+static volatile uint32_t s_rxo_rd = 0;
+
+static volatile bool     s_rxmon_on  = false;
+static volatile int32_t  s_rxmon_vol = (int32_t)(32767 * 40 / 100);   // Q15
+static volatile bool     s_rxmon_agc = true;
+static volatile uint32_t s_rx_under  = 0;     // IRQ found the ring empty
+
+// Consumer state, touched only by the interrupt.
+static int32_t  s_rx_s0 = 0, s_rx_s1 = 0;
+static uint32_t s_rx_ph = 0;
+static int32_t  s_rx_mute = 0;                // Q15 ramp, 0 while transmitting
+
 // Sidetone: PWM audio on GP12 → RC low-pass → headphones
 // ==========================================================
 // 10-bit PWM at sysclk/1024 (244 kHz @ 250 MHz). Samples are delivered
@@ -3085,6 +3153,13 @@ static void __not_in_flash_func(sidetone_fill)(uint32_t *dst) {
                     (g_ui_state == UI_STATE_EDITING &&
                      (g_ui_editing == UI_PARAM_VOL || g_ui_editing == UI_PARAM_TONE));
 
+    // Receive audio rides along on the same PWM. It is faded out while the
+    // key is down or TUNE is running: you do not want the band under your own
+    // sidetone, and on a transverter you would be listening to yourself.
+    const int32_t rxvol      = s_rxmon_vol;
+    const bool    rxon       = s_rxmon_on && rxvol > 0;
+    const bool    rxunmute   = !(g_keyer_key || g_tune_active);
+
     for (uint32_t i = 0; i < ST_BUF; i++) {
         if (on)  { if (s_st_env_pos < ST_RAMP_SAMPLES) s_st_env_pos++; }
         else     { if (s_st_env_pos > 0)               s_st_env_pos--; }
@@ -3101,7 +3176,41 @@ static void __not_in_flash_func(sidetone_fill)(uint32_t *dst) {
         const int32_t  s1   = s_st_sin[(si + 1u) & 255u];
         const int32_t  s    = s0 + (((s1 - s0) * (int32_t)sf) >> 16);
         const int32_t amp = (env * gain) >> 15;              // Q15
-        const int32_t v   = (s * amp) >> 15;                 // ±32767 full scale
+        int32_t       v   = (s * amp) >> 15;                 // ±32767 full scale
+
+        if (rxon) {
+            // 8 kHz -> 48 kHz with linear interpolation. Integer only: this
+            // runs in the DMA completion interrupt.
+            s_rx_ph += RX_PH_INC;
+            if (s_rx_ph >= 65536u) {
+                s_rx_ph -= 65536u;
+                uint32_t lvl = (s_rxo_wr - s_rxo_rd) & RXO_MASK;
+                // RX_PH_INC is 10922 where the exact ratio is 10922.67, so the
+                // consumer runs 0.006 % slow and the ring creeps up. Drop a
+                // sample when it gets too full — once every few seconds, far
+                // below anything you can hear.
+                if (lvl > (RXO_SAMPLES - RXO_SAMPLES / 4u)) {
+                    s_rxo_rd = (s_rxo_rd + 1u) & RXO_MASK;
+                    lvl--;
+                }
+                s_rx_s0 = s_rx_s1;
+                if (lvl) {
+                    s_rx_s1 = s_rxo[s_rxo_rd];
+                    s_rxo_rd = (s_rxo_rd + 1u) & RXO_MASK;
+                } else {
+                    s_rx_under++;          // hold the last sample across the gap
+                }
+            }
+            // 5 ms fade, the same ramp the key edges use, so switching does
+            // not click.
+            if (rxunmute) { s_rx_mute += 137; if (s_rx_mute > 32767) s_rx_mute = 32767; }
+            else          { s_rx_mute -= 137; if (s_rx_mute < 0)     s_rx_mute = 0; }
+
+            const int32_t rs = s_rx_s0 + (((s_rx_s1 - s_rx_s0) * (int32_t)s_rx_ph) >> 16);
+            v += (((rs * s_rx_mute) >> 15) * rxvol) >> 15;
+            if (v >  32767) v =  32767;
+            if (v < -32768) v = -32768;
+        }
 
         // 16-bit sample → 10-bit PWM level with the rounding error fed back
         // into the next sample (pushes quantisation noise above the RC corner).
@@ -3185,6 +3294,7 @@ static void sidetone_init(void) {
 // paces the producer at the same rate Core1 consumes — both clocks come
 // from the same crystal, no resampler needed.
 #define PIN_MIC          26
+#define PIN_RXAUDIO      27     // Si4732 LOUT, see the receive audio monitor below
 #define MIC_RB_SAMPLES   2048u
 #define MIC_RB_MASK      (MIC_RB_SAMPLES - 1u)
 #define MIC_DMA_COUNT    0x0FFFFFFFu          // ~9 h at 8 kHz, then re-armed
@@ -3242,6 +3352,7 @@ static float mic_get_sample(void) {
 static void mic_init(void) {
     adc_init();
     adc_gpio_init(PIN_MIC);
+    adc_gpio_init(PIN_RXAUDIO);   // the monitor borrows this ADC, see rxmon_task()
     adc_select_input(0);
     adc_set_clkdiv(48000000.0f / (float)WAV_SAMPLE_RATE - 1.0f);   // one conversion per 1/8000 s
     adc_fifo_setup(true, true, 1, false, false);
@@ -3257,6 +3368,144 @@ static void mic_init(void) {
 
     adc_run(true);
     mic_flush();
+}
+
+// Receive audio monitor: Si4732 LOUT on GP27 (ADC1)
+// ==========================================================
+// The ADC has one sample-and-hold and one FIFO, and the microphone already
+// owns it. Round-robin over both inputs would interleave them into a single
+// stream whose phase holds only as long as no sample is ever dropped — and a
+// slipped phase would feed receive audio into the transmit modulator. Rather
+// than risk the one part of this radio that is finished, the input is
+// SWITCHED: while the monitor is on it has ADC1, and the transmit audio
+// source is PC. Microphone monitoring, the third part of this stage, needs
+// that round-robin and waits for it.
+//
+// Levelling runs here on core 0, not in the audio interrupt, so the interrupt
+// stays integer-only and short.
+#define PIN_RXAUDIO 27
+
+static uint32_t      s_rx_rd      = 0;      // our read pointer into the ADC ring
+static float         s_rx_dc      = 0.0f;
+static float         s_rx_env     = 0.0f;   // envelope the AGC follows
+static float         s_rx_gain    = 1.0f;
+static float         s_rxmon_tgt  = 0.25f;  // where the AGC aims, full scale = 1
+static uint8_t       s_rxmon_pct  = 40;
+static volatile float s_rx_peak   = 0.0f;   // after the AGC, for the meter
+static volatile float s_rx_clip   = 0.0f;   // before it, to show headroom
+static uint8_t       s_adc_input  = 0;      // 0 = mic GP26, 1 = monitor GP27
+
+static inline uint32_t rx_available(void) {
+    return (mic_wr_index() - s_rx_rd) & MIC_RB_MASK;
+}
+
+static void adc_select_source(uint8_t which)
+{
+    if (s_adc_input == which) return;
+    adc_run(false);
+    adc_fifo_drain();
+    adc_select_input(which);
+    s_adc_input = which;
+    adc_run(true);
+    // Whatever is already in the ring was sampled from the other pin, so both
+    // consumers restart at the write pointer.
+    mic_flush();
+    s_rx_rd = mic_wr_index();
+}
+
+// Called from every service point on core 0. Consumes whatever the ADC has
+// produced, levels it, and hands finished 8 kHz samples to the interrupt.
+static void rxmon_task(void)
+{
+    if (!s_rxmon_on || s_adc_input != 1u) return;
+    mic_dma_rearm_if_done();
+
+    // If core 0 was away for a long time the ring holds stale audio. Playing
+    // it out would only turn the gap into permanent delay, so skip it.
+    if (rx_available() > (MIC_RB_SAMPLES / 2u)) s_rx_rd = mic_wr_index();
+
+    while (rx_available() != 0u &&
+           (((s_rxo_wr - s_rxo_rd) & RXO_MASK) < (RXO_MASK - 1u))) {
+        const uint16_t raw = s_mic_rb[s_rx_rd];
+        s_rx_rd = (s_rx_rd + 1u) & MIC_RB_MASK;
+
+        float x = ((float)(raw & 0x0FFFu) - 2048.0f) / 2048.0f;
+        s_rx_dc += 0.002f * (x - s_rx_dc);          // one-pole HPF, fc ~ 2.5 Hz
+        x -= s_rx_dc;
+
+        const float ax = fabsf(x);
+        if (ax > s_rx_clip) s_rx_clip = ax;
+        s_rx_env += (ax > s_rx_env ? 0.08f : 0.0006f) * (ax - s_rx_env);
+
+        if (s_rxmon_agc) {
+            float want = s_rxmon_tgt / (s_rx_env > 0.0008f ? s_rx_env : 0.0008f);
+            if (want > 60.0f) want = 60.0f;         // +36 dB
+            if (want < 0.05f) want = 0.05f;         // -26 dB
+            // Down fast, up slowly. A station that suddenly booms in has to be
+            // turned down before it hurts; one that fades must come back
+            // gently, or every pause between words pumps.
+            s_rx_gain += (want < s_rx_gain ? 0.05f : 0.0006f) * (want - s_rx_gain);
+        } else {
+            s_rx_gain += 0.02f * (1.0f - s_rx_gain);
+        }
+
+        float y = x * s_rx_gain;
+        // The AGC follows an envelope, and a transient outruns any envelope.
+        // This limiter is what actually keeps a crash out of your ears.
+        if (y >  0.98f) y =  0.98f;
+        if (y < -0.98f) y = -0.98f;
+        const float ay = fabsf(y);
+        if (ay > s_rx_peak) s_rx_peak = ay;
+
+        s_rxo[s_rxo_wr] = (int16_t)(y * 32767.0f);
+        s_rxo_wr = (s_rxo_wr + 1u) & RXO_MASK;
+    }
+}
+
+static void rxmon_set(bool on)
+{
+    if (on) {
+        s_rx_dc = 0.0f; s_rx_env = 0.0f; s_rx_gain = 1.0f;
+        s_rxo_wr = 0; s_rxo_rd = 0;
+        s_rx_s0 = 0; s_rx_s1 = 0; s_rx_ph = 0; s_rx_under = 0;
+        s_rx_peak = 0.0f; s_rx_clip = 0.0f;
+        s_rxmon_on = true;
+        adc_select_source(1u);
+    } else {
+        s_rxmon_on = false;      // the interrupt fades out on its own ramp
+        adc_select_source(0u);
+    }
+}
+
+static bool    rxmon_is_on(void)   { return s_rxmon_on; }
+static uint8_t rxmon_vol_pct(void) { return s_rxmon_pct; }
+static bool    rxmon_agc_on(void)  { return s_rxmon_agc; }
+static void    rxmon_set_agc(bool on) { s_rxmon_agc = on; if (!on) s_rx_gain = 1.0f; }
+
+static void rxmon_set_vol(uint8_t pct)
+{
+    if (pct > 100u) pct = 100u;
+    s_rxmon_pct = pct;
+    s_rxmon_vol = (int32_t)pct * 32767 / 100;
+}
+
+static void rxmon_diag_print(void)
+{
+    const float pk = s_rx_peak, cl = s_rx_clip;
+    s_rx_peak = 0.0f; s_rx_clip = 0.0f;        // peaks since the last report
+    cdc_printf("RX monitor: %s  vol=%u%%  agc=%s gain=%.1f (%+.0f dB)  "
+               "in_peak=%.3f out_peak=%.3f\r\n",
+               s_rxmon_on ? "ON" : "off", s_rxmon_pct,
+               s_rxmon_agc ? "on" : "off", (double)s_rx_gain,
+               (double)(20.0f * log10f(s_rx_gain > 1e-4f ? s_rx_gain : 1e-4f)),
+               (double)cl, (double)pk);
+    cdc_printf("            ADC on %s  ring=%lu/%u  underruns=%lu\r\n",
+               s_adc_input ? "GP27 (Si4732 LOUT)" : "GP26 (microphone)",
+               (unsigned long)((s_rxo_wr - s_rxo_rd) & RXO_MASK),
+               (unsigned)RXO_SAMPLES, (unsigned long)s_rx_under);
+    if (s_rxmon_on && cl > 0.95f)
+        cdc_write_str("NOTE: the ADC is clipping before the AGC can do anything. "
+                      "Turn the\r\n      Si4732 down with 'rx vol'.\r\n");
 }
 
 static const char *audio_src_name(uint8_t s) { return s == AUDIO_SRC_MIC ? "mic" : "pc"; }
@@ -3928,6 +4177,7 @@ int main(void) {
         uint8_t  retries         = 0u;
         while (!gpsdo_clock_ok()) {
             gpsdo_task();
+            rxmon_task();
             tud_task();
             cdc_task();   // allow 'gpsdo' / 'version' while waiting
             uint32_t now_ms = to_ms_since_boot(get_absolute_time());
@@ -4037,6 +4287,7 @@ int main(void) {
             gpsdo_task();
 
             // OLED refresh during wait
+            rxmon_task();
             if (!ssd1306_dma_busy() &&
                 absolute_time_diff_us(get_absolute_time(), oled_next) <= 0) {
                 oled_prepare_frame();
@@ -4126,6 +4377,7 @@ int main(void) {
             // GPS UART must be drained here too: with the mode persisted the
             // device can boot straight into CW and never reach the SSB path.
             gpsdo_task();
+            rxmon_task();
             if (gpsdo_status_due()) {
                 char gbuf[128];
                 gpsdo_format_status(gbuf, sizeof(gbuf));
@@ -4149,6 +4401,7 @@ int main(void) {
             carrier_poll();
             persist_maybe_autosave();
             gpsdo_task();   // 32-byte UART FIFO fills in ~33 ms at 9600 baud — keep draining
+            rxmon_task();
 
             tight_loop_contents();
         }
@@ -4165,6 +4418,7 @@ int main(void) {
 
         // GPSDO: service GPS UART and send periodic status (every 10 s).
         gpsdo_task();
+        rxmon_task();
         if (gpsdo_status_due()) {
             char gbuf[128];
             gpsdo_format_status(gbuf, sizeof(gbuf));
@@ -4225,6 +4479,7 @@ int main(void) {
                 carrier_poll();
                 persist_maybe_autosave();
                 gpsdo_task();
+                rxmon_task();
                 if (g_cw_test_mode || g_audio_src != AUDIO_SRC_MIC) { bail = true; break; }
                 tight_loop_contents();
             }

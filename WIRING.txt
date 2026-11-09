@@ -322,9 +322,28 @@ Same arrangement as the microphone on ADC0: the divider sets the operating
 point to 1.65 V, the 10 uF blocks DC. The 1 kOhm with 47 nF is the anti-alias
 filter at 3.4 kHz, matched to the 8 kHz sample rate.
 
-Not yet used by the firmware — stage R1 is the driver only, and you listen on
-the Si4732's own audio output to prove the receive hardware works. Wiring it up
-now does no harm.
+USED BY THE FIRMWARE since stage R2a: 'rx mon 1' feeds this into the headphone
+jack. The samples are levelled on core 0 (DC removal, AGC, hard limiter) and
+mixed into the same PWM stream that carries the sidetone, so NOTHING changes on
+the headphone wiring - this one connection is the whole hardware change.
+
+    rx mon [0|1]          receiver into the headphones
+    rx mon vol <0..100>   level
+    rx mon agc [0|1]      audio AGC, on by default
+
+The AGC turns down fast and comes back slowly, so a station that suddenly booms
+in cannot hurt, and a pause between words does not pump. Its range is -26 to
++36 dB and a hard limiter sits after it, because the AGC follows an envelope
+and a transient outruns any envelope.
+
+THE ADC IS SHARED. There is one sample-and-hold and one FIFO on the chip, and
+the microphone on ADC0 already owns them. Round-robin over both inputs would
+interleave them into a single stream whose phase holds only as long as no
+sample is ever dropped, and a slipped phase would feed receive audio into the
+transmit modulator. So the input is switched instead: while the monitor runs it
+has ADC1, and the transmit audio source is forced to PC. 'rx mon 1' says so
+when it does that. Microphone monitoring - the third part of this stage - needs
+that round-robin and is not built yet.
 
 --------------------------------------------------------------------------------
 POWER
