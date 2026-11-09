@@ -168,9 +168,17 @@ static void si_log(const char *fmt, ...)
 static bool si_wait_cts(uint32_t timeout_ms)
 {
     absolute_time_t deadline = make_timeout_time_ms(timeout_ms);
+    // What the last poll actually saw, so the timeout can report it. This used
+    // to be recovered by testing s_last_err[0] == 'n' for "no answer ..." —
+    // and "none", the no-error sentinel, starts with an n too. Every real CTS
+    // timeout therefore reported itself as "none", which is how an SSB
+    // receiver that had stopped answering looked like one with nothing wrong.
+    bool saw_idle_bus = false;
+    bool saw_any_ack  = false;
     for (;;) {
         uint8_t st = 0u;
         if (i2c_read_blocking(SI_I2C, s_addr, &st, 1, false) == 1) {
+            saw_any_ack = true;
             // 0xFF is what an idle bus reads: SDA held high by the pull-up
             // because nothing is driving it. Bit 7 is set in that pattern, so
             // a plain "CTS is bit 7" test passes on a chip that is not talking
@@ -179,15 +187,15 @@ static bool si_wait_cts(uint32_t timeout_ms)
             // status has both CTS and ERR plus every other bit set, so treat
             // 0xFF as "no answer".
             if (st == 0xFFu) {
-                s_last_err = "no answer (bus reads 0xFF)";
+                saw_idle_bus = true;
             } else if (st & 0x80u) {
                 return true;
             }
         }
         if (absolute_time_diff_us(get_absolute_time(), deadline) <= 0) {
-            if (s_last_err != (const char *)0 && s_last_err[0] == 'n')
-                return false;              // keep the more specific message
-            s_last_err = "CTS timeout";
+            s_last_err = !saw_any_ack  ? "no ACK: nothing on the bus at this address"
+                       : saw_idle_bus  ? "no answer (bus reads 0xFF)"
+                                       : "CTS stayed low (chip busy and never finished)";
             return false;
         }
         sleep_us(150);
