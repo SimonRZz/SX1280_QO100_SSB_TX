@@ -208,6 +208,7 @@ static void mic_diag_print(void);
 
 // --- Receive audio monitor (Si4732 LOUT on GP27 / ADC1 -> headphones) ---
 // Defined down with the microphone, which owns the ADC it borrows.
+static void    rxmon_task(void);
 static void    rxmon_set(bool on);
 static bool    rxmon_is_on(void);
 static void    rxmon_set_vol(uint8_t pct);
@@ -2059,6 +2060,12 @@ static void cdc_handle_line(char *line) {
             uint8_t best_at_avg = 0u;
             long    best_khz    = f0;
             for (long f = f0; f <= f1; f += st) {
+                // Each probe point parks here for tens of milliseconds, so the
+                // service points in the main loop are out of reach and the
+                // monitor's ring would run dry. Pump it by hand. The audio
+                // still breaks up — the tuner is hopping — but the counters
+                // stay honest and it recovers without a resync.
+                rxmon_task();
                 uint8_t avg = 0u, peak = 0u, snr = 0u;
                 if (!si4732_probe_khz((uint32_t)f, 8u, &avg, &peak, &snr)) {
                     cdc_printf("%7ld   -- measurement failed: %s\r\n",
