@@ -1439,6 +1439,8 @@ static void cmd_help(void) {
         "                         harmonic at 720 MHz. On by default.\r\n"
         "  rx                   - receiver status\r\n"
         "  rx diag              - detailed receiver report\r\n"
+        "  rx scan [from] [to] [step]  - sweep in kHz and print a level table,\r\n"
+        "                         8 averaged reads each. Default 19400 20100 50.\r\n"
         "  rx xosc <0|1>        - POWER_UP crystal-oscillator bit; 0 = external RCLK\r\n"
         "  rx antcap <0..6143>  - antenna tuning capacitor; 0 = automatic. Try 1 for a\r\n"
         "                         short wire or a 50 ohm feed.\r\n"
@@ -1925,6 +1927,68 @@ static void cdc_handle_line(char *line) {
         if (argc < 2) { rx_status_print(); return; }
 
         if (streqi(argv[1], "diag")) { si4732_diag_print(); return; }
+
+        // rx scan <from kHz> <to kHz> <step kHz>
+        //
+        // Sweeps and prints a table. Searching by hand is not viable: a single
+        // RSQ read at one frequency gave 64 and then 0 seconds apart, so every
+        // point here is the mean of eight reads with the peak beside it. The
+        // 500 kHz QO-100 transponder lifts the noise floor across its whole
+        // width, so it shows up as a run of neighbouring frequencies reading
+        // high, not as one spike.
+        if (streqi(argv[1], "scan")) {
+            if (!si4732_is_on()) {
+                cdc_write_str("ERR: receiver is off — 'rx am' or 'rx usb' first\r\n");
+                return;
+            }
+            long f0 = (argc >= 3) ? strtol(argv[2], NULL, 10) : 19400;
+            long f1 = (argc >= 4) ? strtol(argv[3], NULL, 10) : 20100;
+            long st = (argc >= 5) ? strtol(argv[4], NULL, 10) : 50;
+            if (st < 1) st = 1;
+            if (f1 < f0) { long t = f0; f0 = f1; f1 = t; }
+            if (f0 < 2300 || f1 > 26100) {
+                cdc_write_str("ERR: rx scan stays within 2300..26100 kHz\r\n");
+                return;
+            }
+            long steps = (f1 - f0) / st + 1;
+            if (steps > 64) {
+                cdc_printf("ERR: %ld steps is too many (max 64) — use a coarser step\r\n",
+                           steps);
+                return;
+            }
+
+            uint32_t back_hz = si4732_get_hz();
+            cdc_printf("Scanning %ld..%ld kHz in %ld kHz steps, 8 reads each\r\n",
+                       f0, f1, st);
+            cdc_write_str("  kHz    rssi avg/peak  snr    level\r\n");
+
+            uint8_t best_at_avg = 0u;
+            long    best_khz    = f0;
+            for (long f = f0; f <= f1; f += st) {
+                uint8_t avg = 0u, peak = 0u, snr = 0u;
+                if (!si4732_probe_khz((uint32_t)f, 8u, &avg, &peak, &snr)) {
+                    cdc_printf("%7ld   -- measurement failed: %s\r\n",
+                               f, si4732_last_error());
+                    tud_task();
+                    continue;
+                }
+                if (avg > best_at_avg) { best_at_avg = avg; best_khz = f; }
+                char bar[34];
+                unsigned n = (avg > 64u) ? 32u : (unsigned)avg / 2u;
+                for (unsigned i = 0; i < n; i++) bar[i] = '#';
+                bar[n] = '\0';
+                cdc_printf("%7ld    %3u / %3u    %3u   %s\r\n",
+                           f, avg, peak, snr, bar);
+                tud_task();
+            }
+            cdc_printf("Highest average: %u dBuV at %ld kHz\r\n",
+                       best_at_avg, best_khz);
+            cdc_write_str("A 500 kHz run of high readings is the transponder; "
+                          "a single high point is more likely interference.\r\n");
+            (void)si4732_tune_hz(back_hz);
+            rx_status_print();
+            return;
+        }
 
         // rx xosc 0|1 — the crystal-oscillator bit of POWER_UP. Switchable
         // because the reference library sets it where this driver does not,

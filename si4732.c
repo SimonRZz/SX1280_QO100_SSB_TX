@@ -630,6 +630,44 @@ int32_t si4732_get_cal_hz(void) { return s_cal_hz; }
 
 const char *si4732_last_error(void) { return s_last_err ? s_last_err : "none"; }
 
+// Tunes and averages several quality readings.
+//
+// A single RSQ read is not usable for searching: on the bench the same
+// frequency gave 64 and then 0 in consecutive reads seconds apart, because with
+// no carrier the AGC is chasing noise. Averaging a handful of reads, and
+// reporting the peak alongside, turns that into something an eye can compare
+// between frequencies.
+bool si4732_probe_khz(uint32_t khz, uint8_t samples,
+                      uint8_t *rssi_avg, uint8_t *rssi_max, uint8_t *snr_max)
+{
+    if (rssi_avg) *rssi_avg = 0u;
+    if (rssi_max) *rssi_max = 0u;
+    if (snr_max)  *snr_max  = 0u;
+    if (!s_present || !s_on) return false;
+    if (samples == 0u) samples = 1u;
+
+    if (!si4732_tune_hz(khz * 1000u)) return false;
+    sleep_ms(40);                      // let the AGC settle after the tune
+
+    uint32_t sum = 0u;
+    uint8_t  n = 0u, rmax = 0u, smax = 0u;
+    for (uint8_t i = 0; i < samples; i++) {
+        uint8_t r = 0u, sn = 0u;
+        if (si4732_read_rsq(&r, &sn)) {
+            sum += r; n++;
+            if (r  > rmax) rmax = r;
+            if (sn > smax) smax = sn;
+        }
+        sleep_ms(10);
+    }
+    if (n == 0u) return false;
+
+    if (rssi_avg) *rssi_avg = (uint8_t)(sum / n);
+    if (rssi_max) *rssi_max = rmax;
+    if (snr_max)  *snr_max  = smax;
+    return true;
+}
+
 bool si4732_get_xoscen(void) { return s_xoscen; }
 
 uint16_t si4732_get_antcap(void) { return s_antcap; }

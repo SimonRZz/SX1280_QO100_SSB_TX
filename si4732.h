@@ -64,6 +64,12 @@ uint32_t si4732_get_khz(void);
 // an output — so this offset is what stands in for GPS discipline on the
 // receive side. Its TCXO is ±2 ppm, roughly ±10 kHz at 23 °C and ±30 kHz over
 // the full temperature range, so one calibration holds for a session.
+// Tunes to a frequency and averages `samples` quality readings, reporting the
+// mean RSSI plus the peak RSSI and SNR. A single read swings far too much to
+// compare frequencies with: the same spot gave 64 and then 0 seconds apart.
+bool     si4732_probe_khz(uint32_t khz, uint8_t samples,
+                          uint8_t *rssi_avg, uint8_t *rssi_max, uint8_t *snr_max);
+
 // Why the last call failed. Never NULL.
 const char *si4732_last_error(void);
 
