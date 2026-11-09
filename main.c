@@ -2094,8 +2094,14 @@ static void cdc_handle_line(char *line) {
                 return;
             }
             long steps = (f1 - f0) / st + 1;
-            if (steps > 64) {
-                cdc_printf("ERR: %ld steps is too many (max 64) — use a coarser step\r\n",
+            // 64 was chosen when a sweep was a handful of points for a known
+            // frequency. Hunting an unknown one wants a whole band at the
+            // resolution of the filter, which 64 cannot express: 900 kHz in
+            // 2 kHz steps is 451 points. Each point is eight averaged reads
+            // and costs about 0.3 s, so 512 is roughly two and a half
+            // minutes - long, but it is the user who asked for it.
+            if (steps > 512) {
+                cdc_printf("ERR: %ld steps is too many (max 512) — use a coarser step\r\n",
                            steps);
                 return;
             }
