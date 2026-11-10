@@ -80,8 +80,13 @@
 // megahertz from a 19.5 MHz IF, and holds the front-end AGC down. 36 MHz is
 // the same PLL B through an even integer divider and puts the leakage 16 MHz
 // away instead. See gpsdo_set_rclk_mhz(), which moves the other end.
-static uint32_t s_rclk_hz    = 25000000u;
-static uint16_t s_rclk_presc = 800u;        // 25e6 / 800 = 31250 Hz exactly
+// 32.768 kHz with prescaler 1: the chip's own default, and what every design
+// this SSB patch was written for runs on. With 25 MHz the part held a wrong
+// idea of its own clock for the whole patch upload - REFCLK_FREQ defaults to
+// 32768 and we corrected it only afterwards - and the patched DSP then wedged
+// on the first tune. That was the fault, for weeks.
+static uint32_t s_rclk_hz    = 32768u;
+static uint16_t s_rclk_presc = 1u;
 
 // Smallest exact divisor that lands REFCLK inside the window. Exactness
 // matters: a remainder here is not a rounding detail, it becomes a fixed
