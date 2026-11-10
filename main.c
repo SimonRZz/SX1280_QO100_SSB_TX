@@ -1929,11 +1929,27 @@ static void rx_status_print(void) {
                       "Start it with 'rx am' or 'rx usb'.\r\n");
 }
 
+// Twelve, not six. Six was enough while every command was a verb and a value,
+// and "rx raw" broke that: "rx raw 4 13 00 02 01" is seven words, so the last
+// byte was dropped and the command went out short. Two clock-register reads
+// then returned the same answer because the same truncated command had been
+// sent twice, which read as a result and was not one.
+//
+// Three words for "rx raw <length>" plus eight command bytes, and one spare.
+#define CDC_MAX_ARGS 12
+
 static void cdc_handle_line(char *line) {
-    char *argv[6] = {0};
+    char *argv[CDC_MAX_ARGS] = {0};
     int argc = 0;
 
-    for (char *t = strtok(line, " \t\r\n"); t && argc < 6; t = strtok(NULL, " \t\r\n")) {
+    for (char *t = strtok(line, " \t\r\n"); t; t = strtok(NULL, " \t\r\n")) {
+        if (argc >= CDC_MAX_ARGS) {
+            // Never silently again: a truncated command is worse than a
+            // refused one, because it answers.
+            cdc_printf("ERR: too many words (max %d) — nothing was sent\r\n",
+                       CDC_MAX_ARGS);
+            return;
+        }
         argv[argc++] = t;
     }
     if (argc == 0) return;
@@ -2074,7 +2090,12 @@ static void cdc_handle_line(char *line) {
             long rl = strtol(argv[2], NULL, 10);
             if (rl < 0 || rl > 16) { cdc_write_str("ERR: response length 0..16\r\n"); return; }
             uint8_t cmd[8]; size_t n = 0;
-            for (int i = 3; i < argc && n < sizeof cmd; i++)
+            if ((size_t)(argc - 3) > sizeof cmd) {
+                cdc_printf("ERR: at most %u command bytes — nothing was sent\r\n",
+                           (unsigned)sizeof cmd);
+                return;
+            }
+            for (int i = 3; i < argc; i++)
                 cmd[n++] = (uint8_t)strtol(argv[i], NULL, 16);
             if (n == 0) { cdc_write_str("ERR: rx raw <resp_bytes> <hex> [hex ...]\r\n"); return; }
             si4732_raw(cmd, n, (size_t)rl);
