@@ -80,13 +80,17 @@
 // megahertz from a 19.5 MHz IF, and holds the front-end AGC down. 36 MHz is
 // the same PLL B through an even integer divider and puts the leakage 16 MHz
 // away instead. See gpsdo_set_rclk_mhz(), which moves the other end.
-// 32.768 kHz with prescaler 1: the chip's own default, and what every design
-// this SSB patch was written for runs on. With 25 MHz the part held a wrong
-// idea of its own clock for the whole patch upload - REFCLK_FREQ defaults to
-// 32768 and we corrected it only afterwards - and the patched DSP then wedged
-// on the first tune. That was the fault, for weeks.
-static uint32_t s_rclk_hz    = 32768u;
-static uint16_t s_rclk_presc = 1u;
+// 36 MHz / 1125 = 32000 Hz. An integer MultiSynth divisor off PLL B, and
+// sixteen megahertz clear of a 19.5 MHz IF.
+//
+// 32.768 kHz also works, and it is what fixed SSB first - but a 32.768 kHz
+// square wave has harmonics every 32.768 kHz right across the shortwave
+// spectrum, and at 19.4 MHz that is the 592nd of them with its neighbours
+// 32 kHz either side. It lifted the receiver's noise floor from 2-13 dBuV to
+// a flat 43, which is a comb laid over exactly the band being searched. The
+// cure was worse than the disease.
+static uint32_t s_rclk_hz    = 36000000u;
+static uint16_t s_rclk_presc = 1125u;
 
 // Smallest exact divisor that lands REFCLK inside the window. Exactness
 // matters: a remainder here is not a rounding detail, it becomes a fixed
@@ -137,11 +141,15 @@ static bool          s_stc_ok    = false; // last tune reported seek/tune comple
 // library uses 1 and calls it "a condition for loading the patch", so while SSB
 // refuses to tune this stays switchable rather than asserted.
 static bool          s_xoscen    = false;
-// XOSCEN for the PATCH power-up only. The reference hardcodes 0b00110001 in
-// patchPowerUp() - XOSCEN=1 - and uses the real clock type for the second,
-// operational power-up. It does that even on boards with no crystal, so this
-// driver using one setting for both never tested that sequence at all.
-static bool          s_xoscen_patch = false;
+// XOSCEN for the PATCH power-up only, and it defaults ON because it is what
+// makes SSB work here. The reference hardcodes 0b00110001 in patchPowerUp()
+// and uses the real clock type for the operational power-up; this driver used
+// one setting for both and so never ran that sequence at all.
+//
+// It is the half of the fix that costs nothing. The other half - feeding a
+// real 32.768 kHz - works too and was found first, but its harmonics bury the
+// IF. With this bit set, the reference can stay high and clean.
+static bool          s_xoscen_patch = true;
 // Antenna tuning capacitor sent with every tune. 0 = the chip tunes its own
 // varactor, which is what Silicon Labs recommends and what a medium-wave
 // loopstick wants. A short wire or a 50 ohm feed from a mixer has no

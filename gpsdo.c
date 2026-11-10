@@ -95,10 +95,12 @@ static uint8_t s_si_addr = 0x00u;
 static bool s_loOn   = false;  // CLK0, 144 MHz, mixer LO
 static bool s_rclkOn = false;  // CLK2, 25 MHz, Si4732 reference clock
 static uint8_t s_rclkDrive = 3u;  // IDRV field of CLK2_CTRL: 0=2mA .. 3=8mA
-// 0 = 32.768 kHz, which is what the Si4732 expects by default and the only
-// setting under which its SSB patch survives a tune. 25 and 36 MHz are kept
-// for comparison. See si5351_write_pllb_and_ms2().
-static uint8_t s_rclkMhz   = 0u;
+// 36 MHz: integer MultiSynth divisor off PLL B and sixteen megahertz clear of
+// the IF. 0 marks 32.768 kHz, which also makes the SSB patch work but lays a
+// comb of harmonics every 32.768 kHz across the whole shortwave band - it
+// raised the receiver's noise floor by thirty decibels. 25 MHz is kept for
+// comparison. See si5351_write_pllb_and_ms2().
+static uint8_t s_rclkMhz   = 36u;
 static bool s_pllbReady = false;  // PLL B + MS0/MS2 configured yet?
 
 #define SI_REG_STATUS      0u    // Device status (read-only)
