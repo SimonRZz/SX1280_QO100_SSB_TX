@@ -1238,8 +1238,8 @@ void si4732_diag_print(void)
     // SSB the same column reports whether the read-back frequency matches
     // what was asked for, which is the honest equivalent.
     if (s_read_khz == SI_KHZ_NOT_READ) {
-        si_log("[SI4732]   tune %s at %lu kHz  (no read-back in SSB: asking the "
-               "chip stops it answering)",
+        si_log("[SI4732]   tune %s at %lu kHz  (SSB does not read the tuner back; "
+               "rssi below is the real check)",
                s_stc_ok ? "ok" : "NO CTS AFTERWARDS", (unsigned long)s_khz);
     } else {
         si_log("[SI4732]   tuner reports %u kHz, tune %s  (asked for %lu kHz)",

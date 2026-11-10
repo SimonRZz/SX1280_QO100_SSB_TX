@@ -1896,8 +1896,8 @@ static bool rx_ensure_rclk(void)
 {
     if (gpsdo_rclk_enabled()) return true;
     if (gpsdo_set_rclk_enabled(true)) {
-        cdc_printf("NOTE: reference clock was off — CLK2 (%u MHz) enabled\r\n",
-                   gpsdo_rclk_mhz());
+        cdc_printf("NOTE: reference clock was off — CLK2 (%lu Hz) enabled\r\n",
+                   (unsigned long)si4732_rclk_hz());
         return true;
     }
     cdc_write_str("WARN: no reference clock on Si4732 pin 13 (SI5351 unreachable).\r\n"
