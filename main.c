@@ -1504,8 +1504,9 @@ static void cmd_help(void) {
         "  rx scan [from] [to] [step]  - sweep in kHz and print a level table,\r\n"
         "                         8 averaged reads each. Default 19400 20100 50.\r\n"
         "  rx raw <n> <hex...>  - send a raw command, read n response bytes, dump them\r\n"
-        "  rx ssbtest           - walk the SSB bring-up one command at a time and\r\n"
-        "                         report the chip status after each\r\n"
+        "  rx ssbtest [rev|rsq|tune] - run the real bring-up with a status read after\r\n"
+        "                         every step, then ask ONE command and stop\r\n"
+        "  rx xoscpatch <0|1>   - XOSCEN for the patch POWER_UP only (reference uses 1)\r\n"
         "  rx mon [0|1]         - receive audio into the headphones (Si4732 LOUT -> GP27).\r\n"
         "                         Takes the ADC from the microphone, so transmit audio\r\n"
         "                         switches to PC while it is on.\r\n"
@@ -2062,8 +2063,22 @@ static void cdc_handle_line(char *line) {
             return;
         }
         if (streqi(argv[1], "ssbtest")) {
+            int probe = 0;
+            if (argc >= 3) {
+                if      (streqi(argv[2], "rev"))  probe = 0;
+                else if (streqi(argv[2], "rsq"))  probe = 1;
+                else if (streqi(argv[2], "tune")) probe = 2;
+                else { cdc_write_str("ERR: rx ssbtest [rev|rsq|tune]\r\n"); return; }
+            }
             rx_ensure_rclk();
-            si4732_ssb_bringup_test();
+            si4732_ssb_bringup_test(probe);
+            return;
+        }
+        // rx xoscpatch 0|1 — XOSCEN for the patch POWER_UP only.
+        if (streqi(argv[1], "xoscpatch")) {
+            if (argc >= 3) si4732_set_xoscen_patch(strtol(argv[2], NULL, 10) != 0);
+            cdc_printf("OK xoscen(patch)=%d  xoscen(operating)=%d\r\n",
+                       si4732_get_xoscen_patch() ? 1 : 0, si4732_get_xoscen() ? 1 : 0);
             return;
         }
         if (streqi(argv[1], "diag")) {

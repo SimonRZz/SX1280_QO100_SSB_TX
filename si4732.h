@@ -83,6 +83,12 @@ int32_t  si4732_get_cal_hz(void);
 // the SSB patch, so this is switchable while that is unresolved. Takes effect
 // on the next power-up.
 void     si4732_set_xoscen(bool on);
+
+// XOSCEN for the patch POWER_UP alone. The reference library hardcodes it to 1
+// there and uses the real clock type for the operating power-up, even on
+// boards with no crystal. Using one setting for both never tested that.
+void     si4732_set_xoscen_patch(bool on);
+bool     si4732_get_xoscen_patch(void);
 bool     si4732_get_xoscen(void);
 
 // Antenna tuning capacitor, sent with every tune. Defaults to 1, as the
@@ -163,7 +169,12 @@ void     si4732_diag_print(void);
 // byte after each, ERR bit included. For the open question of why the part
 // stops answering after an SSB tune while AM is fine on the same hardware.
 // Leaves the receiver powered up in USB, however far it got.
-void     si4732_ssb_bringup_test(void);
+// Runs the real bring-up (the same si4732_set_mode() that "rx usb" calls)
+// with a status read after every step, then asks ONE command and stops.
+// probe: 0 = GET_REV, 1 = RSQ_STATUS, 2 = TUNE_STATUS. Only the first command
+// after the sequence means anything - the second is asked of whatever the
+// first left behind.
+void     si4732_ssb_bringup_test(int probe);
 
 // Send an arbitrary command and dump the response. For the bench, when the
 // question is "does this command want a different argument or a different

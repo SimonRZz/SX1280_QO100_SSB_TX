@@ -132,6 +132,11 @@ static bool          s_stc_ok    = false; // last tune reported seek/tune comple
 // library uses 1 and calls it "a condition for loading the patch", so while SSB
 // refuses to tune this stays switchable rather than asserted.
 static bool          s_xoscen    = false;
+// XOSCEN for the PATCH power-up only. The reference hardcodes 0b00110001 in
+// patchPowerUp() - XOSCEN=1 - and uses the real clock type for the second,
+// operational power-up. It does that even on boards with no crystal, so this
+// driver using one setting for both never tested that sequence at all.
+static bool          s_xoscen_patch = false;
 // Antenna tuning capacitor sent with every tune. 0 = the chip tunes its own
 // varactor, which is what Silicon Labs recommends and what a medium-wave
 // loopstick wants. A short wire or a 50 ohm feed from a mixer has no
@@ -171,6 +176,9 @@ static void si_log(const char *fmt, ...)
 // The chip raises CTS in bit 7 of its status byte when it has finished the
 // previous command. Every command must be followed by this wait; the patch
 // upload in particular overruns silently without it.
+// Raw status byte from the last CTS poll, so callers can report what they saw.
+static uint8_t s_last_status = 0u;
+
 static bool si_wait_cts(uint32_t timeout_ms)
 {
     absolute_time_t deadline = make_timeout_time_ms(timeout_ms);
@@ -185,6 +193,7 @@ static bool si_wait_cts(uint32_t timeout_ms)
         uint8_t st = 0u;
         if (i2c_read_blocking(SI_I2C, s_addr, &st, 1, false) == 1) {
             saw_any_ack = true;
+            s_last_status = st;
             // 0xFF is what an idle bus reads: SDA held high by the pull-up
             // because nothing is driving it. Bit 7 is set in that pattern, so
             // a plain "CTS is bit 7" test passes on a chip that is not talking
@@ -195,6 +204,15 @@ static bool si_wait_cts(uint32_t timeout_ms)
             if (st == 0xFFu) {
                 saw_idle_bus = true;
             } else if (st & 0x80u) {
+                // Bit 6 is ERR. 0xC0 means "CTS is back AND I refused what you
+                // sent", and treating that as success made every refusal
+                // invisible - including a refused patch block, which is a DSP
+                // left with broken code. It would run fine until something
+                // asked it to work, which is exactly the shape of this fault.
+                if (st & 0x40u) {
+                    s_last_err = "chip refused the command (ERR bit set)";
+                    return false;
+                }
                 return true;
             }
         }
@@ -206,6 +224,30 @@ static bool si_wait_cts(uint32_t timeout_ms)
         }
         sleep_us(150);
     }
+}
+
+// Verbose bring-up. "rx ssbtest" sets this and then calls the SAME
+// si4732_set_mode() that "rx usb" calls, so the diagnosis cannot drift away
+// from the thing being diagnosed - which it had, by one POWER_UP.
+static bool s_verbose = false;
+
+static bool si_cts_now(const char *what)
+{
+    uint8_t st = 0xFFu;
+    const bool got = (i2c_read_blocking(SI_I2C, s_addr, &st, 1, false) == 1);
+    const char *verdict;
+    if (!got)              verdict = "NO ACK - chip is not on the bus";
+    else if (st == 0xFFu)  verdict = "0xFF - bus idle, nothing answered";
+    else if (!(st & 0x80u))verdict = "busy, CTS still low";
+    else if (st & 0x40u)   verdict = "CTS, but ERR SET - command refused";
+    else                   verdict = "ok";
+    si_log("[SSBTEST] %-20s status=0x%02X  %s", what, st, verdict);
+    return got && st != 0xFFu && (st & 0x80u) && !(st & 0x40u);
+}
+
+static void si_vstep(const char *what)
+{
+    if (s_verbose) (void)si_cts_now(what);
 }
 
 static bool si_cmd(const uint8_t *buf, size_t len)
@@ -331,7 +373,13 @@ static bool si_download_patch(void)
             return false;
         }
         if (!si_wait_cts(50u)) {
-            s_last_err = "patch stalled";
+            si_log("[SI4732] PATCH FAILED at block %u of %u (byte offset %u), "
+                   "status=0x%02X: %s",
+                   (unsigned)(off / 8u + 1u), (unsigned)(SSB_PATCH_SIZE / 8u),
+                   (unsigned)off, s_last_status, s_last_err);
+            si_log("[SI4732]   a refused block leaves the DSP with broken code. "
+                   "The patch id can still read back.");
+            s_last_err = "patch block refused";
             return false;
         }
     }
@@ -402,7 +450,7 @@ static bool si_power_up(bool with_patch)
     const uint8_t b[3] = {
         CMD_POWER_UP,
         (uint8_t)((with_patch ? PU_PATCH : 0u)
-                  | (s_xoscen ? PU_XOSCEN : 0u)
+                  | ((with_patch ? s_xoscen_patch : s_xoscen) ? PU_XOSCEN : 0u)
                   | PU_FUNC_AM),
         PU_OPMODE_ANALOG
     };
@@ -413,7 +461,18 @@ static bool si_power_up(bool with_patch)
     // The library waits 50 ms here before touching the chip again, and the
     // patch upload that follows is unforgiving about being rushed.
     sleep_ms(50);
-    return si_wait_cts(500u);
+    if (si_wait_cts(500u)) return true;
+
+    // The reference powers up a SECOND time after the patch, onto a part that
+    // is already running, and AN332 says a POWER_UP in that state is refused.
+    // It evidently does not matter there, so say so and carry on rather than
+    // abort a sequence that works for everyone else.
+    if ((s_last_status & 0xC0u) == 0xC0u) {
+        si_log("[SI4732] note: POWER_UP refused (ERR), status=0x%02X - continuing",
+               s_last_status);
+        return true;
+    }
+    return false;
 }
 
 // Waits for the seek/tune-complete flag. The tune command is acknowledged long
@@ -509,7 +568,15 @@ static bool si_tune(void)
         sleep_ms(40);
         s_read_khz = SI_KHZ_NOT_READ;
         s_stc_ok   = si_wait_cts(200u);
-        s_last_err = s_stc_ok ? err_before : "no CTS after the SSB tune";
+        if (!s_stc_ok) {
+            // Used to return true here, so "rx usb" reported success over a
+            // receiver that had stopped answering and the !R line quietly
+            // showed rssi=-1. A tune the chip did not acknowledge is a failed
+            // tune.
+            s_last_err = "no CTS after the SSB tune";
+            return false;
+        }
+        s_last_err = err_before;
         return true;
     }
 
@@ -630,13 +697,18 @@ bool si4732_set_mode(si4732_mode_t mode)
     // thousands of working receivers run.
     if (!si_power_up(want_patch)) { s_on = false; return false; }
 
+si_vstep("after POWER_UP");
+
 #ifdef SI4732_SSB_PATCH
     if (want_patch && !si_download_patch()) { s_on = false; return false; }
 #endif
 
+    si_vstep("after patch");
+
     // While the patch id is still readable: after the second power-up it is
     // not, so this is the only moment the upload can be confirmed at all.
     if (!si_read_rev(want_patch)) { s_on = false; return false; }
+    si_vstep("after GET_REV");
 
     s_mode = mode;
     s_on   = true;
@@ -644,14 +716,18 @@ bool si4732_set_mode(si4732_mode_t mode)
     bool ok = true;
     if (want_patch) {
         ok = si_apply_bandwidth();              // setSSBConfig()
+        si_vstep("after SSB_MODE");
         ok = si_power_up(false) && ok;          // radioPowerUp(), PATCH clear
+        si_vstep("after 2nd POWER_UP");
     }
 
     // Reference clock. The library sends REFCLK_FREQ before the prescaler and
     // only after that second power-up, which is also when a power-up would
     // have cleared them.
     ok = si_set_prop(PROP_REFCLK_FREQ, (uint16_t)(s_rclk_hz / s_rclk_presc)) && ok;
+    si_vstep("after REFCLK_FREQ");
     ok = si_set_prop(PROP_REFCLK_PRESCALE, s_rclk_presc) && ok;
+    si_vstep("after PRESCALE");
 
     // Soft mute fights weak SSB signals by ducking exactly when you want to
     // hear them. Off.
@@ -660,10 +736,16 @@ bool si4732_set_mode(si4732_mode_t mode)
     // In SSB the bandwidth went in before the second power-up; send it again,
     // since that power-up is entitled to have cleared it.
     ok = si_apply_bandwidth() && ok;
+    si_vstep("after bandwidth");
     ok = si4732_set_volume(s_volume) && ok;
+    si_vstep("after VOLUME");
     ok = si4732_set_mute(s_mute) && ok;
-    if (want_patch) ok = si4732_set_bfo_hz(s_bfo_hz) && ok;
+    if (want_patch) {
+        ok = si4732_set_bfo_hz(s_bfo_hz) && ok;
+        si_vstep("after BFO");
+    }
     ok = si_tune() && ok;
+    si_vstep("after TUNE");
 
     return ok;
 }
@@ -785,6 +867,12 @@ bool si4732_set_antcap(uint16_t cap)
 
 // Takes effect on the next power-up, so re-select the mode afterwards.
 void si4732_set_xoscen(bool on) { s_xoscen = on; }
+
+// XOSCEN used only for the POWER_UP that carries the patch bit. Separate from
+// the operating one because the reference library is: patchPowerUp() sets it
+// unconditionally, radioPowerUp() uses the real clock type.
+void si4732_set_xoscen_patch(bool on) { s_xoscen_patch = on; }
+bool si4732_get_xoscen_patch(void)    { return s_xoscen_patch; }
 
 void si4732_restore(si4732_mode_t mode, uint32_t hz, uint8_t vol,
                     uint16_t bw_hz, int32_t cal_hz)
@@ -947,149 +1035,66 @@ bool si4732_set_rclk_hz(uint32_t hz)
 // The status byte is worth more than CTS alone: bit 6 is ERR, which the part
 // sets when it rejects a command or a property. A property that is valid in
 // AM and not in SSB would show up there and nowhere else.
-static bool si_cts_now(const char *what)
-{
-    uint8_t st = 0xFFu;
-    const bool got = (i2c_read_blocking(SI_I2C, s_addr, &st, 1, false) == 1);
-    const char *verdict;
-    if (!got)              verdict = "NO ACK - chip is not on the bus";
-    else if (st == 0xFFu)  verdict = "0xFF - bus idle, nothing answered";
-    else if (!(st & 0x80u))verdict = "busy, CTS still low";
-    else if (st & 0x40u)   verdict = "CTS, but ERR SET - command refused";
-    else                   verdict = "ok";
-    si_log("[SSBTEST] %-20s status=0x%02X  %s", what, st, verdict);
-    return got && st != 0xFFu && (st & 0x80u) && !(st & 0x40u);
-}
 
-void si4732_ssb_bringup_test(void)
+void si4732_ssb_bringup_test(int probe)
 {
     if (!s_present) { si_log("[SSBTEST] no Si4732 on the bus"); return; }
 #ifndef SI4732_SSB_PATCH
     si_log("[SSBTEST] no SSB patch compiled in - run tools/fetch_ssb_patch.sh");
+    (void)probe;
 #else
-    si_log("[SSBTEST] --- step-by-step SSB bring-up, %lu kHz ---",
-           (unsigned long)s_khz);
+    static const char *k_probe_name[3] = { "GET_REV", "RSQ_STATUS", "TUNE_STATUS" };
+    if (probe < 0 || probe > 2) probe = 0;
 
-    si_hw_reset();
-    si_log("[SSBTEST] probe after reset: %d", (int)si_probe(s_addr));
+    si_log("[SSBTEST] --- bring-up through si4732_set_mode(), probe = %s ---",
+           k_probe_name[probe]);
+    si_log("[SSBTEST] xoscen: patch power-up=%d, operating=%d",
+           (int)s_xoscen_patch, (int)s_xoscen);
 
-    si_log("[SSBTEST] POWER_UP(patch): %d", (int)si_power_up(true));
-    si_cts_now("after POWER_UP");
+    // The SAME call "rx usb" makes. The old version of this test built its own
+    // sequence and had drifted a whole POWER_UP away from the real one, so it
+    // was diagnosing something nobody runs.
+    s_verbose = true;
+    const bool ok = si4732_set_mode(SI4732_MODE_USB);
+    s_verbose = false;
+    si_log("[SSBTEST] set_mode returned %d  (%s)", (int)ok, s_last_err);
 
-    si_log("[SSBTEST] patch upload: %d", (int)si_download_patch());
-    si_cts_now("after patch");
-
-    s_on   = true;
-    s_mode = SI4732_MODE_USB;
-
-    si_log("[SSBTEST] GET_REV: %d", (int)si_read_rev(true));
-    si_cts_now("after GET_REV");
-
-    si_log("[SSBTEST] REFCLK_PRESCALE: %d",
-           (int)si_set_prop(PROP_REFCLK_PRESCALE, s_rclk_presc));
-    si_cts_now("after PRESCALE");
-
-    si_log("[SSBTEST] REFCLK_FREQ: %d",
-           (int)si_set_prop(PROP_REFCLK_FREQ, (uint16_t)(s_rclk_hz / s_rclk_presc)));
-    si_cts_now("after REFCLK_FREQ");
-
-    si_log("[SSBTEST] AM_SOFT_MUTE_MAX: %d",
-           (int)si_set_prop(PROP_AM_SOFT_MUTE_MAX_AT, 0u));
-    si_cts_now("after SOFT_MUTE");
-
-    si_log("[SSBTEST] SSB_MODE+bandwidth: %d", (int)si_apply_bandwidth());
-    si_cts_now("after SSB_MODE");
-
-    si_log("[SSBTEST] RX_VOLUME: %d", (int)si_set_prop(PROP_RX_VOLUME, s_volume));
-    si_cts_now("after VOLUME");
-
-    si_log("[SSBTEST] SSB_BFO: %d", (int)si_set_prop(PROP_SSB_BFO, 0u));
-    si_cts_now("after BFO");
-
-    // The tune itself, by hand, so a CTS timeout inside si_cmd() cannot hide
-    // what the chip did with it.
-    {
-        const uint16_t khz = (uint16_t)s_khz;
-        const uint8_t tf[6] = { CMD_TUNE_FREQ, (uint8_t)(TUNE_SB_USB | TUNE_FAST),
-                                (uint8_t)(khz >> 8), (uint8_t)khz,
-                                (uint8_t)(s_antcap >> 8), (uint8_t)s_antcap };
-        const int w = i2c_write_blocking(SI_I2C, s_addr, tf, sizeof tf, false);
-        si_log("[SSBTEST] SSB_TUNE_FREQ (FAST) written: %d of %u bytes",
-               w, (unsigned)sizeof tf);
+    if (!si_cts_now("before the probe")) {
+        si_log("[SSBTEST] the chip was already gone before the probe - the fault");
+        si_log("[SSBTEST]   is in the sequence above, not in %s.", k_probe_name[probe]);
+        s_on = false;
+        return;
     }
-    sleep_ms(10);  si_cts_now("10 ms after tune");
-    sleep_ms(90);  si_cts_now("100 ms after tune");
-    sleep_ms(400); si_cts_now("500 ms after tune");
 
-    // GET_REV first, and this is the whole point of the run. It returns nine
-    // bytes and it works BEFORE the tune - we have seen the patch id come back
-    // from it every single time. If it still works here, then response reads
-    // as such are fine after an SSB tune and the fault is in 0x42/0x43/0x47
-    // specifically. If it dies here too, the tune has wedged the part for any
-    // command that answers, and the three are innocent.
-    {
-        const uint8_t gr[1] = { CMD_GET_REV };
-        uint8_t rv[9] = { 0 };
-        int w = i2c_write_blocking(SI_I2C, s_addr, gr, 1, false);
+    // ONE probe, and then stop. Whatever is asked second is asked of a part
+    // that the first one may already have stopped, which is how four "rx raw"
+    // lines once all reported the same dead chip. For another command: "rx am"
+    // to recover, then "rx ssbtest <name>" again.
+    uint8_t r[9] = { 0 };
+    int w = 0, n = 0;
+    if (probe == 0) {
+        const uint8_t c[1] = { CMD_GET_REV };
+        w = i2c_write_blocking(SI_I2C, s_addr, c, 1, false);
         sleep_ms(10);
-        int r = i2c_read_blocking(SI_I2C, s_addr, rv, sizeof rv, false);
-        si_log("[SSBTEST] GET_REV after tune: wrote %d read %d -> "
-               "%02X %02X %02X %02X %02X %02X %02X %02X %02X",
-               w, r, rv[0], rv[1], rv[2], rv[3], rv[4], rv[5], rv[6], rv[7], rv[8]);
-    }
-    si_cts_now("after GET_REV");
-
-    // Then the three suspects, each with the status read between them so one
-    // cannot be blamed for the damage done by the one before.
-    {
-        const uint8_t rq[2] = { CMD_RSQ_STATUS, 0x00u };
-        uint8_t rr[6] = { 0 };
-        int w = i2c_write_blocking(SI_I2C, s_addr, rq, 2, false);
+        n = i2c_read_blocking(SI_I2C, s_addr, r, 9, false);
+    } else if (probe == 1) {
+        const uint8_t c[2] = { CMD_RSQ_STATUS, 0x00u };
+        w = i2c_write_blocking(SI_I2C, s_addr, c, 2, false);
         sleep_ms(10);
-        int r = i2c_read_blocking(SI_I2C, s_addr, rr, sizeof rr, false);
-        si_log("[SSBTEST] RSQ 6 bytes: wrote %d read %d -> %02X %02X %02X %02X %02X %02X",
-               w, r, rr[0], rr[1], rr[2], rr[3], rr[4], rr[5]);
-    }
-    si_cts_now("after RSQ");
-
-    si_log("[SSBTEST] TUNE_STATUS: %d  -> %u kHz",
-           (int)si_read_tune_status(), (unsigned)s_read_khz);
-    si_cts_now("after TUNE_STATUS");
-
-    // Does a BARE POWER_UP bring it back, with no hardware reset?
-    //
-    // That separates the two remaining explanations, and they need opposite
-    // remedies. A wedged DSP needs the reset line. A part that has dropped out
-    // and is waiting to be started again is what a supply dip looks like from
-    // here - and the SSB patch begins drawing its working current at exactly
-    // the moment we lose it, the tune, which no AM session ever reaches.
-    si_log("[SSBTEST] --- recovery: POWER_UP alone, no reset line ---");
-    {
-        const uint8_t pu[3] = { CMD_POWER_UP,
-                                (uint8_t)((s_xoscen ? PU_XOSCEN : 0u) | PU_FUNC_AM),
-                                PU_OPMODE_ANALOG };
-        const int w = i2c_write_blocking(SI_I2C, s_addr, pu, sizeof pu, false);
-        si_log("[SSBTEST] POWER_UP written: %d of %u bytes", w, (unsigned)sizeof pu);
-        sleep_ms(50);
-    }
-    const bool back = si_cts_now("after bare POWER_UP");
-    if (back) {
-        const uint8_t gr[1] = { CMD_GET_REV };
-        uint8_t rv[9] = { 0 };
-        i2c_write_blocking(SI_I2C, s_addr, gr, 1, false);
-        sleep_ms(10);
-        const int r = i2c_read_blocking(SI_I2C, s_addr, rv, sizeof rv, false);
-        si_log("[SSBTEST] GET_REV now: read %d -> %02X %02X %02X %02X %02X %02X %02X %02X %02X",
-               r, rv[0], rv[1], rv[2], rv[3], rv[4], rv[5], rv[6], rv[7], rv[8]);
-        si_log("[SSBTEST] CAME BACK FROM A POWER_UP ALONE. The chip was not");
-        si_log("[SSBTEST]   wedged, it had dropped out. Measure 3V3 at pin 14.");
+        n = i2c_read_blocking(SI_I2C, s_addr, r, 6, false);
     } else {
-        si_log("[SSBTEST] still dead without the reset line: a genuine lock-up,");
-        si_log("[SSBTEST]   not a supply dip.");
+        const uint8_t c[2] = { CMD_TUNE_STATUS, 0x01u };
+        w = i2c_write_blocking(SI_I2C, s_addr, c, 2, false);
+        sleep_ms(10);
+        n = i2c_read_blocking(SI_I2C, s_addr, r, 8, false);
     }
-    s_on = false;      // whatever state it is in, it is not a tuned receiver
+    si_log("[SSBTEST] %s: wrote %d, read %d -> %02X %02X %02X %02X %02X %02X %02X %02X %02X",
+           k_probe_name[probe], w, n,
+           r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8]);
+    (void)si_cts_now("after the probe");
 
-    si_log("[SSBTEST] --- the first line that is not ok is the culprit ---");
+    si_log("[SSBTEST] --- one probe per run. 'rx am', then test the next one. ---");
+    s_on = false;
 #endif
 }
 
