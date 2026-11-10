@@ -95,7 +95,7 @@ static uint8_t s_si_addr = 0x00u;
 static bool s_loOn   = false;  // CLK0, 144 MHz, mixer LO
 static bool s_rclkOn = false;  // CLK2, 25 MHz, Si4732 reference clock
 static uint8_t s_rclkDrive = 3u;  // IDRV field of CLK2_CTRL: 0=2mA .. 3=8mA
-static uint8_t s_rclkMhz   = 25u; // 25 or 36 — see si5351_write_ms2()
+static uint8_t s_rclkMhz   = 25u; // 25 or 36 — see si5351_write_pllb_and_ms2()
 static bool s_pllbReady = false;  // PLL B + MS0/MS2 configured yet?
 
 #define SI_REG_STATUS      0u    // Device status (read-only)
@@ -258,16 +258,48 @@ static bool si5351_init_clocks(void)
 // integer divisor, lets the MultiSynth run in integer mode, which is quieter
 // again. The Si4732 does not care which it gets: it divides down to about
 // 32 kHz either way (800 and 1125 both divide exactly).
-static bool si5351_write_ms2(void)
+// 32.768 kHz needs a different PLL B as well, so this writes both.
+//
+// Every reference design for this patch clocks the part from a 32.768 kHz
+// watch crystal. 25 MHz / 800 and 36 MHz / 1125 are structurally the same
+// thing - a high clock through the prescaler - and they behaved identically,
+// which says less than it looked like it did. A direct 32.768 kHz with
+// prescaler 1 is the case that has never been tried.
+//
+//   PLL B = 24 MHz x (32 + 96/125) = 786.432 MHz   (a=32, b=96, c=125)
+//   MS2   = 375 (integer), R = 64
+//   786.432e6 / 375 / 64 = 32768 Hz exactly
+//
+// It costs CLK0: 144 MHz is not an integer divisor of 786.432 MHz, so the
+// mixer LO is switched off while this is selected.
+static bool si5351_write_pllb_and_ms2(void)
 {
-    static const uint8_t ms2_25[8] = {
+    static const uint8_t pllb_864[8] = {            // 24 x 36      = 864 MHz
+        0x00u, 0x01u, 0x00u, 0x10u, 0x00u, 0x00u, 0x00u, 0x00u
+    };
+    static const uint8_t pllb_786[8] = {            // 24 x 32.768  = 786.432 MHz
+        0x00u, 0x7Du, 0x00u, 0x0Eu, 0x62u, 0x00u, 0x00u, 0x26u
+    };
+    static const uint8_t ms0_144[8] = {             // 864 / 6      = 144 MHz
+        0x00u, 0x01u, 0x00u, 0x01u, 0x00u, 0x00u, 0x00u, 0x00u
+    };
+    static const uint8_t ms2_25[8] = {              // 864 / (34+14/25)
         0x00u, 0x19u, 0x00u, 0x0Fu, 0x47u, 0x00u, 0x00u, 0x11u
     };
-    static const uint8_t ms2_36[8] = {
+    static const uint8_t ms2_36[8] = {              // 864 / 24
         0x00u, 0x01u, 0x00u, 0x0Au, 0x00u, 0x00u, 0x00u, 0x00u
     };
-    const bool integer = (s_rclkMhz == 36u);
-    if (!si_write_regs(SI_REG_MS2_BASE, integer ? ms2_36 : ms2_25, 8u)) return false;
+    static const uint8_t ms2_32k[8] = {             // 786.432 / 375, R = 64
+        0x00u, 0x01u, 0x60u, 0xB9u, 0x80u, 0x00u, 0x00u, 0x00u
+    };
+
+    const bool low = (s_rclkMhz == 0u);             // 0 marks 32.768 kHz
+    if (!si_write_regs(SI_REG_PLLB_BASE, low ? pllb_786 : pllb_864, 8u)) return false;
+    if (!si_write_regs(SI_REG_MS0_BASE,  ms0_144, 8u)) return false;
+
+    const uint8_t *ms2 = low ? ms2_32k : (s_rclkMhz == 36u) ? ms2_36 : ms2_25;
+    const bool integer = low || (s_rclkMhz == 36u);
+    if (!si_write_regs(SI_REG_MS2_BASE, ms2, 8u)) return false;
 
     // CLK2: PDN=0, MS2_INT per the divisor, MS_SRC=PLL B, CLK_SRC=MS2, IDRV.
     // 8 mA, because 2 mA left the Si4732 answering on I2C but refusing to tune.
@@ -279,19 +311,7 @@ static bool si5351_init_pllb(void)
 {
     if (s_pllbReady) return true;
 
-    // PLL B: p1=4096=0x1000, p2=0, p3=1  →  24 MHz × 36 = 864 MHz
-    static const uint8_t pllb[8] = {
-        0x00u, 0x01u, 0x00u, 0x10u, 0x00u, 0x00u, 0x00u, 0x00u
-    };
-    if (!si_write_regs(SI_REG_PLLB_BASE, pllb, 8u)) return false;
-
-    // MS0 (CLK0): p1=256=0x0100  →  864 ÷ 6 = 144 MHz, integer, even divider
-    static const uint8_t ms0[8] = {
-        0x00u, 0x01u, 0x00u, 0x01u, 0x00u, 0x00u, 0x00u, 0x00u
-    };
-    if (!si_write_regs(SI_REG_MS0_BASE, ms0, 8u)) return false;
-
-    if (!si5351_write_ms2()) return false;
+    if (!si5351_write_pllb_and_ms2()) return false;
 
     // CLK0: PDN=0, INT=1, PLL B, CLK_SRC=MS0, 8 mA — the mixer LO lives on the
     // 5th harmonic, which only exists because the edges are steep.
@@ -310,6 +330,9 @@ static bool si5351_init_pllb(void)
 bool gpsdo_set_lo_enabled(bool on)
 {
     if (s_si_addr == 0x00u) return false;
+    // PLL B is at 786.432 MHz for the 32.768 kHz reference and cannot make
+    // 144 MHz from it.
+    if (on && s_rclkMhz == 0u) return false;
     if (on && !si5351_init_pllb()) return false;
     bool prev = s_loOn;
     s_loOn = on;
@@ -351,7 +374,7 @@ bool gpsdo_set_rclk_drive(uint8_t ma)
     s_rclkDrive = idrv;
     // Through the same writer, so the integer-mode bit cannot drift out of
     // step with the divisor currently loaded.
-    if (!si5351_write_ms2()) { s_rclkDrive = prev; return false; }
+    if (!si5351_write_pllb_and_ms2()) { s_rclkDrive = prev; return false; }
     return true;
 }
 
@@ -363,15 +386,19 @@ bool gpsdo_set_rclk_drive(uint8_t ma)
 //
 // This moves one end of the link only. si4732_set_rclk_hz() moves the other,
 // and the receiver tunes wrong until both agree.
+// mhz: 25, 36, or 0 for 32.768 kHz.
 bool gpsdo_set_rclk_mhz(uint8_t mhz)
 {
-    if (mhz != 25u && mhz != 36u) return false;
+    if (mhz != 25u && mhz != 36u && mhz != 0u) return false;
     if (s_si_addr == 0x00u) return false;
     if (!si5351_init_pllb()) return false;
 
     uint8_t prev = s_rclkMhz;
     s_rclkMhz = mhz;
-    if (!si5351_write_ms2()) { s_rclkMhz = prev; return false; }
+    // 144 MHz is not an integer divisor of 786.432 MHz, so the mixer LO has
+    // no valid setting here. Switch it off rather than emit a wrong frequency.
+    if (mhz == 0u && s_loOn) { s_loOn = false; (void)si_write_oeb(); }
+    if (!si5351_write_pllb_and_ms2()) { s_rclkMhz = prev; return false; }
     return si_write_reg(SI_REG_PLL_RESET, 0x80u);
 }
 

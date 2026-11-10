@@ -1494,9 +1494,9 @@ static void cmd_help(void) {
         "                         'rx on' enables it. The receiver needs it to tune.\r\n"
         "  rclk drive <2|4|6|8> - drive strength in mA. 8 mA at boot; 2 mA left the\r\n"
         "                         Si4732 talking on I2C but refusing to tune.\r\n"
-        "  rclk freq <25|36>    - reference frequency. 25 MHz leaks into the AM input\r\n"
-        "                         at 65 dBuV, five MHz from a 19.5 MHz IF; 36 moves it\r\n"
-        "                         sixteen MHz away. Moves both ends at once.\r\n"
+        "  rclk freq <25|36|32k>- reference frequency. 32k is the 32.768 kHz every\r\n"
+        "                         reference design uses, with prescaler 1; it costs the\r\n"
+        "                         mixer LO. Moves both ends at once.\r\n"
         "  lo [0|1]             - 144 MHz on SI5351 CLK0, OFF at boot; mixer LO is its 5th\r\n"
         "                         harmonic at 720 MHz. On by default.\r\n"
         "  rx                   - receiver status\r\n"
@@ -1995,10 +1995,20 @@ static void cdc_handle_line(char *line) {
     //   rclk [0|1] | rclk drive <mA> | rclk freq <25|36>
     if (streqi(argv[0], "rclk")) {
         if (argc >= 3 && streqi(argv[1], "freq")) {
-            long mhz = strtol(argv[2], NULL, 10);
-            if (mhz != 25 && mhz != 36) {
-                cdc_write_str("ERR: rclk freq 25|36 (MHz)\r\n");
-                return;
+            long mhz; uint32_t hz;
+            if (streqi(argv[2], "32k") || streqi(argv[2], "32768")) {
+                // The clock every reference design for this patch uses, and
+                // the only configuration never tried here: prescaler 1, no
+                // high clock divided down. Costs the mixer LO - 144 MHz is
+                // not an integer divisor of the 786.432 MHz PLL it needs.
+                mhz = 0; hz = 32768u;
+            } else {
+                mhz = strtol(argv[2], NULL, 10);
+                if (mhz != 25 && mhz != 36) {
+                    cdc_write_str("ERR: rclk freq 25|36 (MHz) | 32k\r\n");
+                    return;
+                }
+                hz = (uint32_t)mhz * 1000000u;
             }
             // Both ends or neither: the clock generator and the receiver's
             // idea of it have to agree, or every tuned frequency is wrong by
@@ -2008,15 +2018,23 @@ static void cdc_handle_line(char *line) {
                 cdc_write_str("ERR: SI5351 not reachable\r\n");
                 return;
             }
-            if (!si4732_set_rclk_hz((uint32_t)mhz * 1000000u)) {
+            if (!si4732_set_rclk_hz(hz)) {
                 cdc_printf("ERR: receiver rejected it (%s) — clock put back\r\n",
                            si4732_last_error());
                 gpsdo_set_rclk_mhz((uint8_t)(mhz == 25 ? 36 : 25));
                 return;
             }
-            cdc_printf("OK rclk freq=%u MHz / %u = refclk %lu Hz\r\n",
-                       gpsdo_rclk_mhz(), si4732_rclk_prescale(),
-                       (unsigned long)(si4732_rclk_hz() / si4732_rclk_prescale()));
+            if (mhz == 0) {
+                cdc_printf("OK rclk freq=32768 Hz / %u = refclk %lu Hz\r\n",
+                           si4732_rclk_prescale(),
+                           (unsigned long)(si4732_rclk_hz() / si4732_rclk_prescale()));
+                cdc_write_str("NOTE: mixer LO (CLK0) is off and cannot run at this "
+                              "setting.\r\n      'rclk freq 25' brings it back.\r\n");
+            } else {
+                cdc_printf("OK rclk freq=%u MHz / %u = refclk %lu Hz\r\n",
+                           gpsdo_rclk_mhz(), si4732_rclk_prescale(),
+                           (unsigned long)(si4732_rclk_hz() / si4732_rclk_prescale()));
+            }
             return;
         }
         if (argc >= 3 && streqi(argv[1], "drive")) {
@@ -2035,9 +2053,9 @@ static void cdc_handle_line(char *line) {
                 return;
             }
         }
-        cdc_printf("OK rclk=%d freq=%u MHz drive=%u mA (CLK2 -> Si4732 pin 13; "
+        cdc_printf("OK rclk=%d freq=%lu Hz drive=%u mA (CLK2 -> Si4732 pin 13; "
                    "divided by %u to %lu Hz)\r\n",
-                   gpsdo_rclk_enabled() ? 1 : 0, gpsdo_rclk_mhz(),
+                   gpsdo_rclk_enabled() ? 1 : 0, (unsigned long)si4732_rclk_hz(),
                    gpsdo_rclk_drive(), si4732_rclk_prescale(),
                    (unsigned long)(si4732_rclk_hz() / si4732_rclk_prescale()));
         return;
@@ -2085,9 +2103,10 @@ static void cdc_handle_line(char *line) {
             // Before anything the chip says about itself: whether it has a
             // clock. Without one every figure below it is a zero that means
             // nothing.
-            cdc_printf("[CLK]   CLK2 reference %s, %u MHz, %u mA%s\r\n",
+            cdc_printf("[CLK]   CLK2 reference %s, %lu Hz, %u mA%s\r\n",
                        gpsdo_rclk_enabled() ? "ON" : "OFF",
-                       gpsdo_rclk_mhz(), gpsdo_rclk_drive(),
+                       (unsigned long)si4732_rclk_hz(),
+                       gpsdo_rclk_drive(),
                        gpsdo_rclk_enabled()
                            ? ""
                            : "   <-- the receiver cannot tune; run 'rclk 1'");

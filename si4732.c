@@ -387,8 +387,8 @@ static bool si_download_patch(void)
     sleep_ms(50);   // let the chip digest it before the next command
 
     int ms = (int)(absolute_time_diff_us(t0, get_absolute_time()) / 1000);
-    si_log("[SI4732] SSB patch uploaded: %u bytes in %d ms",
-           (unsigned)SSB_PATCH_SIZE, ms);
+    si_log("[SI4732] SSB patch uploaded: %u bytes, %u blocks, no block refused, %d ms",
+           (unsigned)SSB_PATCH_SIZE, (unsigned)(SSB_PATCH_SIZE / 8u), ms);
     // Fifteen kilobytes of firmware have just been pushed into a running DSP.
     // The first tune after it was coming back as 0 kHz; give the part a
     // moment before asking it to do anything.
@@ -470,6 +470,7 @@ static bool si_power_up(bool with_patch)
     if ((s_last_status & 0xC0u) == 0xC0u) {
         si_log("[SI4732] note: POWER_UP refused (ERR), status=0x%02X - continuing",
                s_last_status);
+        s_last_err = "none";       // not the caller's failure; do not carry it
         return true;
     }
     return false;
