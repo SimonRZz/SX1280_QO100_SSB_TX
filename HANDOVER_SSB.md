@@ -1,5 +1,20 @@
 # Übergabe: Si4732-A10 verriegelt nach jedem SSB-Tune
 
+> **GELÖST am 2026-11-10.** Ursache: `REFCLK_FREQ` steht nach POWER_UP per
+> Vorgabe auf 32768 und `REFCLK_PRESCALE` auf 1, der Treiber korrigierte das
+> aber erst **nach** dem Patch-Upload. Der Chip verbrachte den gesamten Upload
+> mit einer falschen Vorstellung seines eigenen Takts, und die gepatchte DSP
+> hing dann beim ersten Tune. Abhilfe: `XOSCEN=1` nur beim Patch-POWER_UP, so
+> wie es die Referenzbibliothek in `patchPowerUp()` macht. Commits `1b42d8d`
+> und `7cbc24c`.
+>
+> Dieses Dokument bleibt als Protokoll der Fehlersuche stehen — die neun
+> widerlegten Theorien in §5 und die Messfallen in §6 sind weiterhin gültig
+> und ersparen Wiederholungen.
+>
+> **Das offene Problem steht jetzt in `HANDOVER_PEGEL.md`.**
+
+
 **Stand:** 2026-11-09, 21:30 UTC+1
 **Repo:** `SimonRZz/SX1280_QO100_SSB_TX`, Branch `claude/review-upstream-changes-uky0w`
 **Letzter Commit:** `861970a`
