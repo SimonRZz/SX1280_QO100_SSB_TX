@@ -2013,10 +2013,10 @@ static void cdc_handle_line(char *line) {
         if (argc >= 3 && streqi(argv[1], "freq")) {
             long mhz; uint32_t hz;
             if (streqi(argv[2], "32k") || streqi(argv[2], "32768")) {
-                // The clock every reference design for this patch uses, and
-                // the only configuration never tried here: prescaler 1, no
-                // high clock divided down. Costs the mixer LO - 144 MHz is
-                // not an integer divisor of the 786.432 MHz PLL it needs.
+                // What the SSB patch requires. It ignores REFCLK_FREQ: with
+                // 36 MHz / 1125 = 32000 Hz the tuning came out 32768/32000 =
+                // 2.4 % high, which is 470 kHz at 19.6 MHz, and sideband
+                // reported rssi 0 for a carrier AM read at 52 dBuV.
                 mhz = 0; hz = 32768u;
             } else {
                 mhz = strtol(argv[2], NULL, 10);
@@ -2044,8 +2044,6 @@ static void cdc_handle_line(char *line) {
                 cdc_printf("OK rclk freq=32768 Hz / %u = refclk %lu Hz\r\n",
                            si4732_rclk_prescale(),
                            (unsigned long)(si4732_rclk_hz() / si4732_rclk_prescale()));
-                cdc_write_str("NOTE: mixer LO (CLK0) is off and cannot run at this "
-                              "setting.\r\n      'rclk freq 25' brings it back.\r\n");
             } else {
                 cdc_printf("OK rclk freq=%u MHz / %u = refclk %lu Hz\r\n",
                            gpsdo_rclk_mhz(), si4732_rclk_prescale(),

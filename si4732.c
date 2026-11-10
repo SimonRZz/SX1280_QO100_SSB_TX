@@ -80,17 +80,19 @@
 // megahertz from a 19.5 MHz IF, and holds the front-end AGC down. 36 MHz is
 // the same PLL B through an even integer divider and puts the leakage 16 MHz
 // away instead. See gpsdo_set_rclk_mhz(), which moves the other end.
-// 36 MHz / 1125 = 32000 Hz. An integer MultiSynth divisor off PLL B, and
-// sixteen megahertz clear of a 19.5 MHz IF.
+// 32.768 kHz, prescaler 1, and the SSB patch leaves no choice: it ignores
+// REFCLK_FREQ entirely. On 36 MHz / 1125 = 32000 Hz every sideband tune came
+// out 32768/32000 = 2.4 % high, which is 470 kHz at 19.6 MHz - far outside any
+// filter. Sideband then reported rssi 0 for an injected carrier that AM read
+// at 52 dBuV, and looked like a receiver that did not work.
 //
-// 32.768 kHz also works, and it is what fixed SSB first - but a 32.768 kHz
-// square wave has harmonics every 32.768 kHz right across the shortwave
-// spectrum, and at 19.4 MHz that is the 592nd of them with its neighbours
-// 32 kHz either side. It lifted the receiver's noise floor from 2-13 dBuV to
-// a flat 43, which is a comb laid over exactly the band being searched. The
-// cure was worse than the disease.
-static uint32_t s_rclk_hz    = 36000000u;
-static uint16_t s_rclk_presc = 1125u;
+// The cost is a comb: a 32.768 kHz square wave has harmonics every 32.768 kHz
+// across the whole shortwave band, and it lifts the noise floor from 2-13 dBuV
+// to a flat 43. That is fixed on the wire, not here - 1 kOhm in series and
+// 2.2 nF to ground at pin 13 turns the square into the sine a crystal would
+// have given, costing 0.8 dB at 32 kHz and 49 dB at 19.6 MHz.
+static uint32_t s_rclk_hz    = 32768u;
+static uint16_t s_rclk_presc = 1u;
 
 // Smallest exact divisor that lands REFCLK inside the window. Exactness
 // matters: a remainder here is not a rounding detail, it becomes a fixed
