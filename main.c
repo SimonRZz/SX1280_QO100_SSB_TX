@@ -212,6 +212,8 @@ static void    rxmon_task(void);
 static void    rxmon_set(bool on);
 static bool    rxmon_is_on(void);
 static void    rxmon_set_vol(uint8_t pct);
+static bool    rxmon_set_cw(long width_hz, long centre_hz);   // width 0 = off; centre 0 = keep
+static void    rxmon_set_level(uint8_t pct);
 static uint8_t rxmon_vol_pct(void);
 static void    rxmon_set_agc(bool on);
 static bool    rxmon_agc_on(void);
@@ -1523,6 +1525,8 @@ static void cmd_help(void) {
         "                         switches to PC while it is on.\r\n"
         "  rx mon vol <0..100>  - monitor level in the headphones\r\n"
         "  rx mon agc [0|1]     - audio AGC: down fast, up slowly, with a hard limiter\r\n"
+        "  rx mon cw 0|<Hz> [<centre>] - CW audio filter, e.g. 'rx mon cw 150 600'\r\n"
+        "  rx mon level <5..90> - AGC target in % of full scale (default 25)\r\n"
         "  rx agc [on|off|<n>]  - front-end attenuator. The index is attenuation, so 0\r\n"
         "                         is full gain. 'off' pins it open for measuring.\r\n"
         "  rx xosc <0|1>        - POWER_UP crystal-oscillator bit; 0 = external RCLK\r\n"
@@ -2265,6 +2269,20 @@ static void cdc_handle_line(char *line) {
                 long v = strtol(argv[3], NULL, 10);
                 if (v < 0 || v > 100) { cdc_write_str("ERR: rx mon vol 0..100\r\n"); return; }
                 rxmon_set_vol((uint8_t)v);
+            } else if (argc >= 4 && streqi(argv[2], "cw")) {
+                // rx mon cw 0 | rx mon cw <width Hz> [<centre Hz>]
+                long w = strtol(argv[3], NULL, 10);
+                long c = (argc >= 5) ? strtol(argv[4], NULL, 10) : 0;
+                if (!rxmon_set_cw(w, c)) {
+                    cdc_write_str("ERR: rx mon cw 0 | rx mon cw <30..1500 Hz> [<200..2500 Hz centre>]\r\n");
+                    return;
+                }
+            } else if (argc >= 4 && streqi(argv[2], "level")) {
+                // AGC target in percent of full scale. Above ~70 % the
+                // limiter starts to clip speech peaks; for a CW tone it is fine.
+                long v = strtol(argv[3], NULL, 10);
+                if (v < 5 || v > 90) { cdc_write_str("ERR: rx mon level 5..90 (%)\r\n"); return; }
+                rxmon_set_level((uint8_t)v);
             } else if (argc >= 4 && streqi(argv[2], "agc")) {
                 uint8_t v;
                 if (!parse_bool(argv[3], &v)) { cdc_write_str("ERR: rx mon agc 0|1\r\n"); return; }
@@ -3646,6 +3664,39 @@ static float         s_rx_dc      = 0.0f;
 static float         s_rx_env     = 0.0f;   // envelope the AGC follows
 static float         s_rx_gain    = 1.0f;
 static float         s_rxmon_tgt  = 0.25f;  // where the AGC aims, full scale = 1
+
+// CW audio filter in the monitor path. The Si4732's narrowest SSB filter is
+// 500 Hz; a keyed beacon wants far less. Two cascaded RBJ band-pass sections
+// (0 dB at the centre) on the 8 kHz samples, ahead of the AGC, so the AGC
+// then levels the tone rather than the noise around it.
+static bool  s_cw_on  = false;
+static float s_cw_f0  = 600.0f;   // Hz, tone pitch to aim the tuning at
+static float s_cw_bw  = 150.0f;   // Hz, per section
+static float s_cw_b0, s_cw_a1, s_cw_a2;             // b1 = 0, b2 = -b0
+static float s_cw_x1[2], s_cw_x2[2], s_cw_y1[2], s_cw_y2[2];
+
+static void cw_design(void)
+{
+    const float w0 = 2.0f * 3.14159265f * s_cw_f0 / 8000.0f;
+    const float q  = s_cw_f0 / s_cw_bw;
+    const float al = sinf(w0) / (2.0f * q);
+    const float a0 = 1.0f + al;
+    s_cw_b0 = al / a0;
+    s_cw_a1 = -2.0f * cosf(w0) / a0;
+    s_cw_a2 = (1.0f - al) / a0;
+    for (int k = 0; k < 2; k++) { s_cw_x1[k] = s_cw_x2[k] = s_cw_y1[k] = s_cw_y2[k] = 0.0f; }
+}
+
+static inline float cw_filter(float x)
+{
+    for (int k = 0; k < 2; k++) {
+        const float y = s_cw_b0 * (x - s_cw_x2[k]) - s_cw_a1 * s_cw_y1[k] - s_cw_a2 * s_cw_y2[k];
+        s_cw_x2[k] = s_cw_x1[k]; s_cw_x1[k] = x;
+        s_cw_y2[k] = s_cw_y1[k]; s_cw_y1[k] = y;
+        x = y;
+    }
+    return x;
+}
 static uint8_t       s_rxmon_pct  = 40;
 static volatile float s_rx_peak   = 0.0f;   // after the AGC, for the meter
 static volatile float s_rx_clip   = 0.0f;   // before it, to show headroom
@@ -3717,8 +3768,11 @@ static void rxmon_task(void)
         s_rx_dc += 0.002f * (x - s_rx_dc);          // one-pole HPF, fc ~ 2.5 Hz
         x -= s_rx_dc;
 
+        // Clipping is judged on what the ADC delivered, before any filtering.
+        if (fabsf(x) > s_rx_clip) s_rx_clip = fabsf(x);
+        if (s_cw_on) x = cw_filter(x);
+
         const float ax = fabsf(x);
-        if (ax > s_rx_clip) s_rx_clip = ax;
         s_rx_env += (ax > s_rx_env ? 0.08f : 0.0006f) * (ax - s_rx_env);
 
         if (s_rxmon_agc) {
@@ -3734,6 +3788,10 @@ static void rxmon_task(void)
         }
 
         float y = x * s_rx_gain;
+        // Nothing to listen to while the Si4732 is powered down - and with no
+        // signal the AGC winds up to +36 dB and plays the ADC's own noise and
+        // the supply ripple on its bias divider. Silence instead.
+        if (!si4732_is_on()) { y = 0.0f; s_rx_gain = 1.0f; s_rx_env = 0.0f; }
         // The AGC follows an envelope, and a transient outruns any envelope.
         // This limiter is what actually keeps a crash out of your ears.
         if (y >  0.98f) y =  0.98f;
@@ -3773,6 +3831,21 @@ static void rxmon_set_vol(uint8_t pct)
     s_rxmon_vol = (int32_t)pct * 32767 / 100;
 }
 
+static bool rxmon_set_cw(long w, long c)
+{
+    if (w == 0) { s_cw_on = false; return true; }
+    if (c == 0) c = (long)s_cw_f0;
+    if (w < 30 || w > 1500 || c < 200 || c > 2500 || w >= c) return false;
+    s_cw_bw = (float)w;
+    s_cw_f0 = (float)c;
+    s_cw_on = false;          // the producer must not run a half-written filter
+    cw_design();
+    s_cw_on = true;
+    return true;
+}
+
+static void rxmon_set_level(uint8_t pct) { s_rxmon_tgt = (float)pct / 100.0f; }
+
 static void rxmon_diag_print(void)
 {
     const float pk = s_rx_peak, cl = s_rx_clip;
@@ -3783,6 +3856,10 @@ static void rxmon_diag_print(void)
                s_rxmon_agc ? "on" : "off", (double)s_rx_gain,
                (double)(20.0f * log10f(s_rx_gain > 1e-4f ? s_rx_gain : 1e-4f)),
                (double)cl, (double)pk);
+    cdc_printf("            level=%u%%  cw-filter=%s",
+               (unsigned)(s_rxmon_tgt * 100.0f + 0.5f), s_cw_on ? "ON" : "off");
+    if (s_cw_on) cdc_printf(" %.0f Hz +-%.0f Hz", (double)s_cw_f0, (double)(s_cw_bw / 2.0f));
+    cdc_write_str("\r\n");
     cdc_printf("            ADC on %s  ring=%lu/%u  underruns=%lu\r\n",
                s_adc_input ? "GP27 (Si4732 LOUT)" : "GP26 (microphone)",
                (unsigned long)((s_rxo_wr - s_rxo_rd) & RXO_MASK),

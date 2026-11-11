@@ -1389,12 +1389,10 @@ class SX1280ControlApp(ttk.Frame):
     _RX_STEPS = [("10 Hz", 0.01), ("100 Hz", 0.1), ("1 kHz", 1.0), ("5 kHz", 5.0), ("9 kHz", 9.0)]
     _RX_BW_AM  = ["1000", "1800", "2000", "2500", "3000", "4000", "6000"]
     _RX_BW_SSB = ["500", "1000", "1200", "2200", "3000", "4000"]
-    # The beacons are placed relative to the BPSK beacon as heard on the
-    # bench, because their absolute IF depends on two uncalibrated
-    # oscillators (LNB TCXO, TinySA as mixer LO) and an earlier absolute
-    # table turned out to be 250 kHz off - the beacon spacing exactly.
-    # Heard: BPSK in USB at 19360 kHz, BFO 0, LO 720.137 MHz.
-    _RX_BEACONS = [("Bake unten (CW)", -250.0), ("BPSK", 0.0), ("Bake oben (CW)", +250.0)]
+    # The beacons are placed relative to the lower CW beacon as heard on the
+    # bench (19359.8 kHz with the TinySA as mixer LO at 720.137 MHz), because
+    # their absolute IF depends on two uncalibrated oscillators. Offsets in kHz.
+    _RX_BEACONS = [("Bake unten (CW)", 0.0), ("BPSK", 250.0), ("Bake oben (CW)", 500.0)]
 
     def _build_rx_tab(self):
         sc = ScrollableFrame(self.notebook)
@@ -1422,7 +1420,11 @@ class SX1280ControlApp(ttk.Frame):
         self.rx_scan_from = tk.StringVar(value="19350")
         self.rx_scan_to   = tk.StringVar(value="19366")
         self.rx_scan_step = tk.StringVar(value="1")
-        self.rx_bpsk_var  = tk.StringVar(value="19360")
+        self.rx_ref_var   = tk.StringVar(value="19359.8")
+        self.rx_cw_var    = tk.BooleanVar(value=False)
+        self.rx_cwbw_var  = tk.StringVar(value="150")
+        self.rx_cwf0_var  = tk.StringVar(value="600")
+        self.rx_level_var = tk.DoubleVar(value=25)
 
         # --- live status ---
         st = ttk.LabelFrame(tab, text="Status", padding=10)
@@ -1499,17 +1501,17 @@ class SX1280ControlApp(ttk.Frame):
             row=5, column=0, columnspan=6, sticky="ew", pady=(8, 0))
 
         # --- beacons ---
-        bk = ttk.LabelFrame(tab, text="QO-100-Baken (USB, BFO 0)", padding=10)
+        bk = ttk.LabelFrame(tab, text="QO-100-Baken (USB)", padding=10)
         bk.grid(row=2, column=0, sticky="ew", pady=(0, 8))
-        ttk.Label(bk, text="BPSK-Bake gehört bei (kHz):").grid(row=0, column=0, columnspan=2, sticky="w")
-        ttk.Entry(bk, textvariable=self.rx_bpsk_var, width=10).grid(row=0, column=2, sticky="w", padx=4)
+        ttk.Label(bk, text="Untere CW-Bake gehört bei (kHz):").grid(row=0, column=0, columnspan=2, sticky="w")
+        ttk.Entry(bk, textvariable=self.rx_ref_var, width=10).grid(row=0, column=2, sticky="w", padx=4)
         for i, (name, off) in enumerate(self._RX_BEACONS):
-            ttk.Button(bk, text=f"{name}\nBPSK {off:+.0f} kHz",
-                       command=lambda o=off: self._rx_goto_beacon(o)).grid(
+            ttk.Button(bk, text=f"{name}\n+{off:.0f} kHz",
+                       command=lambda o=off, n=name: self._rx_goto_beacon(o, "CW" in n)).grid(
                 row=1, column=i, padx=4, pady=(6, 0), sticky="w")
-        ttk.Label(bk, text="Die Knöpfe rechnen ±250 kHz um die eingetragene BPSK-Frequenz. "
-                           "Woran du die Baken erkennst: BPSK ist ein gleichmäßiges, raues "
-                           "Schnarren ohne Pausen; die CW-Baken sind ein Ton mit Morse-Pausen.",
+        ttk.Label(bk, text="CW-Baken werden so abgestimmt, dass der Ton auf der Mitte des CW-Filters "
+                           "liegt. Mit ◀ ▶ in 10-Hz-Schritten nachstimmen, bis er am lautesten ist. "
+                           "CW: Ton mit Morse-Pausen; BPSK: gleichmäßiges Schnarren.",
                   foreground="gray", wraplength=620, justify="left").grid(
             row=2, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
@@ -1529,6 +1531,22 @@ class SX1280ControlApp(ttk.Frame):
         LabeledScale(mf, "Lautstärke", self.rx_monvol_var, 0, 100, 1,
                      lambda v: self._send_cmd_safe(f"rx mon vol {int(v)}"), "{:.0f} %").grid(
             row=1, column=0, sticky="ew", pady=(8, 0))
+        LabeledScale(mf, "AGC-Zielpegel", self.rx_level_var, 5, 90, 1,
+                     lambda v: self._send_cmd_safe(f"rx mon level {int(v)}"), "{:.0f} %").grid(
+            row=3, column=0, sticky="ew", pady=(4, 0))
+        cwf = ttk.Frame(mf)
+        cwf.grid(row=4, column=0, sticky="w", pady=(8, 0))
+        ttk.Checkbutton(cwf, text="CW-Filter", variable=self.rx_cw_var,
+                        command=self._rx_send_cw).pack(side="left")
+        ttk.Label(cwf, text="  Breite (Hz):").pack(side="left")
+        cwb = ttk.Combobox(cwf, textvariable=self.rx_cwbw_var, values=["80", "150", "250", "400"],
+                           state="readonly", width=5)
+        cwb.pack(side="left")
+        cwb.bind("<<ComboboxSelected>>", lambda _e: self._rx_send_cw())
+        ttk.Label(cwf, text="  Tonhöhe (Hz):").pack(side="left")
+        cwc = ttk.Entry(cwf, textvariable=self.rx_cwf0_var, width=6)
+        cwc.pack(side="left")
+        cwc.bind("<Return>", lambda _e: self._rx_send_cw())
         ttk.Label(mf, text="Der Monitor belegt den ADC; die Sendequelle wird dabei auf PC umgeschaltet.",
                   foreground="gray").grid(row=2, column=0, sticky="w", pady=(4, 0))
 
@@ -1602,20 +1620,31 @@ class SX1280ControlApp(ttk.Frame):
             return
         self._send_cmd_safe(f"rx bfo {hz}")
 
-    def _rx_goto_beacon(self, offset_khz):
-        try:
-            bpsk = float(self.rx_bpsk_var.get().replace(",", "."))
-        except ValueError:
-            self._log("[RX] BPSK-Frequenz in kHz eintragen", "error")
+    def _rx_send_cw(self):
+        if not self.rx_cw_var.get():
+            self._send_cmd_safe("rx mon cw 0")
             return
-        # Order matters: "rx freq" resets the BFO, so the BFO goes last.
+        self._send_cmd_safe(f"rx mon cw {self.rx_cwbw_var.get()} {self.rx_cwf0_var.get().strip()}")
+
+    def _rx_goto_beacon(self, offset_khz, is_cw):
+        try:
+            ref = float(self.rx_ref_var.get().replace(",", "."))
+        except ValueError:
+            self._log("[RX] Frequenz der unteren CW-Bake in kHz eintragen", "error")
+            return
         if self.rx_mode_var.get() != "usb":
             self.rx_mode_var.set("usb")
             self._rx_set_mode()
-        self.rx_freq_var.set(f"{bpsk + offset_khz:.1f}")
+        # In USB a carrier at C is heard at C - f. A CW beacon is put on the
+        # CW filter's centre pitch; BPSK, ~800 Hz wide, about 1 kHz up.
+        # No "rx bfo" afterwards: the firmware carries the sub-kHz part of
+        # "rx freq" in the BFO, and a separate BFO command would undo it.
+        try:
+            pitch = float(self.rx_cwf0_var.get()) / 1000.0 if is_cw else 1.0
+        except ValueError:
+            pitch = 0.6
+        self.rx_freq_var.set(f"{ref + offset_khz - pitch:.2f}")
         self._rx_set_freq()
-        self.rx_bfo_var.set("0")
-        self._rx_set_bfo()
 
     def _rx_live_tick(self):
         try:
