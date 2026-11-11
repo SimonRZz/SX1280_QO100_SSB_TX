@@ -1390,7 +1390,7 @@ class SX1280ControlApp(ttk.Frame):
     _RX_BW_AM  = ["1000", "1800", "2000", "2500", "3000", "4000", "6000"]
     _RX_BW_SSB = ["500", "1000", "1200", "2200", "3000", "4000"]
     # The beacons are placed relative to the lower CW beacon as heard on the
-    # bench (19359.8 kHz with the TinySA as mixer LO at 720.137 MHz), because
+    # bench (heard at 19359.8 with the old mirrored BFO sign, which was really 19360.2 kHz, with the TinySA as mixer LO at 720.137 MHz), because
     # their absolute IF depends on two uncalibrated oscillators. Offsets in kHz.
     _RX_BEACONS = [("Bake unten (CW)", 0.0), ("BPSK", 250.0), ("Bake oben (CW)", 500.0)]
 
@@ -1420,7 +1420,7 @@ class SX1280ControlApp(ttk.Frame):
         self.rx_scan_from = tk.StringVar(value="19350")
         self.rx_scan_to   = tk.StringVar(value="19366")
         self.rx_scan_step = tk.StringVar(value="1")
-        self.rx_ref_var   = tk.StringVar(value="19359.8")
+        self.rx_ref_var   = tk.StringVar(value="19360.2")
         self.rx_cw_var    = tk.BooleanVar(value=False)
         self.rx_cwbw_var  = tk.StringVar(value="150")
         self.rx_cwf0_var  = tk.StringVar(value="600")

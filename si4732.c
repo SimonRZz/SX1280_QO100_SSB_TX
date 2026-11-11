@@ -830,9 +830,14 @@ bool si4732_tune_hz(uint32_t hz)
     uint32_t khz = (uint32_t)((want + 500) / 1000);          // nearest kHz
     int32_t  rem = (int32_t)(want - (int64_t)khz * 1000);    // -500..+499 Hz
 
+    // The BFO counts the other way round from the dial: a positive offset
+    // moves the received signal DOWN. ATS-Mini, which is calibrated on the air
+    // by many users, does setSSBBfo(-(fine + cal)) for the same reason. With
+    // +rem here, everything below the kHz was mirrored: 19359.8 really tuned
+    // 19360.2, and crossing a kHz boundary jumped by almost 2 kHz.
     s_hz     = hz;
     s_khz    = khz;
-    s_bfo_hz = (int16_t)rem;
+    s_bfo_hz = (int16_t)(-rem);
 
     if (!s_on) return true;       // remembered, applied at power-up
 
@@ -940,6 +945,8 @@ void si4732_restore(si4732_mode_t mode, uint32_t hz, uint8_t vol,
         hz = 19500000u;
     s_hz  = hz;
     s_khz = (uint32_t)(((int64_t)hz + s_cal_hz + 500) / 1000);
+    // The sub-kHz part as well, or a reboot rounds the dial to whole kHz.
+    s_bfo_hz = (int16_t)(-(int32_t)(((int64_t)hz + s_cal_hz) - (int64_t)s_khz * 1000));
 }
 
 bool si4732_set_bfo_hz(int16_t hz)
