@@ -38,6 +38,16 @@ Dokument bleibt als Protokoll der Fehlersuche stehen.
 > Überlagerungston. Er verschwindet zusammen mit der Bake, wenn der
 > TinySA-LO abgeschaltet wird — das zeigt die LO-Abhängigkeit, lokalisiert
 > die Quelle aber nicht. Firmware wird künftig andernorts gebaut.
+>
+> **Ideen für später (Operator, 2026-11-11):**
+> * **Stromversorgung 12 V.** Heute hängt alles an USB-VBUS; die
+>   3,3-V-Schiene des Pico war schon mehrfach verdächtig.
+> * **Pico als vollwertiges USB-Soundinterface wie beim QMX**, Ein- und
+>   Ausgang in WSJT-X direkt wählbar. Bestand: Die Firmware meldet sich
+>   bereits als UAC1-**Lautsprecher** (PC → Gerät, 48 kHz, 16 bit stereo,
+>   ohne Feedback-Endpunkt) — das ist der Sendeweg. Es fehlt die Gegenrichtung,
+>   ein UAC1-**Mikrofon** (Gerät → PC) mit dem Empfängerton von ADC1, also
+>   ein zweites Audio-Interface im selben Deskriptor. Entspricht Aufgabe #12.
 
 ---
 
