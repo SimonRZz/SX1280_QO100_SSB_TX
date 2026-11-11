@@ -1459,6 +1459,7 @@ static void cmd_help(void) {
         "  save          - write freq/ppm/txpwr/mode/DSP to flash now (autosaves 5 s after idle)\r\n"
         "  defaults      - restore compile-time defaults and save\r\n"
         "  oled flip 0|1 - rotate the display by 180 degrees (default 1)\r\n"
+        "  smps pwm 0|1  - Pico regulator: 1 = fixed PWM (less 3V3 ripple into the ADC)\r\n"
         "  oled off|on   - panel and charge pump off/on, refresh stopped (noise test)\r\n"
         "  oled freeze 0|1 - stop the I2C refresh, panel stays lit (noise test)\r\n"
         "  ptt 0|1       - 1: MIC mode transmits only while a CW paddle contact is held\r\n"
@@ -2497,6 +2498,23 @@ static void cdc_handle_line(char *line) {
         return;
     }
     // Display orientation: oled flip 0|1
+    // smps pwm 0|1 — Pico SMPS mode via GPIO23 (PS pin). 0 = power-save
+    // (board default: bursts at light load, pulsing ripple on 3V3), 1 = fixed
+    // PWM (steady switching, far less low-frequency ripple, a few mA more).
+    // The RX audio ADC sits on a divider from 3V3, so that ripple goes
+    // straight into the headphones. Not persisted.
+    if (streqi(argv[0], "smps")) {
+        if (argc >= 3 && streqi(argv[1], "pwm")) {
+            uint8_t v;
+            if (!parse_bool(argv[2], &v)) { cdc_write_str("ERR: smps pwm 0|1\r\n"); return; }
+            gpio_init(23);
+            gpio_set_dir(23, GPIO_OUT);
+            gpio_put(23, v != 0);
+        }
+        cdc_printf("OK smps pwm=%u (GPIO23; 1 = fixed PWM, 0 = power-save)\r\n",
+                   (unsigned)gpio_get_out_level(23));
+        return;
+    }
     if (streqi(argv[0], "oled")) {
         // oled off | oled on | oled freeze 0|1
         if (argc == 2 && (streqi(argv[1], "off") || streqi(argv[1], "on"))) {
