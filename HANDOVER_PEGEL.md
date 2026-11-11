@@ -400,11 +400,42 @@ Empfangsseite auf Display-Seite 4 (lange drücken): Drehregler stimmt ab,
 Kacheln für Schrittweite, Modus, Bandbreite, Monitorpegel, Si4732-Pegel,
 Audio-AGC.
 
-**Takterzeugung:** PLL A = 884 MHz → CLK1 52 MHz (SX1280) **und** MS2 für
-32,768 kHz (884 MHz / (210 + 12485/16384) / 128, exakt). PLL B = 864 MHz →
-CLK0 144 MHz (Mischer-LO). 25 und 36 MHz kommen aus PLL B.
+**Takterzeugung:** PLL A = 884 MHz → CLK1 52 MHz (SX1280), wird von der
+Empfangsseite nie angefasst. PLL B → CLK0 144 MHz (Mischer-LO) und CLK2
+(Referenz):
+
+| `rclk freq` | PLL B | MS2 | im Chip | Mischer-LO |
+|---|---|---|---|---|
+| `25` | 864 MHz | ÷(34+14/25) | 25 MHz / 800 = 31250 Hz | ja |
+| `36` | 864 MHz | ÷24 | 36 MHz / 1125 = 32000 Hz | ja |
+| `32k` | **786,432 MHz** | ÷375, R=64 | 32768 Hz / 1 | **nein** |
+| `32m` | 864 MHz | ÷(26+47/128) | 32,768 MHz / 1000 = 32768 Hz | ja |
+
+**Korrektur:** Frühere Commit-Texte (`1b42d8d`, `a05e1ef`) und eine frühere
+Fassung dieses Dokuments behaupten, die 32,768 kHz kämen aus PLL A und der
+Mischer-LO bleibe dabei erhalten. Das stimmt nicht — das Änderungsskript brach
+ab, ohne zu schreiben. Bei `32k` steht PLL B auf 786,432 MHz und CLK0 ist aus.
 
 ---
+
+## 11a. Nachtrag 2026-11-11
+
+* Mit echten 32768 Hz liefert der eingespeiste Träger (19,609 MHz, −60 dBm) in
+  USB **rssi ≈ 47 dBµV, snr 9–12**, und `rx raw 3 47` (AGC_STATUS) antwortet
+  `81 00 00`: CTS und STC gesetzt, AGC automatisch, Dämpfungsindex 0. Die
+  AGC-Abfrage ist in SSB deshalb wieder freigegeben.
+* Dass der Patch intern fest 32768 Hz annimmt, ist eine **Hypothese**, die den
+  Befund erklärt (2,4 % Abstimmfehler bei 32000 Hz). Unabhängig bestätigt ist
+  nur: Empfang mit 32768 Hz ja, mit 32000 Hz nein.
+* **Offener Versuch, eingebaut, ungetestet:** `rclk freq 32m` — CLK2 =
+  32,768 MHz, Prescaler 1000, REFCLK_FREQ 32768. Dieselbe interne Referenz,
+  aber ohne den Oberwellenkamm des langsamen Rechtecks und mit erhaltenem
+  Mischer-LO. Gelingt das, entfällt der RC-Tiefpass aus §8.1.
+* **Der Bedarf an 15–25 dB Zusatzverstärkung ist nicht nachgewiesen.** Alle
+  Pegelmessungen an der Antenne liefen in AM (das eine CW-Bake nicht hörbar
+  macht) oder in SSB mit falscher Abstimmung bzw. unter dem Kamm. Ein sauber
+  abgestimmter SSB-Empfang mit ruhigem Boden hat den Satelliten noch nie
+  gesehen — erst der entscheidet, ob §8.2/§8.3 überhaupt nötig sind.
 
 ## 12. Vorgehen
 

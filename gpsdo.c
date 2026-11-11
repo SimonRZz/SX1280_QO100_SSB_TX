@@ -299,12 +299,24 @@ static bool si5351_write_pllb_and_ms2(void)
     static const uint8_t ms2_32k[8] = {             // 786.432 / 375, R = 64
         0x00u, 0x01u, 0x60u, 0xB9u, 0x80u, 0x00u, 0x00u, 0x00u
     };
+    // 32.768 MHz: 864 / (26 + 47/128), p1=2863 (0x0B2F), p2=0, p3=128.
+    // 864e6 * 128 / 3375 = 32 768 000 Hz exactly. Divided by 1000 in the
+    // Si4732 that is the 32768 Hz its SSB patch assumes whatever REFCLK_FREQ
+    // says - but as a 32 MHz clock, whose harmonics start at 65 MHz instead
+    // of lying every 32.768 kHz across the IF. PLL B stays at 864 MHz, so
+    // CLK0 keeps its 144 MHz and the mixer LO survives.
+    static const uint8_t ms2_32m[8] = {
+        0x00u, 0x80u, 0x00u, 0x0Bu, 0x2Fu, 0x00u, 0x00u, 0x00u
+    };
 
     const bool low = (s_rclkMhz == 0u);             // 0 marks 32.768 kHz
     if (!si_write_regs(SI_REG_PLLB_BASE, low ? pllb_786 : pllb_864, 8u)) return false;
     if (!si_write_regs(SI_REG_MS0_BASE,  ms0_144, 8u)) return false;
 
-    const uint8_t *ms2 = low ? ms2_32k : (s_rclkMhz == 36u) ? ms2_36 : ms2_25;
+    const uint8_t *ms2 = low ? ms2_32k
+                       : (s_rclkMhz == 36u) ? ms2_36
+                       : (s_rclkMhz == 32u) ? ms2_32m
+                                            : ms2_25;
     const bool integer = low || (s_rclkMhz == 36u);
     if (!si_write_regs(SI_REG_MS2_BASE, ms2, 8u)) return false;
 
@@ -396,7 +408,8 @@ bool gpsdo_set_rclk_drive(uint8_t ma)
 // mhz: 25, 36, or 0 for 32.768 kHz.
 bool gpsdo_set_rclk_mhz(uint8_t mhz)
 {
-    if (mhz != 25u && mhz != 36u && mhz != 0u) return false;
+    // 0 = 32.768 kHz, 32 = 32.768 MHz, 25 and 36 are what they say.
+    if (mhz != 25u && mhz != 36u && mhz != 0u && mhz != 32u) return false;
     if (s_si_addr == 0x00u) return false;
     if (!si5351_init_pllb()) return false;
 

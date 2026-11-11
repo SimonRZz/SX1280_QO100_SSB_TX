@@ -99,6 +99,13 @@ static uint16_t s_rclk_presc = 1u;
 // multiplicative offset on every frequency the chip tunes.
 static uint16_t si_presc_for(uint32_t rclk_hz)
 {
+    // 32768 Hz first, whenever the clock allows it exactly. The SSB patch
+    // tunes as if the divided reference were 32768 Hz regardless of what
+    // REFCLK_FREQ is told, so any other value in the legal window - 32000
+    // from 36 MHz, 31250 from 25 MHz - puts sideband off by the ratio.
+    if (rclk_hz % 32768u == 0u && rclk_hz / 32768u >= 1u && rclk_hz / 32768u <= 4095u)
+        return (uint16_t)(rclk_hz / 32768u);
+
     uint32_t d = (rclk_hz + SI_REFCLK_MAX - 1u) / SI_REFCLK_MAX;
     if (d < 1u) d = 1u;
     for (; d <= 4095u; d++) {
@@ -982,15 +989,9 @@ bool si4732_read_rsq(uint8_t *rssi_dbuv, uint8_t *snr_db)
 bool si4732_read_agc(bool *disabled, uint8_t *index)
 {
     if (!s_present || !s_on) { s_last_err = "receiver is not powered up"; return false; }
-    // 0x47 is an AM command. TUNE_STATUS taught us what an AM command costs
-    // once the SSB patch is running: CTS goes away and stays away until the
-    // next power-up. The missing agc line in an SSB diagnosis, with the RSQ
-    // read dead right behind it, has exactly that shape. Not sent there.
-    if (s_mode != SI4732_MODE_AM) {
-        s_last_err = "AGC status is an AM command and is not sent in SSB";
-        return false;
-    }
-
+    // Sent in sideband too. It was held back while every answering command
+    // seemed to kill the patched chip; that was the reference clock, and with
+    // a real 32768 Hz "rx raw 3 47" comes back 81 00 00.
     const uint8_t b[1] = { CMD_AGC_STATUS };
     if (!si_cmd(b, sizeof b)) return false;
 
@@ -1226,9 +1227,7 @@ void si4732_diag_print(void)
 
     bool agc_off = false;
     uint8_t agc_idx = 0u;
-    if (s_mode != SI4732_MODE_AM) {
-        si_log("[SI4732]   agc not read in SSB (0x47 is an AM command)");
-    } else if (si4732_read_agc(&agc_off, &agc_idx)) {
+    if (si4732_read_agc(&agc_off, &agc_idx)) {
         si_log("[SI4732]   agc %s, attenuation index %u%s",
                agc_off ? "DISABLED (forced)" : "automatic", agc_idx,
                (!agc_off && agc_idx > 8u)

@@ -1494,9 +1494,9 @@ static void cmd_help(void) {
         "                         'rx on' enables it. The receiver needs it to tune.\r\n"
         "  rclk drive <2|4|6|8> - drive strength in mA. 8 mA at boot; 2 mA left the\r\n"
         "                         Si4732 talking on I2C but refusing to tune.\r\n"
-        "  rclk freq <25|36|32k>- reference frequency. 32k is the 32.768 kHz every\r\n"
-        "                         reference design uses, with prescaler 1; it costs the\r\n"
-        "                         mixer LO. Moves both ends at once.\r\n"
+        "  rclk freq <25|36|32k|32m> - reference. SSB needs 32768 Hz inside the chip:\r\n"
+        "                         32k feeds it directly (costs the mixer LO, and its\r\n"
+        "                         harmonics cover the IF); 32m is 32.768 MHz / 1000.\r\n"
         "  lo [0|1]             - 144 MHz on SI5351 CLK0, OFF at boot; mixer LO is its 5th\r\n"
         "                         harmonic at 720 MHz. On by default.\r\n"
         "  rx                   - receiver status\r\n"
@@ -2018,14 +2018,20 @@ static void cdc_handle_line(char *line) {
                 // 2.4 % high, which is 470 kHz at 19.6 MHz, and sideband
                 // reported rssi 0 for a carrier AM read at 52 dBuV.
                 mhz = 0; hz = 32768u;
+            } else if (streqi(argv[2], "32m")) {
+                // The same 32768 Hz inside the chip, reached as 32.768 MHz
+                // through prescaler 1000 - so without a slow square wave
+                // laying harmonics every 32.768 kHz across the IF.
+                mhz = 32; hz = 32768000u;
             } else {
                 mhz = strtol(argv[2], NULL, 10);
                 if (mhz != 25 && mhz != 36) {
-                    cdc_write_str("ERR: rclk freq 25|36 (MHz) | 32k\r\n");
+                    cdc_write_str("ERR: rclk freq 25|36 (MHz) | 32k | 32m\r\n");
                     return;
                 }
                 hz = (uint32_t)mhz * 1000000u;
             }
+            const uint8_t prev_mhz = gpsdo_rclk_mhz();
             // Both ends or neither: the clock generator and the receiver's
             // idea of it have to agree, or every tuned frequency is wrong by
             // the ratio between them. If the second step fails, put the first
@@ -2037,18 +2043,17 @@ static void cdc_handle_line(char *line) {
             if (!si4732_set_rclk_hz(hz)) {
                 cdc_printf("ERR: receiver rejected it (%s) — clock put back\r\n",
                            si4732_last_error());
-                gpsdo_set_rclk_mhz((uint8_t)(mhz == 25 ? 36 : 25));
+                gpsdo_set_rclk_mhz(prev_mhz);
                 return;
             }
-            if (mhz == 0) {
-                cdc_printf("OK rclk freq=32768 Hz / %u = refclk %lu Hz\r\n",
-                           si4732_rclk_prescale(),
-                           (unsigned long)(si4732_rclk_hz() / si4732_rclk_prescale()));
-            } else {
-                cdc_printf("OK rclk freq=%u MHz / %u = refclk %lu Hz\r\n",
-                           gpsdo_rclk_mhz(), si4732_rclk_prescale(),
-                           (unsigned long)(si4732_rclk_hz() / si4732_rclk_prescale()));
-            }
+            cdc_printf("OK rclk freq=%lu Hz / %u = refclk %lu Hz\r\n",
+                       (unsigned long)si4732_rclk_hz(), si4732_rclk_prescale(),
+                       (unsigned long)(si4732_rclk_hz() / si4732_rclk_prescale()));
+            if (mhz == 0)
+                cdc_write_str("NOTE: mixer LO (CLK0) is off and cannot run at this "
+                              "setting: PLL B is at\r\n      786.432 MHz for it. "
+                              "'rclk freq 32m' gives the same 32768 Hz and keeps "
+                              "the LO.\r\n");
             return;
         }
         if (argc >= 3 && streqi(argv[1], "drive")) {
@@ -2265,11 +2270,6 @@ static void cdc_handle_line(char *line) {
         // apart — at the price of overloading on anything strong, so it is a
         // measurement setting, not a listening one.
         if (streqi(argv[1], "agc")) {
-            if (si4732_get_mode() != SI4732_MODE_AM) {
-                cdc_write_str("ERR: the AGC commands are AM only. In SSB they take the\r\n"
-                              "     chip's CTS away until the next power-up.\r\n");
-                return;
-            }
             if (argc >= 3) {
                 bool ok;
                 if (streqi(argv[2], "on")) {
