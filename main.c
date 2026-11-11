@@ -347,6 +347,12 @@ static volatile uint8_t    g_ui_cursor_idx = 0;            // tile index on the 
 static volatile ui_param_t g_ui_cursor = UI_PARAM_MODE;    // param under the cursor (derived)
 static volatile ui_param_t g_ui_editing = UI_PARAM_MODE;   // which param is being edited
 static volatile uint32_t   g_ui_last_activity_ms = 0;      // for auto-timeout
+// OLED noise isolation, not persisted. g_oled_freeze stops the frame
+// refresh (I2C1 bursts at 5 Hz) but leaves the panel lit; g_oled_off also
+// switches the panel and its charge pump off. Between them they separate the
+// two ways the display can get into a receiver.
+static volatile uint8_t    g_oled_freeze = 0;
+static volatile uint8_t    g_oled_off    = 0;
 static volatile uint8_t    g_oled_flip = 1;                // 180 degree rotation; 1 suits how the box is built
 
 // Blink phase for warnings on the display (2 Hz; the panel refreshes at 5 fps)
@@ -1453,6 +1459,8 @@ static void cmd_help(void) {
         "  save          - write freq/ppm/txpwr/mode/DSP to flash now (autosaves 5 s after idle)\r\n"
         "  defaults      - restore compile-time defaults and save\r\n"
         "  oled flip 0|1 - rotate the display by 180 degrees (default 1)\r\n"
+        "  oled off|on   - panel and charge pump off/on, refresh stopped (noise test)\r\n"
+        "  oled freeze 0|1 - stop the I2C refresh, panel stays lit (noise test)\r\n"
         "  ptt 0|1       - 1: MIC mode transmits only while a CW paddle contact is held\r\n"
         "  src pc|mic    - audio source: USB from PC, or MAX4466 mic on GP26\r\n"
         "  mic [gain <1..50> | gate <0..0.5>] - mic gain and noise-gate threshold\r\n"
@@ -2490,6 +2498,24 @@ static void cdc_handle_line(char *line) {
     }
     // Display orientation: oled flip 0|1
     if (streqi(argv[0], "oled")) {
+        // oled off | oled on | oled freeze 0|1
+        if (argc == 2 && (streqi(argv[1], "off") || streqi(argv[1], "on"))) {
+            const bool on = streqi(argv[1], "on");
+            g_oled_off = on ? 0 : 1;
+            if (on) g_oled_freeze = 0;
+            ssd1306_power(OLED_I2C, on);
+            cdc_printf("OK oled %s (panel and charge pump %s, refresh %s)\r\n",
+                       on ? "on" : "off", on ? "on" : "off", on ? "running" : "stopped");
+            return;
+        }
+        if (argc >= 3 && streqi(argv[1], "freeze")) {
+            uint8_t v;
+            if (!parse_bool(argv[2], &v)) { cdc_write_str("ERR: oled freeze 0|1\r\n"); return; }
+            g_oled_freeze = v;
+            cdc_printf("OK oled freeze=%u (panel stays lit, I2C refresh %s)\r\n",
+                       (unsigned)v, v ? "stopped" : "running");
+            return;
+        }
         if (argc >= 3 && streqi(argv[1], "flip")) {
             uint8_t v;
             if (!parse_bool(argv[2], &v)) { cdc_write_str("ERR: oled flip 0|1\r\n"); return; }
@@ -2499,10 +2525,11 @@ static void cdc_handle_line(char *line) {
                 persist_mark_dirty();
             }
         } else if (argc >= 2) {
-            cdc_write_str("ERR: oled flip 0|1\r\n");
+            cdc_write_str("ERR: oled flip 0|1 | oled on|off | oled freeze 0|1\r\n");
             return;
         }
-        cdc_printf("OK oled flip=%u\r\n", (unsigned)g_oled_flip);
+        cdc_printf("OK oled flip=%u off=%u freeze=%u\r\n", (unsigned)g_oled_flip,
+                   (unsigned)g_oled_off, (unsigned)g_oled_freeze);
         return;
     }
     // SSB push-to-talk: ptt 0|1
@@ -4375,7 +4402,7 @@ static void mic_level_push(void) {
 
 static void ui_service(void) {
     static absolute_time_t oled_next = {0};
-    if (!ssd1306_dma_busy() &&
+    if (!g_oled_freeze && !g_oled_off && !ssd1306_dma_busy() &&
         absolute_time_diff_us(get_absolute_time(), oled_next) <= 0) {
         oled_prepare_frame();
         ssd1306_display_dma(OLED_I2C);
@@ -4592,7 +4619,7 @@ int main(void) {
 
             // OLED refresh during wait
             rxmon_task();
-            if (!ssd1306_dma_busy() &&
+            if (!g_oled_freeze && !g_oled_off && !ssd1306_dma_busy() &&
                 absolute_time_diff_us(get_absolute_time(), oled_next) <= 0) {
                 oled_prepare_frame();
                 ssd1306_display_dma(OLED_I2C);

@@ -178,6 +178,24 @@ void ssd1306_set_flip(i2c_inst_t *i2c, bool flip) {
 }
 
 // ============================================================
+// Panel power. OFF also stops the charge pump, which switches at a few
+// hundred kHz and is the panel's own noise source, independent of the I2C
+// traffic that refreshes it.
+// ============================================================
+void ssd1306_power(i2c_inst_t *i2c, bool on) {
+    while (ssd1306_dma_busy()) tight_loop_contents();
+    if (on) {
+        ssd1306_write_cmd(i2c, 0x8D);   // charge pump
+        ssd1306_write_cmd(i2c, 0x14);   //   on
+        ssd1306_write_cmd(i2c, 0xAF);   // display on
+    } else {
+        ssd1306_write_cmd(i2c, 0xAE);   // display off
+        ssd1306_write_cmd(i2c, 0x8D);   // charge pump
+        ssd1306_write_cmd(i2c, 0x10);   //   off
+    }
+}
+
+// ============================================================
 // Clear
 // ============================================================
 void ssd1306_clear(void) {

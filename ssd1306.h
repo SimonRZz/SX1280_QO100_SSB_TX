@@ -54,6 +54,8 @@ void ssd1306_draw_string_2x(int x, int page, const char *str);
 // Rotate the panel by 180 degrees (segment remap + COM scan direction).
 // Waits for any pending DMA transfer so the command does not collide with it.
 void ssd1306_set_flip(i2c_inst_t *i2c, bool flip);
+// Panel and charge pump on/off. The frame buffer is kept.
+void ssd1306_power(i2c_inst_t *i2c, bool on);
 
 void ssd1306_set_pixel(int x, int y, bool on);
 
