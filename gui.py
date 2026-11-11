@@ -821,6 +821,7 @@ class SX1280ControlApp(ttk.Frame):
         self.notebook.grid(row=1, column=0, sticky="nsew", padx=5, pady=5)
         self._build_dsp_tab()
         self._build_tx_tab()
+        self._build_rx_tab()
         self._build_cw_tab()
         self._build_gpsdo_tab()
         self._build_console_tab()
@@ -1378,6 +1379,273 @@ class SX1280ControlApp(ttk.Frame):
                 self._send_cmd_safe(f"keyer test {1 if self.dev_sttest_var.get() else 0}")
         except (ValueError, tk.TclError) as e:
             self._log(f"[KEYER] invalid value: {e}", "error")
+
+    # ------------------------------------------------------------------
+    # Receiver (Si4732 behind the QO-100 downconverter)
+    # ------------------------------------------------------------------
+    # Commands map 1:1 onto the firmware's "rx ..." console commands; the
+    # live values come from the "!R key=value ..." lines that every "rx"
+    # command answers with. Polling "rx" once a second keeps them current.
+    _RX_STEPS = [("10 Hz", 0.01), ("100 Hz", 0.1), ("1 kHz", 1.0), ("5 kHz", 5.0), ("9 kHz", 9.0)]
+    _RX_BW_AM  = ["1000", "1800", "2000", "2500", "3000", "4000", "6000"]
+    _RX_BW_SSB = ["500", "1000", "1200", "2200", "3000", "4000"]
+    # IF of the QO-100 beacons with the mixer LO at 720.137 MHz and the
+    # Bullseye LNB LO measured at 9750.0043 MHz. In USB the receiver is tuned
+    # a little below the carrier and the BFO sets the pitch.
+    _RX_BEACONS = [("Bake unten (CW)", 19358.0), ("BPSK", 19608.0), ("Bake oben (CW)", 19858.0)]
+
+    def _build_rx_tab(self):
+        sc = ScrollableFrame(self.notebook)
+        self.notebook.add(sc, text="RX")
+        tab = sc.inner
+        tab.columnconfigure(0, weight=1)
+
+        self.rx_on_var    = tk.StringVar(value="—")
+        self.rx_mode_var  = tk.StringVar(value="usb")
+        self.rx_freq_var  = tk.StringVar(value="19358.0")
+        self.rx_step_var  = tk.StringVar(value="1 kHz")
+        self.rx_bw_var    = tk.StringVar(value="2200")
+        self.rx_bfo_var   = tk.StringVar(value="500")
+        self.rx_cal_var   = tk.StringVar(value="0")
+        self.rx_vol_var   = tk.DoubleVar(value=50)
+        self.rx_mon_var   = tk.BooleanVar(value=False)
+        self.rx_monvol_var= tk.DoubleVar(value=50)
+        self.rx_monagc_var= tk.BooleanVar(value=True)
+        self.rx_rclk_var  = tk.StringVar(value="32k")
+        self.rx_lo_var    = tk.BooleanVar(value=False)
+        self.rx_live_var  = tk.BooleanVar(value=True)
+        self.rx_rssi_var  = tk.StringVar(value="—")
+        self.rx_snr_var   = tk.StringVar(value="—")
+        self.rx_state_var = tk.StringVar(value="kein Status")
+        self.rx_scan_from = tk.StringVar(value="19350")
+        self.rx_scan_to   = tk.StringVar(value="19366")
+        self.rx_scan_step = tk.StringVar(value="1")
+
+        # --- live status ---
+        st = ttk.LabelFrame(tab, text="Status", padding=10)
+        st.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        st.columnconfigure(1, weight=1)
+        ttk.Label(st, textvariable=self.rx_state_var, font=("Consolas", 11)).grid(
+            row=0, column=0, columnspan=3, sticky="w")
+        ttk.Label(st, text="RSSI:").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        self.rx_rssi_bar = ttk.Progressbar(st, maximum=80, mode="determinate")
+        self.rx_rssi_bar.grid(row=1, column=1, sticky="ew", padx=6, pady=(6, 0))
+        ttk.Label(st, textvariable=self.rx_rssi_var, width=10).grid(row=1, column=2, sticky="w", pady=(6, 0))
+        ttk.Label(st, text="SNR:").grid(row=2, column=0, sticky="w")
+        self.rx_snr_bar = ttk.Progressbar(st, maximum=40, mode="determinate")
+        self.rx_snr_bar.grid(row=2, column=1, sticky="ew", padx=6)
+        ttk.Label(st, textvariable=self.rx_snr_var, width=10).grid(row=2, column=2, sticky="w")
+        bf = ttk.Frame(st)
+        bf.grid(row=3, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        ttk.Checkbutton(bf, text="Live (1 s)", variable=self.rx_live_var).pack(side="left")
+        ttk.Button(bf, text="Abfragen", command=lambda: self._send_cmd_safe("rx")).pack(side="left", padx=6)
+        ttk.Button(bf, text="Diagnose", command=lambda: self._send_cmd_safe("rx diag")).pack(side="left")
+        ttk.Label(bf, text="  (Diagnose erscheint im Console-Reiter)", foreground="gray").pack(side="left")
+
+        # --- receiver ---
+        rf = ttk.LabelFrame(tab, text="Empfänger", padding=10)
+        rf.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        rf.columnconfigure(5, weight=1)
+        ttk.Label(rf, text="Modus:").grid(row=0, column=0, sticky="w")
+        for i, m in enumerate(("am", "usb", "lsb")):
+            ttk.Radiobutton(rf, text=m.upper(), value=m, variable=self.rx_mode_var,
+                            command=self._rx_set_mode).grid(row=0, column=1 + i, sticky="w", padx=(0, 6))
+        ttk.Button(rf, text="Aus", command=lambda: self._send_cmd_safe("rx off")).grid(row=0, column=4, sticky="w")
+        ttk.Label(rf, text="SSB lädt den Patch neu, das dauert ca. 3 s.", foreground="gray").grid(
+            row=0, column=5, sticky="w", padx=(10, 0))
+
+        ttk.Label(rf, text="Frequenz (kHz):").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        fe = ttk.Entry(rf, textvariable=self.rx_freq_var, width=12, font=("Consolas", 11))
+        fe.grid(row=1, column=1, columnspan=2, sticky="w", pady=(8, 0))
+        fe.bind("<Return>", lambda _e: self._rx_set_freq())
+        ttk.Button(rf, text="Setzen", command=self._rx_set_freq).grid(row=1, column=3, sticky="w", pady=(8, 0))
+        sf = ttk.Frame(rf)
+        sf.grid(row=1, column=4, columnspan=2, sticky="w", pady=(8, 0))
+        ttk.Button(sf, text="◀", width=3, command=lambda: self._rx_step(-1)).pack(side="left")
+        ttk.Combobox(sf, textvariable=self.rx_step_var, values=[n for n, _ in self._RX_STEPS],
+                     state="readonly", width=7).pack(side="left", padx=4)
+        ttk.Button(sf, text="▶", width=3, command=lambda: self._rx_step(+1)).pack(side="left")
+
+        ttk.Label(rf, text="Bandbreite (Hz):").grid(row=2, column=0, sticky="w", pady=(8, 0))
+        self.rx_bw_combo = ttk.Combobox(rf, textvariable=self.rx_bw_var, values=self._RX_BW_SSB,
+                                        state="readonly", width=8)
+        self.rx_bw_combo.grid(row=2, column=1, columnspan=2, sticky="w", pady=(8, 0))
+        self.rx_bw_combo.bind("<<ComboboxSelected>>",
+                              lambda _e: self._send_cmd_safe(f"rx bw {self.rx_bw_var.get()}"))
+
+        ttk.Label(rf, text="BFO (Hz):").grid(row=3, column=0, sticky="w", pady=(8, 0))
+        be = ttk.Entry(rf, textvariable=self.rx_bfo_var, width=8)
+        be.grid(row=3, column=1, columnspan=2, sticky="w", pady=(8, 0))
+        be.bind("<Return>", lambda _e: self._rx_set_bfo())
+        ttk.Button(rf, text="Setzen", command=self._rx_set_bfo).grid(row=3, column=3, sticky="w", pady=(8, 0))
+        ttk.Label(rf, text="wird bei jeder Frequenzänderung neu gesetzt", foreground="gray").grid(
+            row=3, column=4, columnspan=2, sticky="w", pady=(8, 0), padx=(6, 0))
+
+        ttk.Label(rf, text="Kalibrierung (Hz):").grid(row=4, column=0, sticky="w", pady=(8, 0))
+        ce = ttk.Entry(rf, textvariable=self.rx_cal_var, width=8)
+        ce.grid(row=4, column=1, columnspan=2, sticky="w", pady=(8, 0))
+        ce.bind("<Return>", lambda _e: self._send_cmd_safe(f"rx cal {self.rx_cal_var.get().strip()}"))
+        ttk.Button(rf, text="Setzen",
+                   command=lambda: self._send_cmd_safe(f"rx cal {self.rx_cal_var.get().strip()}")).grid(
+            row=4, column=3, sticky="w", pady=(8, 0))
+        ttk.Label(rf, text="LNB-Ablage; gemessen −4300", foreground="gray").grid(
+            row=4, column=4, columnspan=2, sticky="w", pady=(8, 0), padx=(6, 0))
+
+        LabeledScale(rf, "Si4732-Pegel", self.rx_vol_var, 0, 63, 1,
+                     lambda v: self._send_cmd_safe(f"rx vol {int(v)}"), "{:.0f}").grid(
+            row=5, column=0, columnspan=6, sticky="ew", pady=(8, 0))
+
+        # --- beacons ---
+        bk = ttk.LabelFrame(tab, text="QO-100-Baken (Mischer-LO 720,137 MHz, USB, BFO 500)", padding=10)
+        bk.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+        for i, (name, khz) in enumerate(self._RX_BEACONS):
+            ttk.Button(bk, text=f"{name}\n{khz:.1f} kHz",
+                       command=lambda k=khz: self._rx_goto_beacon(k)).grid(row=0, column=i, padx=4, sticky="w")
+        ttk.Label(bk, text="Die CW-Baken sind getastet: ein Ton mit Pausen ist richtig. "
+                           "Liegt der TinySA-Quarz daneben, mit den Pfeiltasten in 1-kHz-Schritten suchen.",
+                  foreground="gray", wraplength=620, justify="left").grid(
+            row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
+
+        # --- monitor ---
+        mf = ttk.LabelFrame(tab, text="Kopfhörer-Monitor", padding=10)
+        mf.grid(row=3, column=0, sticky="ew", pady=(0, 8))
+        mf.columnconfigure(0, weight=1)
+        top = ttk.Frame(mf)
+        top.grid(row=0, column=0, sticky="w")
+        ttk.Checkbutton(top, text="Empfängerton auf den Kopfhörer", variable=self.rx_mon_var,
+                        command=lambda: self._send_cmd_safe(f"rx mon {1 if self.rx_mon_var.get() else 0}")
+                        ).pack(side="left")
+        ttk.Checkbutton(top, text="Audio-AGC", variable=self.rx_monagc_var,
+                        command=lambda: self._send_cmd_safe(f"rx mon agc {1 if self.rx_monagc_var.get() else 0}")
+                        ).pack(side="left", padx=(16, 0))
+        ttk.Button(top, text="Status", command=lambda: self._send_cmd_safe("rx mon")).pack(side="left", padx=(16, 0))
+        LabeledScale(mf, "Lautstärke", self.rx_monvol_var, 0, 100, 1,
+                     lambda v: self._send_cmd_safe(f"rx mon vol {int(v)}"), "{:.0f} %").grid(
+            row=1, column=0, sticky="ew", pady=(8, 0))
+        ttk.Label(mf, text="Der Monitor belegt den ADC; die Sendequelle wird dabei auf PC umgeschaltet.",
+                  foreground="gray").grid(row=2, column=0, sticky="w", pady=(4, 0))
+
+        # --- clocks ---
+        kf = ttk.LabelFrame(tab, text="Takte", padding=10)
+        kf.grid(row=4, column=0, sticky="ew", pady=(0, 8))
+        ttk.Label(kf, text="Referenz (RCLK):").grid(row=0, column=0, sticky="w")
+        rc = ttk.Combobox(kf, textvariable=self.rx_rclk_var, values=["32k", "32m", "36", "25"],
+                          state="readonly", width=6)
+        rc.grid(row=0, column=1, sticky="w", padx=6)
+        rc.bind("<<ComboboxSelected>>", lambda _e: self._send_cmd_safe(f"rclk freq {self.rx_rclk_var.get()}"))
+        ttk.Label(kf, text="SSB empfängt nur mit 32k; dabei ist der eigene Mischer-LO aus.",
+                  foreground="gray").grid(row=0, column=2, sticky="w")
+        ttk.Checkbutton(kf, text="Eigener Mischer-LO (CLK0, 144 MHz × 5)", variable=self.rx_lo_var,
+                        command=lambda: self._send_cmd_safe(f"lo {1 if self.rx_lo_var.get() else 0}")
+                        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        ttk.Label(kf, text="Aus lassen, wenn der TinySA den LO liefert.", foreground="gray").grid(
+            row=2, column=0, columnspan=3, sticky="w")
+
+        # --- scan ---
+        scf = ttk.LabelFrame(tab, text="Suchlauf", padding=10)
+        scf.grid(row=5, column=0, sticky="ew", pady=(0, 8))
+        ttk.Label(scf, text="von").grid(row=0, column=0)
+        ttk.Entry(scf, textvariable=self.rx_scan_from, width=8).grid(row=0, column=1, padx=4)
+        ttk.Label(scf, text="bis").grid(row=0, column=2)
+        ttk.Entry(scf, textvariable=self.rx_scan_to, width=8).grid(row=0, column=3, padx=4)
+        ttk.Label(scf, text="Schritt (kHz)").grid(row=0, column=4)
+        ttk.Entry(scf, textvariable=self.rx_scan_step, width=4).grid(row=0, column=5, padx=4)
+        ttk.Button(scf, text="Start", command=lambda: self._send_cmd_safe(
+            f"rx scan {self.rx_scan_from.get().strip()} {self.rx_scan_to.get().strip()} "
+            f"{self.rx_scan_step.get().strip()}")).grid(row=0, column=6, padx=(8, 0))
+        ttk.Label(scf, text="Ergebnis im Console-Reiter. Für Träger in AM suchen, in USB hören.",
+                  foreground="gray").grid(row=1, column=0, columnspan=7, sticky="w", pady=(4, 0))
+
+        self._rx_last_on = None
+        self.master.after(1000, self._rx_live_tick)
+
+    def _rx_set_mode(self):
+        self._rx_last_on = None
+        m = self.rx_mode_var.get()
+        self.rx_bw_combo.config(values=self._RX_BW_AM if m == "am" else self._RX_BW_SSB)
+        self._send_cmd_safe(f"rx {m}")
+
+    def _rx_freq_khz(self):
+        try:
+            return float(self.rx_freq_var.get().replace(",", "."))
+        except ValueError:
+            return None
+
+    def _rx_set_freq(self):
+        khz = self._rx_freq_khz()
+        if khz is None or not (2300.0 <= khz <= 26100.0):
+            self._log("[RX] Frequenz 2300..26100 kHz", "error")
+            return
+        self.rx_freq_var.set(f"{khz:.2f}".rstrip("0").rstrip("."))
+        self._send_cmd_safe(f"rx freq {khz:.3f}")
+
+    def _rx_step(self, direction):
+        khz = self._rx_freq_khz()
+        if khz is None:
+            return
+        step = dict(self._RX_STEPS).get(self.rx_step_var.get(), 1.0)
+        self.rx_freq_var.set(f"{khz + direction * step:.2f}")
+        self._rx_set_freq()
+
+    def _rx_set_bfo(self):
+        try:
+            hz = int(float(self.rx_bfo_var.get().replace(",", ".")))
+        except ValueError:
+            self._log("[RX] BFO in Hz", "error")
+            return
+        self._send_cmd_safe(f"rx bfo {hz}")
+
+    def _rx_goto_beacon(self, khz):
+        # Order matters: "rx freq" resets the BFO, so the BFO goes last.
+        if self.rx_mode_var.get() != "usb":
+            self.rx_mode_var.set("usb")
+            self._rx_set_mode()
+        self.rx_freq_var.set(f"{khz:.1f}")
+        self._rx_set_freq()
+        self.rx_bfo_var.set("500")
+        self._rx_set_bfo()
+
+    def _rx_live_tick(self):
+        try:
+            # Not while the receiver is known to be off: the firmware then
+            # adds a "receiver is OFF" note to every answer, once a second.
+            if (self.rx_live_var.get() and self.worker.is_connected()
+                    and self._rx_last_on is not False
+                    and self.notebook.tab(self.notebook.select(), "text") == "RX"):
+                self.worker.send_line("rx")          # silent: not echoed to the console
+        except Exception:
+            pass
+        self.master.after(1000, self._rx_live_tick)
+
+    def _handle_rx_status(self, line):
+        kv = dict(t.split("=", 1) for t in line[3:].split() if "=" in t)
+        def num(k, d=0):
+            try: return int(kv.get(k, d))
+            except ValueError: return d
+        on = kv.get("on") == "1"
+        self._rx_last_on = on
+        hz = num("hz")
+        mode = kv.get("mode", "?")
+        rssi, snr = num("rssi", -1), num("snr", -1)
+        self.rx_state_var.set(
+            f"{'EIN' if on else 'AUS'}  {mode.upper():3}  {hz/1000:10.3f} kHz  "
+            f"BW {kv.get('bw', '?')} Hz  BFO {kv.get('bfo', '?')} Hz  Pegel {kv.get('vol', '?')}"
+            + ("  STUMM" if kv.get("mute") == "1" else ""))
+        self.rx_rssi_var.set(f"{rssi} dBµV" if rssi >= 0 else "—")
+        self.rx_snr_var.set(f"{snr} dB" if snr >= 0 else "—")
+        self.rx_rssi_bar["value"] = max(0, rssi)
+        self.rx_snr_bar["value"] = max(0, snr)
+        # Keep the controls in step with the radio, except while the user
+        # is typing into a field.
+        focus = self.master.focus_get()
+        if mode in ("am", "usb", "lsb"):
+            self.rx_mode_var.set(mode)
+        if hz and not isinstance(focus, (ttk.Entry, tk.Entry)):
+            self.rx_freq_var.set(f"{hz/1000:.2f}".rstrip("0").rstrip("."))
+            self.rx_bfo_var.set(kv.get("bfo", self.rx_bfo_var.get()))
+            self.rx_cal_var.set(kv.get("cal", self.rx_cal_var.get()))
+        if kv.get("bw", "").isdigit():
+            self.rx_bw_var.set(kv["bw"])
 
     def _build_gpsdo_tab(self):
         tab = ttk.Frame(self.notebook, padding=10)
@@ -2274,6 +2542,10 @@ class SX1280ControlApp(ttk.Frame):
                         self._log(line, "recv")
                 elif line.startswith("!M "):
                     self._handle_mic_level(line)
+                    if self.log_show_status_var.get():
+                        self._log(line, "recv")
+                elif line.startswith("!R "):
+                    self._handle_rx_status(line)
                     if self.log_show_status_var.get():
                         self._log(line, "recv")
                 else:
