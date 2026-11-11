@@ -6,6 +6,39 @@
 **Vorgänger:** `HANDOVER_SSB.md` — das dort beschriebene Hängen ist gelöst, das
 Dokument bleibt als Protokoll der Fehlersuche stehen.
 
+
+> **GELÖST am 2026-11-11.** Der Si4732 empfängt SSB und QO-100: Die
+> CW-Bake um 19,360 MHz war über den Mischer hörbar.
+>
+> **Was zum Erfolg führte:** echte 32,768 kHz von SI5351 CLK2 an RCLK
+> (`rclk freq 32k`). Mit 36 MHz / 1125 = 32000 Hz blieb SSB ohne
+> nutzbaren Empfang; die genaue interne Ursache ist nicht abschließend
+> geklärt. Direkttest TinySA → AMI, Träger 19,609 MHz, USB auf 19,608 MHz,
+> 2200 Hz: klarer Ton (besonders mit `rx bfo 500`), TinySA aus rssi 25/snr 1,
+> ein rssi 35/snr 25.
+>
+> **Korrekturen zu diesem Dokument:**
+> * **Bakenzuordnung in §9 ist falsch.** Bei LNB-LO 9750,0043 MHz und
+>   Mischer-LO 720,137 MHz liegen nominal: untere CW **19,3587 MHz**,
+>   BPSK **19,6087 MHz**, obere CW **19,8587 MHz**. Das Signal bei
+>   19,3585 MHz war die untere CW-Bake, nicht die BPSK-Bake.
+> * Das behauptete Empfindlichkeitsdefizit von 15–25 dB und das Rauschmaß
+>   von 46 dB (§6.2, §7, §8.2, §8.3) sind **nicht belastbar nachgewiesen**;
+>   Spule und ZF-Verstärker waren für den Empfang nicht nötig.
+> * Die Aussage, der Oberwellenkamm hebe den Boden um 30 dB (§4), verglich
+>   SSB- mit AM-Werten und ist nicht belegt.
+> * AVC ist nicht die Ursache: `SSB_MODE` 0x8011 → 0x9011 ohne hörbaren
+>   Unterschied.
+> * Patch-ID 0x9D29, CTS und „tune ok" beweisen allein keinen HF-Empfang.
+>
+> **Aufbau dabei:** Bullseye-LNB → RMS-11X → Si4732 AMI, **ohne**
+> ZF-Tiefpass; TinySA als Mischer-LO, 720,137 MHz, +7 dBm.
+>
+> **Offen, ausdrücklich vertagt:** starker brummender/summender
+> Überlagerungston. Er verschwindet zusammen mit der Bake, wenn der
+> TinySA-LO abgeschaltet wird — das zeigt die LO-Abhängigkeit, lokalisiert
+> die Quelle aber nicht. Firmware wird künftig andernorts gebaut.
+
 ---
 
 ## 1. Das Problem in einem Satz
