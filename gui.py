@@ -1389,10 +1389,12 @@ class SX1280ControlApp(ttk.Frame):
     _RX_STEPS = [("10 Hz", 0.01), ("100 Hz", 0.1), ("1 kHz", 1.0), ("5 kHz", 5.0), ("9 kHz", 9.0)]
     _RX_BW_AM  = ["1000", "1800", "2000", "2500", "3000", "4000", "6000"]
     _RX_BW_SSB = ["500", "1000", "1200", "2200", "3000", "4000"]
-    # IF of the QO-100 beacons with the mixer LO at 720.137 MHz and the
-    # Bullseye LNB LO measured at 9750.0043 MHz. In USB the receiver is tuned
-    # a little below the carrier and the BFO sets the pitch.
-    _RX_BEACONS = [("Bake unten (CW)", 19358.0), ("BPSK", 19608.0), ("Bake oben (CW)", 19858.0)]
+    # The beacons are placed relative to the BPSK beacon as heard on the
+    # bench, because their absolute IF depends on two uncalibrated
+    # oscillators (LNB TCXO, TinySA as mixer LO) and an earlier absolute
+    # table turned out to be 250 kHz off - the beacon spacing exactly.
+    # Heard: BPSK in USB at 19360 kHz, BFO 0, LO 720.137 MHz.
+    _RX_BEACONS = [("Bake unten (CW)", -250.0), ("BPSK", 0.0), ("Bake oben (CW)", +250.0)]
 
     def _build_rx_tab(self):
         sc = ScrollableFrame(self.notebook)
@@ -1420,6 +1422,7 @@ class SX1280ControlApp(ttk.Frame):
         self.rx_scan_from = tk.StringVar(value="19350")
         self.rx_scan_to   = tk.StringVar(value="19366")
         self.rx_scan_step = tk.StringVar(value="1")
+        self.rx_bpsk_var  = tk.StringVar(value="19360")
 
         # --- live status ---
         st = ttk.LabelFrame(tab, text="Status", padding=10)
@@ -1496,15 +1499,19 @@ class SX1280ControlApp(ttk.Frame):
             row=5, column=0, columnspan=6, sticky="ew", pady=(8, 0))
 
         # --- beacons ---
-        bk = ttk.LabelFrame(tab, text="QO-100-Baken (Mischer-LO 720,137 MHz, USB, BFO 500)", padding=10)
+        bk = ttk.LabelFrame(tab, text="QO-100-Baken (USB, BFO 0)", padding=10)
         bk.grid(row=2, column=0, sticky="ew", pady=(0, 8))
-        for i, (name, khz) in enumerate(self._RX_BEACONS):
-            ttk.Button(bk, text=f"{name}\n{khz:.1f} kHz",
-                       command=lambda k=khz: self._rx_goto_beacon(k)).grid(row=0, column=i, padx=4, sticky="w")
-        ttk.Label(bk, text="Die CW-Baken sind getastet: ein Ton mit Pausen ist richtig. "
-                           "Liegt der TinySA-Quarz daneben, mit den Pfeiltasten in 1-kHz-Schritten suchen.",
+        ttk.Label(bk, text="BPSK-Bake gehört bei (kHz):").grid(row=0, column=0, columnspan=2, sticky="w")
+        ttk.Entry(bk, textvariable=self.rx_bpsk_var, width=10).grid(row=0, column=2, sticky="w", padx=4)
+        for i, (name, off) in enumerate(self._RX_BEACONS):
+            ttk.Button(bk, text=f"{name}\nBPSK {off:+.0f} kHz",
+                       command=lambda o=off: self._rx_goto_beacon(o)).grid(
+                row=1, column=i, padx=4, pady=(6, 0), sticky="w")
+        ttk.Label(bk, text="Die Knöpfe rechnen ±250 kHz um die eingetragene BPSK-Frequenz. "
+                           "Woran du die Baken erkennst: BPSK ist ein gleichmäßiges, raues "
+                           "Schnarren ohne Pausen; die CW-Baken sind ein Ton mit Morse-Pausen.",
                   foreground="gray", wraplength=620, justify="left").grid(
-            row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
+            row=2, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
         # --- monitor ---
         mf = ttk.LabelFrame(tab, text="Kopfhörer-Monitor", padding=10)
@@ -1595,14 +1602,19 @@ class SX1280ControlApp(ttk.Frame):
             return
         self._send_cmd_safe(f"rx bfo {hz}")
 
-    def _rx_goto_beacon(self, khz):
+    def _rx_goto_beacon(self, offset_khz):
+        try:
+            bpsk = float(self.rx_bpsk_var.get().replace(",", "."))
+        except ValueError:
+            self._log("[RX] BPSK-Frequenz in kHz eintragen", "error")
+            return
         # Order matters: "rx freq" resets the BFO, so the BFO goes last.
         if self.rx_mode_var.get() != "usb":
             self.rx_mode_var.set("usb")
             self._rx_set_mode()
-        self.rx_freq_var.set(f"{khz:.1f}")
+        self.rx_freq_var.set(f"{bpsk + offset_khz:.1f}")
         self._rx_set_freq()
-        self.rx_bfo_var.set("500")
+        self.rx_bfo_var.set("0")
         self._rx_set_bfo()
 
     def _rx_live_tick(self):

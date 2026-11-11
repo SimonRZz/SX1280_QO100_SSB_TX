@@ -18,6 +18,11 @@ Dokument bleibt als Protokoll der Fehlersuche stehen.
 > ein rssi 35/snr 25.
 >
 > **Korrekturen zu diesem Dokument:**
+> * **Nachtrag: Zuordnung erneut offen.** Der Operator hört bei 19360 kHz
+>   (USB, BFO 0) nach Gehör die **BPSK**-Bake. Dann liegen die CW-Baken bei
+>   etwa 19110 und 19610 kHz, und die folgende Zeile ist um 250 kHz falsch.
+>   Entscheidend ist der Klang (CW getastet, BPSK gleichmäßig schnarrend);
+>   die Rechnung hängt an zwei unkalibrierten Oszillatoren.
 > * **Bakenzuordnung in §9 ist falsch.** Bei LNB-LO 9750,0043 MHz und
 >   Mischer-LO 720,137 MHz liegen nominal: untere CW **19,3587 MHz**,
 >   BPSK **19,6087 MHz**, obere CW **19,8587 MHz**. Das Signal bei
