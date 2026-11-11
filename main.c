@@ -1507,6 +1507,8 @@ static void cmd_help(void) {
         "  rx ssbtest [rev|rsq|tune] - run the real bring-up with a status read after\r\n"
         "                         every step, then ask ONE command and stop\r\n"
         "  rx xoscpatch <0|1>   - XOSCEN for the patch POWER_UP only (reference uses 1)\r\n"
+        "  rx refearly <0|1>    - send the REFCLK properties before the patch upload\r\n"
+        "  rx fast <0|1>        - FAST bit of the SSB tune\r\n"
         "  rx mon [0|1]         - receive audio into the headphones (Si4732 LOUT -> GP27).\r\n"
         "                         Takes the ADC from the microphone, so transmit audio\r\n"
         "                         switches to PC while it is on.\r\n"
@@ -2114,6 +2116,19 @@ static void cdc_handle_line(char *line) {
             }
             rx_ensure_rclk();
             si4732_ssb_bringup_test(probe);
+            return;
+        }
+        // rx refearly 0|1 / rx fast 0|1 — bench switches for the SSB bring-up.
+        if (streqi(argv[1], "refearly") || streqi(argv[1], "fast")) {
+            const bool early = streqi(argv[1], "refearly");
+            if (argc >= 3) {
+                const bool v = strtol(argv[2], NULL, 10) != 0;
+                if (early) si4732_set_ref_early(v); else si4732_set_ssb_fast(v);
+            }
+            cdc_printf("OK refearly=%d fast=%d xoscen(patch)=%d (applies at the next "
+                       "'rx usb'/'rx ssbtest')\r\n",
+                       si4732_get_ref_early() ? 1 : 0, si4732_get_ssb_fast() ? 1 : 0,
+                       si4732_get_xoscen_patch() ? 1 : 0);
             return;
         }
         // rx xoscpatch 0|1 — XOSCEN for the patch POWER_UP only.

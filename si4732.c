@@ -159,6 +159,18 @@ static bool          s_xoscen    = false;
 // real 32.768 kHz - works too and was found first, but its harmonics bury the
 // IF. With this bit set, the reference can stay high and clean.
 static bool          s_xoscen_patch = true;
+// Two bench switches for the one configuration never reached: a high clock
+// with XOSCEN genuinely 0 while sideband runs. The second POWER_UP is refused
+// (0xC0) every time, so "xoscen(patch)=1" leaves the part in crystal mode for
+// good, where the prescaler apparently does nothing - 32.768 MHz / 1000 gave
+// rssi 0 with the internal reference reading exactly 32768 Hz.
+//   s_ref_early: send REFCLK_FREQ/PRESCALE straight after the patch POWER_UP,
+//                before the upload, so the part never runs on a wrong idea of
+//                its clock. Whether it accepts a property there is unknown;
+//                the ERR bit will say.
+//   s_ssb_fast:  the FAST bit of the sideband tune.
+static bool          s_ref_early = false;
+static bool          s_ssb_fast  = true;
 // Antenna tuning capacitor sent with every tune. 0 = the chip tunes its own
 // varactor, which is what Silicon Labs recommends and what a medium-wave
 // loopstick wants. A short wire or a 50 ohm feed from a mixer has no
@@ -555,8 +567,9 @@ static bool si_tune(void)
     // tune itself reports CTS, and then every command after it leaves CTS low
     // for good. Weeks of "SSB does not tune" were this one bit.
     uint8_t arg1 = 0u;
-    if (s_mode == SI4732_MODE_LSB)      arg1 = TUNE_SB_LSB | TUNE_FAST;
-    else if (s_mode == SI4732_MODE_USB) arg1 = TUNE_SB_USB | TUNE_FAST;
+    if (s_mode == SI4732_MODE_LSB)      arg1 = TUNE_SB_LSB;
+    else if (s_mode == SI4732_MODE_USB) arg1 = TUNE_SB_USB;
+    if (arg1 != 0u && s_ssb_fast)       arg1 |= TUNE_FAST;
 
     uint16_t khz = (uint16_t)s_khz;
     const uint8_t b[6] = {
@@ -721,6 +734,13 @@ bool si4732_set_mode(si4732_mode_t mode)
     if (!si_power_up(want_patch)) { s_on = false; return false; }
 
 si_vstep("after POWER_UP");
+
+    if (want_patch && s_ref_early) {
+        const bool f = si_set_prop(PROP_REFCLK_FREQ, (uint16_t)(s_rclk_hz / s_rclk_presc));
+        si_log("[SI4732] early REFCLK_FREQ: %s (status 0x%02X)", f ? "accepted" : "REFUSED", s_last_status);
+        const bool q = si_set_prop(PROP_REFCLK_PRESCALE, s_rclk_presc);
+        si_log("[SI4732] early REFCLK_PRESCALE: %s (status 0x%02X)", q ? "accepted" : "REFUSED", s_last_status);
+    }
 
 #ifdef SI4732_SSB_PATCH
     if (want_patch && !si_download_patch()) { s_on = false; return false; }
@@ -895,6 +915,10 @@ void si4732_set_xoscen(bool on) { s_xoscen = on; }
 // the operating one because the reference library is: patchPowerUp() sets it
 // unconditionally, radioPowerUp() uses the real clock type.
 void si4732_set_xoscen_patch(bool on) { s_xoscen_patch = on; }
+void si4732_set_ref_early(bool on)    { s_ref_early = on; }
+bool si4732_get_ref_early(void)       { return s_ref_early; }
+void si4732_set_ssb_fast(bool on)     { s_ssb_fast = on; }
+bool si4732_get_ssb_fast(void)        { return s_ssb_fast; }
 bool si4732_get_xoscen_patch(void)    { return s_xoscen_patch; }
 
 void si4732_restore(si4732_mode_t mode, uint32_t hz, uint8_t vol,
@@ -1065,8 +1089,8 @@ void si4732_ssb_bringup_test(int probe)
 
     si_log("[SSBTEST] --- bring-up through si4732_set_mode(), probe = %s ---",
            k_probe_name[probe]);
-    si_log("[SSBTEST] xoscen: patch power-up=%d, operating=%d",
-           (int)s_xoscen_patch, (int)s_xoscen);
+    si_log("[SSBTEST] xoscen: patch power-up=%d, operating=%d  refearly=%d  fast=%d",
+           (int)s_xoscen_patch, (int)s_xoscen, (int)s_ref_early, (int)s_ssb_fast);
 
     // The SAME call "rx usb" makes. The old version of this test built its own
     // sequence and had drifted a whole POWER_UP away from the real one, so it

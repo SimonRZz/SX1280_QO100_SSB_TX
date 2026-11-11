@@ -89,6 +89,14 @@ void     si4732_set_xoscen(bool on);
 // boards with no crystal. Using one setting for both never tested that.
 void     si4732_set_xoscen_patch(bool on);
 bool     si4732_get_xoscen_patch(void);
+
+// Bench switches, not persisted. ref_early sends the reference-clock
+// properties before the patch upload instead of after it; ssb_fast is the
+// FAST bit of the sideband tune. See the comment at their definition.
+void     si4732_set_ref_early(bool on);
+bool     si4732_get_ref_early(void);
+void     si4732_set_ssb_fast(bool on);
+bool     si4732_get_ssb_fast(void);
 bool     si4732_get_xoscen(void);
 
 // Antenna tuning capacitor, sent with every tune. Defaults to 1, as the
