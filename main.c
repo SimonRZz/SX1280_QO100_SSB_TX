@@ -214,6 +214,11 @@ static bool    rxmon_is_on(void);
 static void    rxmon_set_vol(uint8_t pct);
 static bool    rxmon_set_cw(long width_hz, long centre_hz);   // width 0 = off; centre 0 = keep
 static void    rxmon_set_level(uint8_t pct);
+static void    rxmon_set_maxgain(uint8_t db);
+static void    rxmon_set_hang(uint16_t ms);
+// Display RSSI/SNR polling over I2C, 5 Hz. Switchable to test it as a
+// source of crackle in the headphones. Not persisted.
+static volatile bool g_rx_rsq_poll = true;
 static uint8_t rxmon_vol_pct(void);
 static void    rxmon_set_agc(bool on);
 static bool    rxmon_agc_on(void);
@@ -1527,6 +1532,9 @@ static void cmd_help(void) {
         "  rx mon agc [0|1]     - audio AGC: down fast, up slowly, with a hard limiter\r\n"
         "  rx mon cw 0|<Hz> [<centre>] - CW audio filter, e.g. 'rx mon cw 150 600'\r\n"
         "  rx mon level <5..90> - AGC target in % of full scale (default 25)\r\n"
+        "  rx mon maxgain <0..36> - AGC gain ceiling in dB (default 36)\r\n"
+        "  rx mon hang <0..3000>  - AGC hold after a signal, ms (default 400)\r\n"
+        "  rx mon poll 0|1      - 5 Hz RSSI polling for the display (crackle test)\r\n"
         "  rx agc [on|off|<n>]  - front-end attenuator. The index is attenuation, so 0\r\n"
         "                         is full gain. 'off' pins it open for measuring.\r\n"
         "  rx xosc <0|1>        - POWER_UP crystal-oscillator bit; 0 = external RCLK\r\n"
@@ -2277,6 +2285,18 @@ static void cdc_handle_line(char *line) {
                     cdc_write_str("ERR: rx mon cw 0 | rx mon cw <30..1500 Hz> [<200..2500 Hz centre>]\r\n");
                     return;
                 }
+            } else if (argc >= 4 && streqi(argv[2], "maxgain")) {
+                long v = strtol(argv[3], NULL, 10);
+                if (v < 0 || v > 36) { cdc_write_str("ERR: rx mon maxgain 0..36 (dB)\r\n"); return; }
+                rxmon_set_maxgain((uint8_t)v);
+            } else if (argc >= 4 && streqi(argv[2], "hang")) {
+                long v = strtol(argv[3], NULL, 10);
+                if (v < 0 || v > 3000) { cdc_write_str("ERR: rx mon hang 0..3000 (ms)\r\n"); return; }
+                rxmon_set_hang((uint16_t)v);
+            } else if (argc >= 4 && streqi(argv[2], "poll")) {
+                uint8_t v;
+                if (!parse_bool(argv[3], &v)) { cdc_write_str("ERR: rx mon poll 0|1\r\n"); return; }
+                g_rx_rsq_poll = (v != 0);
             } else if (argc >= 4 && streqi(argv[2], "level")) {
                 // AGC target in percent of full scale. Above ~70 % the
                 // limiter starts to clip speech peaks; for a CW tone it is fine.
@@ -3664,6 +3684,13 @@ static float         s_rx_dc      = 0.0f;
 static float         s_rx_env     = 0.0f;   // envelope the AGC follows
 static float         s_rx_gain    = 1.0f;
 static float         s_rxmon_tgt  = 0.25f;  // where the AGC aims, full scale = 1
+// Ceiling of the AGC gain, and how long it holds after a signal before it
+// starts to rise. A keyed CW beacon leaves gaps between its elements; with no
+// hold the AGC climbed back up within ~0.2 s in every gap and the noise
+// swelled each time. Hold, then a slow release (~1.5 s), is what CW wants.
+static float         s_rxmon_gmax = 60.0f;  // linear, 60 = +36 dB
+static uint32_t      s_rx_hang_n  = 3200u;  // samples at 8 kHz, 400 ms
+static uint32_t      s_rx_hang    = 0u;
 
 // CW audio filter in the monitor path. The Si4732's narrowest SSB filter is
 // 500 Hz; a keyed beacon wants far less. Two cascaded RBJ band-pass sections
@@ -3744,7 +3771,7 @@ static void rxmon_task(void)
     {
         static uint32_t s_rsq_due = 0;
         const uint32_t now = to_ms_since_boot(get_absolute_time());
-        if ((int32_t)(now - s_rsq_due) >= 0 && !g_keyer_key && !g_tune_active) {
+        if (g_rx_rsq_poll && (int32_t)(now - s_rsq_due) >= 0 && !g_keyer_key && !g_tune_active) {
             s_rsq_due = now + 200u;
             uint8_t r = 0, n = 0;
             if (si4732_is_on() && si4732_read_rsq(&r, &n)) { g_rx_rssi = r; g_rx_snr = n; }
@@ -3777,12 +3804,19 @@ static void rxmon_task(void)
 
         if (s_rxmon_agc) {
             float want = s_rxmon_tgt / (s_rx_env > 0.0008f ? s_rx_env : 0.0008f);
-            if (want > 60.0f) want = 60.0f;         // +36 dB
+            if (want > s_rxmon_gmax) want = s_rxmon_gmax;
             if (want < 0.05f) want = 0.05f;         // -26 dB
-            // Down fast, up slowly. A station that suddenly booms in has to be
-            // turned down before it hurts; one that fades must come back
-            // gently, or every pause between words pumps.
-            s_rx_gain += (want < s_rx_gain ? 0.05f : 0.0006f) * (want - s_rx_gain);
+            // Down fast; then hold; then up slowly. A station that booms in
+            // must be turned down before it hurts, and a pause between CW
+            // elements or words must not let the noise swell back up.
+            if (want < s_rx_gain) {
+                s_rx_gain += 0.05f * (want - s_rx_gain);
+                s_rx_hang = s_rx_hang_n;
+            } else if (s_rx_hang) {
+                s_rx_hang--;
+            } else {
+                s_rx_gain += 0.00008f * (want - s_rx_gain);
+            }
         } else {
             s_rx_gain += 0.02f * (1.0f - s_rx_gain);
         }
@@ -3845,6 +3879,8 @@ static bool rxmon_set_cw(long w, long c)
 }
 
 static void rxmon_set_level(uint8_t pct) { s_rxmon_tgt = (float)pct / 100.0f; }
+static void rxmon_set_maxgain(uint8_t db) { s_rxmon_gmax = powf(10.0f, (float)db / 20.0f); }
+static void rxmon_set_hang(uint16_t ms)   { s_rx_hang_n = (uint32_t)ms * 8u; }
 
 static void rxmon_diag_print(void)
 {
@@ -3856,8 +3892,10 @@ static void rxmon_diag_print(void)
                s_rxmon_agc ? "on" : "off", (double)s_rx_gain,
                (double)(20.0f * log10f(s_rx_gain > 1e-4f ? s_rx_gain : 1e-4f)),
                (double)cl, (double)pk);
-    cdc_printf("            level=%u%%  cw-filter=%s",
-               (unsigned)(s_rxmon_tgt * 100.0f + 0.5f), s_cw_on ? "ON" : "off");
+    cdc_printf("            level=%u%%  maxgain=%.0f dB  hang=%lu ms  rsq-poll=%s  cw-filter=%s",
+               (unsigned)(s_rxmon_tgt * 100.0f + 0.5f),
+               (double)(20.0f * log10f(s_rxmon_gmax)), (unsigned long)(s_rx_hang_n / 8u),
+               g_rx_rsq_poll ? "on" : "OFF", s_cw_on ? "ON" : "off");
     if (s_cw_on) cdc_printf(" %.0f Hz +-%.0f Hz", (double)s_cw_f0, (double)(s_cw_bw / 2.0f));
     cdc_write_str("\r\n");
     cdc_printf("            ADC on %s  ring=%lu/%u  underruns=%lu\r\n",

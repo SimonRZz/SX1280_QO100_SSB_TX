@@ -1425,6 +1425,9 @@ class SX1280ControlApp(ttk.Frame):
         self.rx_cwbw_var  = tk.StringVar(value="150")
         self.rx_cwf0_var  = tk.StringVar(value="600")
         self.rx_level_var = tk.DoubleVar(value=25)
+        self.rx_maxgain_var = tk.DoubleVar(value=36)
+        self.rx_hang_var  = tk.DoubleVar(value=400)
+        self.rx_poll_var  = tk.BooleanVar(value=True)
 
         # --- live status ---
         st = ttk.LabelFrame(tab, text="Status", padding=10)
@@ -1547,6 +1550,16 @@ class SX1280ControlApp(ttk.Frame):
         cwc = ttk.Entry(cwf, textvariable=self.rx_cwf0_var, width=6)
         cwc.pack(side="left")
         cwc.bind("<Return>", lambda _e: self._rx_send_cw())
+        LabeledScale(mf, "AGC max. Verstärkung", self.rx_maxgain_var, 0, 36, 1,
+                     lambda v: self._send_cmd_safe(f"rx mon maxgain {int(v)}"), "{:.0f} dB").grid(
+            row=5, column=0, sticky="ew", pady=(8, 0))
+        LabeledScale(mf, "AGC-Haltezeit", self.rx_hang_var, 0, 2000, 50,
+                     lambda v: self._send_cmd_safe(f"rx mon hang {int(v)}"), "{:.0f} ms").grid(
+            row=6, column=0, sticky="ew", pady=(4, 0))
+        ttk.Checkbutton(mf, text="RSSI-Abfrage im Gerät (5×/s; zum Test auf Knistern abschalten)",
+                        variable=self.rx_poll_var,
+                        command=lambda: self._send_cmd_safe(f"rx mon poll {1 if self.rx_poll_var.get() else 0}")
+                        ).grid(row=7, column=0, sticky="w", pady=(6, 0))
         ttk.Label(mf, text="Der Monitor belegt den ADC; die Sendequelle wird dabei auf PC umgeschaltet.",
                   foreground="gray").grid(row=2, column=0, sticky="w", pady=(4, 0))
 
