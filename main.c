@@ -2266,9 +2266,20 @@ static void cdc_handle_line(char *line) {
                 if (v < 0 || v > 100) { cdc_write_str("ERR: rx mon vol 0..100\r\n"); return; }
                 rxmon_set_vol((uint8_t)v);
             } else if (argc >= 4 && streqi(argv[2], "agc")) {
-                rxmon_set_agc(strtol(argv[3], NULL, 10) != 0);
+                uint8_t v;
+                if (!parse_bool(argv[3], &v)) { cdc_write_str("ERR: rx mon agc 0|1\r\n"); return; }
+                rxmon_set_agc(v != 0);
             } else if (argc >= 3) {
-                bool on = (strtol(argv[2], NULL, 10) != 0);
+                // Only an explicit 0 or 1 switches the monitor. "rx mon agc"
+                // without a value used to land here, strtol("agc") gave 0,
+                // and the monitor went off - silencing the headphones and
+                // looking like every disturbance had vanished.
+                uint8_t v;
+                if (!parse_bool(argv[2], &v)) {
+                    cdc_write_str("ERR: rx mon 0|1 | rx mon vol <0..100> | rx mon agc 0|1\r\n");
+                    return;
+                }
+                bool on = (v != 0);
                 if (on && g_audio_src == AUDIO_SRC_MIC) {
                     // One ADC, and the modulator must never be handed receive
                     // audio. Say so rather than fail quietly.
