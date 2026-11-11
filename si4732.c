@@ -1049,6 +1049,8 @@ bool si4732_set_rclk_hz(uint32_t hz)
         s_last_err = "no exact prescaler puts that clock in the 31130..34406 Hz window";
         return false;
     }
+    const uint32_t old_hz    = s_rclk_hz;
+    const uint16_t old_presc = s_rclk_presc;
     s_rclk_hz    = hz;
     s_rclk_presc = presc;
 
@@ -1060,7 +1062,21 @@ bool si4732_set_rclk_hz(uint32_t hz)
     // tuner holds was derived from the old reference.
     bool ok = si_set_prop(PROP_REFCLK_PRESCALE, s_rclk_presc);
     ok = si_set_prop(PROP_REFCLK_FREQ, (uint16_t)(s_rclk_hz / s_rclk_presc)) && ok;
-    if (!ok) return false;
+    if (!ok) {
+        // The caller puts the clock generator back, so this side has to go
+        // back too. It did not: after a refused switch the driver kept the
+        // new clock and prescaler while the pin carried the old one, and the
+        // next power-up would have programmed a prescaler of 1000 onto a
+        // 32.768 kHz reference. The properties are re-sent by that caller's
+        // next step or the next power-up; here only the bookkeeping matters.
+        const char *why = s_last_err;
+        s_rclk_hz    = old_hz;
+        s_rclk_presc = old_presc;
+        (void)si_set_prop(PROP_REFCLK_PRESCALE, s_rclk_presc);
+        (void)si_set_prop(PROP_REFCLK_FREQ, (uint16_t)(s_rclk_hz / s_rclk_presc));
+        s_last_err = why;
+        return false;
+    }
     return si4732_tune_hz(si4732_get_hz());
 }
 
