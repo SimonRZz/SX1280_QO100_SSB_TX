@@ -2498,9 +2498,9 @@ static void cdc_handle_line(char *line) {
         return;
     }
     // Display orientation: oled flip 0|1
-    // smps pwm 0|1 — Pico SMPS mode via GPIO23 (PS pin). 0 = power-save
-    // (board default: bursts at light load, pulsing ripple on 3V3), 1 = fixed
-    // PWM (steady switching, far less low-frequency ripple, a few mA more).
+    // smps pwm 0|1 — Pico SMPS mode via GPIO23 (PS pin). 1 = fixed PWM, the
+    // default since boot (see main()); 0 = the board's power-save mode, which
+    // switches in bursts at light load and puts a pulsing ripple on 3V3.
     // The RX audio ADC sits on a divider from 3V3, so that ripple goes
     // straight into the headphones. Not persisted.
     if (streqi(argv[0], "smps")) {
@@ -4451,6 +4451,15 @@ static void oled_draw_boot_wait(uint32_t elapsed_ms) {
 int main(void) {
     bool ok = set_sys_clock_khz(250000, false);
     if (!ok) set_sys_clock_khz(200000, true);
+
+    // Pico SMPS into fixed PWM (GPIO23 = PS pin). In the board's default
+    // power-save mode it switches in bursts at light load, and the resulting
+    // pulsing ripple on 3V3 reached the headphones through the RX audio ADC,
+    // whose bias divider hangs off 3V3. Confirmed on the bench: "smps pwm 1"
+    // made the pulse clearly quieter. Costs a few mA.
+    gpio_init(23);
+    gpio_set_dir(23, GPIO_OUT);
+    gpio_put(23, 1);
 
     // Restore saved config before anything displays or uses it.
     persist_load();
