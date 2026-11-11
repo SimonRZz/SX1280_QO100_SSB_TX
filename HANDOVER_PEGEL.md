@@ -37,7 +37,8 @@ Dokument bleibt als Protokoll der Fehlersuche stehen.
 > **Offen, ausdrücklich vertagt:** starker brummender/summender
 > Überlagerungston. Er verschwindet zusammen mit der Bake, wenn der
 > TinySA-LO abgeschaltet wird — das zeigt die LO-Abhängigkeit, lokalisiert
-> die Quelle aber nicht. Firmware wird künftig andernorts gebaut.
+> die Quelle aber nicht. Die Firmware wird weiterhin in diesem Repository
+> gebaut (Branch `claude/review-upstream-changes-uky0w`).
 >
 > **Ideen für später (Operator, 2026-11-11):**
 > * **Stromversorgung 12 V.** Heute hängt alles an USB-VBUS; die
