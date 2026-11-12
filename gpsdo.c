@@ -93,14 +93,12 @@ static uint8_t s_si_addr = 0x00u;
 
 // Receive-side outputs, both off until asked for.
 static bool s_loOn   = false;  // CLK0, 144 MHz, mixer LO
-static bool s_rclkOn = false;  // CLK2, 25 MHz, Si4732 reference clock
+static bool s_rclkOn = false;  // CLK2, switchable Si4732 reference clock
 static uint8_t s_rclkDrive = 3u;  // IDRV field of CLK2_CTRL: 0=2mA .. 3=8mA
-// 0 = 32.768 kHz, and the SSB patch is not negotiable about it: it ignores
-// REFCLK_FREQ, so 36 MHz / 1125 = 32000 Hz put every sideband tune 2.4 % off -
-// 470 kHz at 19.6 MHz - and sideband reported rssi 0 for a carrier AM read at
-// 52 dBuV. 25 and 36 MHz are kept because AM is happier on them: a 32.768 kHz
-// square wave has harmonics every 32.768 kHz across the whole shortwave band.
-// The cure for that is an RC on the RCLK line, not a different frequency.
+// 0 = direct 32.768 kHz, the demonstrated working SSB setup. The high-clock
+// tests failed but did not isolate startup/property interpretation as the
+// cause. Clock pickup is still a hypothesis; old cross-mode RSSI comparisons
+// did not establish its amplitude or prove that a particular RC cures it.
 // See si5351_write_pllb_and_ms2().
 static uint8_t s_rclkMhz   = 0u;
 static bool s_pllbReady = false;  // PLL B + MS0/MS2 configured yet?
@@ -301,10 +299,9 @@ static bool si5351_write_pllb_and_ms2(void)
     };
     // 32.768 MHz: 864 / (26 + 47/128), p1=2863 (0x0B2F), p2=0, p3=128.
     // 864e6 * 128 / 3375 = 32 768 000 Hz exactly. Divided by 1000 in the
-    // Si4732 that is the 32768 Hz its SSB patch assumes whatever REFCLK_FREQ
-    // says - but as a 32 MHz clock, whose harmonics start at 65 MHz instead
-    // of lying every 32.768 kHz across the IF. PLL B stays at 864 MHz, so
-    // CLK0 keeps its 144 MHz and the mixer LO survives.
+    // Si4732 that requests the same 32768 Hz reference, but actual SSB RX
+    // with this configuration is not established. PLL B stays at 864 MHz,
+    // so CLK0 keeps its 144 MHz and the mixer LO survives.
     static const uint8_t ms2_32m[8] = {
         0x00u, 0x80u, 0x00u, 0x0Bu, 0x2Fu, 0x00u, 0x00u, 0x00u
     };

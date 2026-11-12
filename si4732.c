@@ -66,31 +66,14 @@
 #define TUNE_SB_USB         (2u << 6)
 
 // ---------------------------------------------------------------------------
-// Reference clock. 25 MHz from the second GPSDO, divided down into the window
-// the chip accepts. 25e6 / 800 = 31250 Hz exactly — no rounding error to carry
-// into the tuning.
-// ---------------------------------------------------------------------------
-// AN332 gives the usable REFCLK_FREQ window as 31130..34406 Hz and caps the
-// prescaler at 4095 (it is a 12-bit field).
+// SI5351 CLK2 on RCLK. Direct 32768 Hz is the demonstrated SSB setup.
+// High-clock failures did not isolate whether startup or reference properties
+// caused them. Neither an ignored REFCLK_FREQ nor a calibrated noise-floor
+// rise from the clock was established. Clock pickup remains a hypothesis.
+// AN332: REFCLK_FREQ 31130..34406 Hz; prescaler is a 12-bit field.
 #define SI_REFCLK_MIN       31130u
 #define SI_REFCLK_MAX       34406u
 
-// The reference is switchable at runtime because 25 MHz turned out to be a
-// poor choice on this board: it leaks into the AM input at 65 dBuV, five
-// megahertz from a 19.5 MHz IF, and holds the front-end AGC down. 36 MHz is
-// the same PLL B through an even integer divider and puts the leakage 16 MHz
-// away instead. See gpsdo_set_rclk_mhz(), which moves the other end.
-// 32.768 kHz, prescaler 1, and the SSB patch leaves no choice: it ignores
-// REFCLK_FREQ entirely. On 36 MHz / 1125 = 32000 Hz every sideband tune came
-// out 32768/32000 = 2.4 % high, which is 470 kHz at 19.6 MHz - far outside any
-// filter. Sideband then reported rssi 0 for an injected carrier that AM read
-// at 52 dBuV, and looked like a receiver that did not work.
-//
-// The cost is a comb: a 32.768 kHz square wave has harmonics every 32.768 kHz
-// across the whole shortwave band, and it lifts the noise floor from 2-13 dBuV
-// to a flat 43. That is fixed on the wire, not here - 1 kOhm in series and
-// 2.2 nF to ground at pin 13 turns the square into the sine a crystal would
-// have given, costing 0.8 dB at 32 kHz and 49 dB at 19.6 MHz.
 static uint32_t s_rclk_hz    = 32768u;
 static uint16_t s_rclk_presc = 1u;
 
@@ -99,10 +82,7 @@ static uint16_t s_rclk_presc = 1u;
 // multiplicative offset on every frequency the chip tunes.
 static uint16_t si_presc_for(uint32_t rclk_hz)
 {
-    // 32768 Hz first, whenever the clock allows it exactly. The SSB patch
-    // tunes as if the divided reference were 32768 Hz regardless of what
-    // REFCLK_FREQ is told, so any other value in the legal window - 32000
-    // from 36 MHz, 31250 from 25 MHz - puts sideband off by the ratio.
+    // Prefer an exact 32768 Hz division. High-clock SSB remains experimental.
     if (rclk_hz % 32768u == 0u && rclk_hz / 32768u >= 1u && rclk_hz / 32768u <= 4095u)
         return (uint16_t)(rclk_hz / 32768u);
 
@@ -130,7 +110,7 @@ static bool          s_on        = false;
 static si4732_mode_t s_mode      = SI4732_MODE_USB;
 static uint32_t      s_hz        = 19500000u; // middle of the planned IF
 static uint32_t      s_khz       = 19500u;    // what the tuner was actually given
-static int32_t       s_cal_hz    = 0;         // LNB LO error, see si4732.h
+static int32_t       s_cal_hz    = SI4732_DEFAULT_CAL_HZ;
 static uint8_t       s_volume    = 32u;
 static uint16_t      s_bw_hz     = 2200u;
 static int16_t       s_bfo_hz    = 0;
@@ -155,9 +135,8 @@ static bool          s_xoscen    = false;
 // and uses the real clock type for the operational power-up; this driver used
 // one setting for both and so never ran that sequence at all.
 //
-// It is the half of the fix that costs nothing. The other half - feeding a
-// real 32.768 kHz - works too and was found first, but its harmonics bury the
-// IF. With this bit set, the reference can stay high and clean.
+// Used in the successful 32768 Hz setup; it alone did not demonstrate
+// successful reception with a high reference clock.
 static bool          s_xoscen_patch = true;
 // Two bench switches for the one configuration never reached: a high clock
 // with XOSCEN genuinely 0 while sideband runs. The second POWER_UP is refused
@@ -461,7 +440,7 @@ static bool si_read_rev(bool expect_patch)
                s_rev_raw[0], s_rev_raw[1], s_rev_raw[2], s_rev_raw[3],
                s_rev_raw[4], s_rev_raw[5], s_rev_raw[6], s_rev_raw[7],
                s_rev_raw[8]);
-        si_log("[SI4732]   most likely no 25 MHz on pin 13: POWER_UP runs with "
+        si_log("[SI4732]   check the configured RCLK on pin 13: POWER_UP runs with "
                "XOSCEN=0, so without it the chip has no clock. Check 'rclk'.");
         return false;
     }
@@ -645,11 +624,30 @@ static bool si_tune(void)
 // Public interface
 // ---------------------------------------------------------------------------
 
+// Shared by boot, normal tuning and restored settings; invalid requests
+// leave the previous tuning plan untouched.
+static bool si_plan_tune(uint32_t hz, int32_t cal_hz)
+{
+    const int64_t want = (int64_t)hz + cal_hz;
+    if (want < (int64_t)SI_KHZ_MIN * 1000 || want > (int64_t)SI_KHZ_MAX * 1000) {
+        s_last_err = "frequency outside 2300..26100 kHz after calibration";
+        return false;
+    }
+    const uint32_t khz = (uint32_t)((want + 500) / 1000);
+    s_hz = hz;
+    s_khz = khz;
+    s_bfo_hz = (int16_t)((int64_t)khz * 1000 - want);
+    return true;
+}
+
 bool si4732_init(void)
 {
     s_present = false;
     s_on      = false;
     s_addr    = 0x00u;
+
+    // Keep loaded settings; empty flash uses the build default PLL/BFO.
+    if (!si_plan_tune(s_hz, s_cal_hz)) return false;
 
     si_hw_reset();
 
@@ -808,36 +806,35 @@ bool si4732_tune_khz(uint32_t khz)
 
 uint32_t si4732_get_hz(void) { return s_hz; }
 
+int32_t si4732_get_configured_if_hz(void)
+{
+    return (int32_t)(s_khz * 1000u) -
+           (s_mode == SI4732_MODE_AM ? 0 : s_bfo_hz);
+}
+
+int32_t si4732_get_actual_hz(void)
+{
+    return si4732_get_configured_if_hz() - s_cal_hz;
+}
+
+bool si4732_bfo_overridden(void)
+{
+    return s_mode != SI4732_MODE_AM &&
+           (int64_t)si4732_get_configured_if_hz() != (int64_t)s_hz + s_cal_hz;
+}
+
 // Splits the wanted frequency into what the tuner can take and what the BFO
 // has to make up. The calibration offset is added here, in one place, so
 // everything above this layer can work in true downlink terms and stay unaware
 // of the LNB's error.
 //
-// SIGN CONVENTION OF THE BFO IS ASSUMED, NOT VERIFIED: positive BFO is taken to
-// shift the received frequency up, the same direction as the tuner. Check it on
-// the beacon — tune to it, then "rx bfo 500" and listen whether the tone rises
-// or falls. If it falls, the one negation below is wrong and nothing else is.
+// Convention: configured_IF = PLL_kHz*1000 - BFO. Raw BFO changes that
+// configured IF without changing the last requested dial frequency.
 bool si4732_tune_hz(uint32_t hz)
 {
     if (!s_present) return false;
 
-    int64_t want = (int64_t)hz + (int64_t)s_cal_hz;
-    if (want < (int64_t)SI_KHZ_MIN * 1000 || want > (int64_t)SI_KHZ_MAX * 1000) {
-        s_last_err = "frequency outside 2300..26100 kHz after calibration";
-        return false;
-    }
-
-    uint32_t khz = (uint32_t)((want + 500) / 1000);          // nearest kHz
-    int32_t  rem = (int32_t)(want - (int64_t)khz * 1000);    // -500..+499 Hz
-
-    // The BFO counts the other way round from the dial: a positive offset
-    // moves the received signal DOWN. ATS-Mini, which is calibrated on the air
-    // by many users, does setSSBBfo(-(fine + cal)) for the same reason. With
-    // +rem here, everything below the kHz was mirrored: 19359.8 really tuned
-    // 19360.2, and crossing a kHz boundary jumped by almost 2 kHz.
-    s_hz     = hz;
-    s_khz    = khz;
-    s_bfo_hz = (int16_t)(-rem);
+    if (!si_plan_tune(hz, s_cal_hz)) return false;
 
     if (!s_on) return true;       // remembered, applied at power-up
 
@@ -853,6 +850,11 @@ bool si4732_set_cal_hz(int32_t hz)
     // cannot push the tuning out of the band.
     if (hz < -200000 || hz > 200000) {
         s_last_err = "calibration outside +-200 kHz";
+        return false;
+    }
+    const int64_t want = (int64_t)s_hz + hz;
+    if (want < (int64_t)SI_KHZ_MIN * 1000 || want > (int64_t)SI_KHZ_MAX * 1000) {
+        s_last_err = "frequency outside 2300..26100 kHz after calibration";
         return false;
     }
     s_cal_hz = hz;
@@ -932,21 +934,15 @@ void si4732_restore(si4732_mode_t mode, uint32_t hz, uint8_t vol,
     s_mode = (mode == SI4732_MODE_LSB || mode == SI4732_MODE_USB ||
               mode == SI4732_MODE_AM) ? mode : SI4732_MODE_USB;
 
-    s_cal_hz = (cal_hz >= -200000 && cal_hz <= 200000) ? cal_hz : 0;
+    s_cal_hz = (cal_hz >= -200000 && cal_hz <= 200000)
+                   ? cal_hz : SI4732_DEFAULT_CAL_HZ;
 
     s_volume = (vol <= 63u) ? vol : 32u;
 
     s_bw_hz = bw_nearest((bw_hz >= 100u && bw_hz <= 8000u) ? bw_hz : 2200u,
                          s_mode != SI4732_MODE_AM)->hz;
 
-    // Checked against the band after calibration, exactly as tuning would.
-    int64_t want = (int64_t)hz + (int64_t)s_cal_hz;
-    if (want < (int64_t)SI_KHZ_MIN * 1000 || want > (int64_t)SI_KHZ_MAX * 1000)
-        hz = 19500000u;
-    s_hz  = hz;
-    s_khz = (uint32_t)(((int64_t)hz + s_cal_hz + 500) / 1000);
-    // The sub-kHz part as well, or a reboot rounds the dial to whole kHz.
-    s_bfo_hz = (int16_t)(-(int32_t)(((int64_t)hz + s_cal_hz) - (int64_t)s_khz * 1000));
+    if (!si_plan_tune(hz, s_cal_hz)) (void)si_plan_tune(19500000u, s_cal_hz);
 }
 
 bool si4732_set_bfo_hz(int16_t hz)
@@ -1221,6 +1217,12 @@ void si4732_diag_print(void)
 {
     si_log("[SI4732] present=%d addr=0x%02X on=%d patch=%d",
            (int)s_present, s_addr, (int)s_on, (int)si4732_has_ssb());
+    si_log("[SI4732]   requested_if_hz=%lu cal=%ld configured_if_hz=%ld (configured, not measured)",
+           (unsigned long)s_hz, (long)s_cal_hz,
+           (long)si4732_get_configured_if_hz());
+    si_log("[SI4732]   actual_nominal_hz=%ld tuner_khz=%lu bfo=%d bfo_override=%d",
+           (long)si4732_get_actual_hz(),
+           (unsigned long)s_khz, (int)s_bfo_hz, (int)si4732_bfo_overridden());
     if (!s_present) {
         si_log("[SI4732]   last error: %s", s_last_err);
         si_log("[SI4732]   note: before power-up the chip answers GET_REV with a");
@@ -1230,7 +1232,7 @@ void si4732_diag_print(void)
                s_rev_raw[0], s_rev_raw[1], s_rev_raw[2], s_rev_raw[3], s_rev_raw[4],
                s_rev_raw[5], s_rev_raw[6], s_rev_raw[7], s_rev_raw[8]);
         si_log("[SI4732]   check in this order:");
-        si_log("[SI4732]     1. 25 MHz on pin 13 - 'rclk' must say 1, and POWER_UP");
+        si_log("[SI4732]     1. Configured reference on pin 13 - 'rclk' must say 1, and POWER_UP");
         si_log("[SI4732]        runs with XOSCEN=0, so without it the chip has no clock");
         si_log("[SI4732]     2. 3V3 on pin 14, GND on pin 15, 100 nF close by");
         si_log("[SI4732]     3. RST on GP13");
@@ -1290,12 +1292,11 @@ void si4732_diag_print(void)
     } else {
         si_log("[SI4732]   rsq unavailable (%s)", s_last_err);
     }
-    // "tune complete" is the chip's seek/tune flag, which only AM raises. In
-    // SSB the same column reports whether the read-back frequency matches
-    // what was asked for, which is the honest equivalent.
+    // AM reports seek/tune completion and tuner readback. The SSB path only
+    // records command readiness; neither that nor cached settings proves RF RX.
     if (s_read_khz == SI_KHZ_NOT_READ) {
         si_log("[SI4732]   tune %s at %lu kHz  (SSB does not read the tuner back; "
-               "rssi below is the real check)",
+               "CTS alone does not prove reception)",
                s_stc_ok ? "ok" : "NO CTS AFTERWARDS", (unsigned long)s_khz);
     } else {
         si_log("[SI4732]   tuner reports %u kHz, tune %s  (asked for %lu kHz)",

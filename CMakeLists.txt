@@ -30,6 +30,31 @@ include(pico_sdk_import.cmake)
 
 project(SX1280SDR C CXX ASM)
 
+# Refresh this identity by re-running CMake before a release build. Untracked
+# files (including downloaded tools and build products) do not mark it dirty.
+set(FW_GIT_SHA "unknown")
+set(FW_GIT_DIRTY "")
+find_package(Git QUIET)
+if(GIT_FOUND AND EXISTS "${CMAKE_CURRENT_LIST_DIR}/.git")
+    execute_process(COMMAND ${GIT_EXECUTABLE} rev-parse --short=12 HEAD
+        WORKING_DIRECTORY ${CMAKE_CURRENT_LIST_DIR}
+        OUTPUT_VARIABLE FW_GIT_HASH OUTPUT_STRIP_TRAILING_WHITESPACE
+        RESULT_VARIABLE FW_GIT_RESULT ERROR_QUIET)
+    if(FW_GIT_RESULT EQUAL 0)
+        set(FW_GIT_SHA "${FW_GIT_HASH}")
+        execute_process(COMMAND ${GIT_EXECUTABLE} diff --quiet HEAD --
+            WORKING_DIRECTORY ${CMAKE_CURRENT_LIST_DIR}
+            RESULT_VARIABLE FW_GIT_CHANGED ERROR_QUIET)
+        if(FW_GIT_CHANGED EQUAL 1)
+            set(FW_GIT_DIRTY "-dirty")
+        elseif(NOT FW_GIT_CHANGED EQUAL 0)
+            set(FW_GIT_DIRTY "-status-unknown")
+        endif()
+    endif()
+endif()
+configure_file(fw_build_info.h.in generated/fw_build_info.h @ONLY)
+message(STATUS "Firmware Git revision: ${FW_GIT_SHA}${FW_GIT_DIRTY}")
+
 # Initialise the Raspberry Pi Pico SDK
 pico_sdk_init()
 
@@ -89,6 +114,7 @@ target_link_libraries(SX1280SDR
 
 # Include paths: projekt + TinyUSB + BSP
 target_include_directories(SX1280SDR PRIVATE
+    ${CMAKE_CURRENT_BINARY_DIR}/generated
     ${CMAKE_CURRENT_LIST_DIR}
     ${CMAKE_CURRENT_LIST_DIR}/src
     ${TINYUSB_DIR}/src

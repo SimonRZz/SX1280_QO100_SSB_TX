@@ -32,6 +32,7 @@
 // GPSDO (SI5351 52 MHz clock gen + NEO-7M GPS)
 #include "gpsdo.h"
 #include "si4732.h"
+#include "fw_build_info.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -94,7 +95,7 @@
 // ===============================================
 
 // ================== FIRMWARE VERSION ==================
-#define FW_VERSION      "2.3.0-rx"
+#define FW_VERSION      "2.3.1-rx"
 #define FW_BUILD        __DATE__ " " __TIME__
 // ======================================================
 
@@ -1427,7 +1428,7 @@ static void cfg_print(void) {
     fmt_freq(corr_str, sizeof(corr_str), corrected);
 
     cdc_printf("CFG:\r\n");
-    cdc_printf("  fw=" FW_VERSION "  built=" FW_BUILD "\r\n");
+    cdc_printf("  fw=" FW_VERSION "  git=" FW_GIT_ID "  built=" FW_BUILD "\r\n");
     cdc_printf("  freq=%s Hz (target)  ppm=%.3f  tx=%s  txpwr=%d dBm\r\n",
                freq_str, g_ppm_correction, g_tx_enabled ? "ON" : "OFF", g_tx_power_max_dbm);
     cdc_printf("  mode=%s  tune=%s  gps=%s  gpsgate=%s  config=%s\r\n",
@@ -1510,11 +1511,11 @@ static void cmd_help(void) {
         "                         'rx on' enables it. The receiver needs it to tune.\r\n"
         "  rclk drive <2|4|6|8> - drive strength in mA. 8 mA at boot; 2 mA left the\r\n"
         "                         Si4732 talking on I2C but refusing to tune.\r\n"
-        "  rclk freq <25|36|32k|32m> - reference. SSB needs 32768 Hz inside the chip:\r\n"
-        "                         32k feeds it directly (costs the mixer LO, and its\r\n"
-        "                         harmonics cover the IF); 32m is 32.768 MHz / 1000.\r\n"
+        "  rclk freq <25|36|32k|32m> - reference. Demonstrated SSB uses 32k:\r\n"
+        "                         32k feeds it directly (disables the mixer LO).\r\n"
+        "                         32m = 32.768 MHz / 1000 is experimental for SSB.\r\n"
         "  lo [0|1]             - 144 MHz on SI5351 CLK0, OFF at boot; mixer LO is its 5th\r\n"
-        "                         harmonic at 720 MHz. On by default.\r\n"
+        "                         harmonic at 720 MHz. 32k disables this output.\r\n"
         "  rx                   - receiver status\r\n"
         "  rx diag              - detailed receiver report\r\n"
         "  rx scan [from] [to] [step]  - sweep in kHz and print a level table,\r\n"
@@ -1544,13 +1545,14 @@ static void cmd_help(void) {
         "  rx usb | lsb | am    - demodulation mode (sideband needs the SSB patch)\r\n"
         "  rx freq <kHz>        - 2300..26100, the IF from the mixer.\r\n"
         "                         Decimals allowed: 19500.5 is 19 500 500 Hz.\r\n"
-        "  rx cal <Hz>          - LNB oscillator error, saved to flash. Measure\r\n"
-        "                         it on the lower QO-100 beacon: 10489.500 MHz\r\n"
-        "                         should land at 739.500 MHz, so a beacon seen\r\n"
-        "                         at 739.512 means 'rx cal 12000'.\r\n"
+        "  rx cal <Hz>          - IF offset, saved; build default -4300 Hz.\r\n"
+        "                         Negative when IF arrives low. Apply only here,\r\n"
+        "                         not again in rx freq. Direct generator: cal 0.\r\n"
+        "                         Status adds configured IF/nominal Hz and PLL;\r\n"
+        "                         these are command values, not RF measurements.\r\n"
         "  rx vol <0..63>\r\n"
         "  rx bw <Hz>           - nearest available filter is used\r\n"
-        "  rx bfo <Hz>          - raw BFO; the next tune overwrites it\r\n"
+        "  rx bfo <Hz>          - raw BFO changes IF; next tune overwrites it\r\n"
         "  rx mute 0|1\r\n"
         "\r\n"
         "Frequency is automatically split into PLL steps + fine DSP offset.\r\n"
@@ -1932,7 +1934,7 @@ static bool rx_ensure_rclk(void)
 static void rx_status_print(void) {
     uint8_t rssi = 0, snr = 0;
     bool have_rsq = si4732_read_rsq(&rssi, &snr);
-    cdc_printf("!R on=%d mode=%s hz=%lu cal=%ld bw=%u bfo=%d vol=%u mute=%d rssi=%d snr=%d\r\n",
+    cdc_printf("!R on=%d mode=%s hz=%lu cal=%ld bw=%u bfo=%d vol=%u mute=%d rssi=%d snr=%d tuner_khz=%lu if_hz=%ld actual_hz=%ld bfo_override=%d\r\n",
                si4732_is_on() ? 1 : 0,
                si4732_mode_name(si4732_get_mode()),
                (unsigned long)si4732_get_hz(),
@@ -1942,7 +1944,13 @@ static void rx_status_print(void) {
                si4732_get_volume(),
                si4732_get_mute() ? 1 : 0,
                have_rsq ? (int)rssi : -1,
-               have_rsq ? (int)snr  : -1);
+               have_rsq ? (int)snr  : -1,
+               (unsigned long)si4732_get_khz(),
+               (long)si4732_get_configured_if_hz(),
+               (long)si4732_get_actual_hz(),
+               si4732_bfo_overridden() ? 1 : 0);
+    if (si4732_bfo_overridden())
+        cdc_write_str("NOTE: raw BFO changes configured IF; rx freq restores automatic fine tuning.\r\n");
     // Every setting command ends here, and each one answered "OK" while the
     // chip was powered down, so values were being stored into a receiver that
     // was not running and nothing was heard. on=0 was in the line all along and
@@ -2036,10 +2044,8 @@ static void cdc_handle_line(char *line) {
         if (argc >= 3 && streqi(argv[1], "freq")) {
             long mhz; uint32_t hz;
             if (streqi(argv[2], "32k") || streqi(argv[2], "32768")) {
-                // What the SSB patch requires. It ignores REFCLK_FREQ: with
-                // 36 MHz / 1125 = 32000 Hz the tuning came out 32768/32000 =
-                // 2.4 % high, which is 470 kHz at 19.6 MHz, and sideband
-                // reported rssi 0 for a carrier AM read at 52 dBuV.
+                // Demonstrated SSB setup. High-clock failures did not isolate
+                // whether startup or the reference properties caused them.
                 mhz = 0; hz = 32768u;
             } else if (streqi(argv[2], "32m")) {
                 // The same 32768 Hz inside the chip, reached as 32.768 MHz
@@ -2075,7 +2081,7 @@ static void cdc_handle_line(char *line) {
             if (mhz == 0)
                 cdc_write_str("NOTE: mixer LO (CLK0) is off and cannot run at this "
                               "setting: PLL B is at\r\n      786.432 MHz for it. "
-                              "'rclk freq 32m' gives the same 32768 Hz and keeps "
+                              "'rclk freq 32m' is experimental and keeps "
                               "the LO.\r\n");
             return;
         }
@@ -2160,6 +2166,7 @@ static void cdc_handle_line(char *line) {
             return;
         }
         if (streqi(argv[1], "diag")) {
+            cdc_printf("[FW] " FW_VERSION " git=" FW_GIT_ID " built " FW_BUILD "\r\n");
             // Before anything the chip says about itself: whether it has a
             // clock. Without one every figure below it is a zero that means
             // nothing.
@@ -2500,8 +2507,14 @@ static void cdc_handle_line(char *line) {
         g_mic_gate         = 0.02f;
         g_ptt_required     = 1;
         if (!g_oled_flip) { g_oled_flip = 1; ssd1306_set_flip(OLED_I2C, true); }
-        // Receive side back to the planned QO-100 IF, no LNB calibration.
-        si4732_restore(SI4732_MODE_USB, 19500000u, 32u, 2200u, 0);
+        // Receive side back to the build defaults, including LNB calibration.
+        const bool rx_was_on = si4732_is_on();
+        si4732_restore(SI4732_MODE_USB, 19500000u, 32u, 2200u, SI4732_DEFAULT_CAL_HZ);
+        if (rx_was_on &&
+            (!rx_ensure_rclk() || !si4732_set_mode(si4732_get_mode()))) {
+            cdc_printf("WARN: RX defaults stored but hardware restart failed: %s\r\n",
+                       si4732_last_error());
+        }
         keyer_reset();
         cfg_commit(&k_cfg_defaults);
         if (g_tune_active) tune_apply_settings();
@@ -2613,7 +2626,7 @@ static void cdc_handle_line(char *line) {
         return;
     }
     if (streqi(argv[0], "version") || streqi(argv[0], "ver")) {
-        cdc_write_str("FW: " FW_VERSION " built " FW_BUILD "\r\n");
+        cdc_write_str("FW: " FW_VERSION " git=" FW_GIT_ID " built " FW_BUILD "\r\n");
         return;
     }
     if (streqi(argv[0], "gpsgate") && argc >= 2) {
@@ -4893,7 +4906,7 @@ int main(void) {
 #if CFG_TUD_CDC
         if (!greeted && tud_cdc_connected()) {
             greeted = 1;
-            cdc_write_str("\r\nSX1280_SDR control ready. FW " FW_VERSION " built " FW_BUILD ". Type 'help'.\r\n");
+            cdc_write_str("\r\nSX1280_SDR control ready. FW " FW_VERSION " git=" FW_GIT_ID " built " FW_BUILD ". Type 'help'.\r\n");
             cdc_write_str(g_persist_loaded ? "Config: restored from flash.\r\n"
                                            : "Config: compile-time defaults (nothing valid in flash).\r\n");
             bootlog_flush();

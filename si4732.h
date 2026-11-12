@@ -5,6 +5,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
+// Provisional calibration for this build's Bullseye LNB. Valid settings in
+// flash (including zero for a direct generator test) take precedence.
+#define SI4732_DEFAULT_CAL_HZ (-4300)
+
 // ---------------------------------------------------------------------------
 // Si4732-A10 receive demodulator, on the I2C0 bus shared with the SI5351.
 //
@@ -14,10 +18,9 @@
 // and still receives AM, but si4732_has_ssb() returns false and the sideband
 // modes are refused.
 //
-// Its reference clock is the GPS-disciplined 25 MHz from the second GPSDO on
-// pin 13 (RCLK), so the receive tuning carries the same accuracy as the
-// transmit side — that is the whole reason for not using the usual 32.768 kHz
-// watch crystal, which would be ±20 ppm, or ±390 Hz at a 19.5 MHz IF.
+// SI5351 CLK2 supplies RCLK on pin 13. The demonstrated SSB configuration
+// uses 32768 Hz directly. Other reference configurations remain bench tests;
+// the LNB and an external mixer LO still contribute their own frequency error.
 //
 // si4732_init() must run AFTER gpsdo_init(), which brings up I2C0.
 // ---------------------------------------------------------------------------
@@ -49,22 +52,28 @@ bool     si4732_is_on(void);
 // Tuning. The chip itself only accepts whole kilohertz, which is useless for
 // SSB — a kilohertz of error puts every voice a kilohertz off pitch. So the
 // Hz-resolution entry point rounds to the nearest kHz for the tuner and puts
-// the remainder into the BFO, which steps in 8 Hz. Prefer it over the kHz form.
+// the remainder into the BFO. Prefer it over the kHz form.
 bool     si4732_tune_hz(uint32_t hz);
 uint32_t si4732_get_hz(void);
+
+// Configured frequencies derived from cached commands, NOT RF measurements
+// or tuner readback. SSB uses PLL*1000 - BFO; AM has whole-kHz tuning only.
+int32_t  si4732_get_configured_if_hz(void);
+int32_t  si4732_get_actual_hz(void);  // configured IF minus calibration
+bool     si4732_bfo_overridden(void);
 
 bool     si4732_tune_khz(uint32_t khz);   // 2300..26100 (SW band)
 uint32_t si4732_get_khz(void);
 
-// The LNB's local-oscillator error, in Hz, as the amount by which everything
-// arrives HIGH of where it should. Measure it on the QO-100 beacon: the lower
-// CW beacon at 10489.500 MHz should land at 739.500 MHz out of a 9750 MHz LNB,
-// so a beacon seen at 739.512 MHz means +12000.
+// Calibration in Hz: amount by which a signal arrives HIGH of the nominal IF
+// computed using the nominal LNB LO and the configured mixer LO. An LNB LO
+// 4300 Hz high makes the received IF 4300 Hz low: calibration = -4300.
+// Do not also subtract that correction from the frequency passed to tune_hz.
+// Direct generator tests use calibration zero. A measured offset can include
+// mixer-LO and measuring-receiver errors; it is not a GPS accuracy guarantee.
 //
-// The Bullseye LNB cannot take an external reference — its 25 MHz connector is
-// an output — so this offset is what stands in for GPS discipline on the
-// receive side. Its TCXO is ±2 ppm, roughly ±10 kHz at 23 °C and ±30 kHz over
-// the full temperature range, so one calibration holds for a session.
+// The Bullseye LNB's 25 MHz connector is an output. The measured offset can
+// drift with temperature; an offset setting does not discipline the oscillator.
 // Tunes to a frequency and averages `samples` quality readings, reporting the
 // mean RSSI plus the peak RSSI and SNR. A single read swings far too much to
 // compare frequencies with: the same spot gave 64 and then 0 seconds apart.
@@ -102,13 +111,8 @@ bool     si4732_get_xoscen(void);
 // Antenna tuning capacitor, sent with every tune. Defaults to 1, as the
 // reference library does for every AM and SSB tune.
 //
-// 0 means "tune the varactor yourself". The ROM firmware can; the SSB patch
-// cannot, and asking it to leaves the chip unable to finish another command
-// until the next power-up - which is what "SSB does not tune" was, for weeks.
-// Leave it alone unless you are measuring: in AM it makes no difference worth
-// having on a 50 ohm feed from a mixer, which has no inductance to resonate
-// against anyway. The capacitance is 95 fF x ANTCAP + 7 pF, so 1 is about
-// 7.1 pF. Range 0..6143.
+// 0 requests automatic tuning. The demonstrated SW setup uses 1; historical
+// hangs alone did not establish automatic ANTCAP as their cause. Range 0..6143.
 bool     si4732_set_antcap(uint16_t cap);
 uint16_t si4732_get_antcap(void);
 

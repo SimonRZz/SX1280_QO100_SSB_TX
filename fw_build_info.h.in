@@ -1,0 +1,8 @@
+#ifndef FW_BUILD_INFO_H
+#define FW_BUILD_INFO_H
+
+#define FW_GIT_SHA "@FW_GIT_SHA@"
+#define FW_GIT_DIRTY "@FW_GIT_DIRTY@"
+#define FW_GIT_ID FW_GIT_SHA FW_GIT_DIRTY
+
+#endif

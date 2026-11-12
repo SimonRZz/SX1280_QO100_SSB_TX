@@ -121,34 +121,22 @@ CW KEY / PADDLE JACK (3.5 mm stereo)
 RECEIVER: Si4732-A10 (QO-100 downlink via LNB + mixer)
 ================================================================================
 
-Signal chain:
+Verified operating arrangement (not the older proposed filter/amplifier chain):
 
-   dish -> Bullseye LNB (LO 9750) -> 739.5 MHz -> triplexer -> SAW filter
-        -> RMS-11X mixer -> 19.5 MHz IF -> 3 dB pad -> low-pass
-        -> Si4732 (SSB) -> audio -> GPIO 27 (ADC1)
+    dish -> Bullseye LNB -> triplexer/bias-T -> RMS-11X -> Si4732 pin 8 AMI
+                                                 ^
+                       TinySA HIGH, 720.137 MHz, +7 dBm, unmodulated LO
 
-   SI5351 CLK0, 144 MHz -> high-pass -> SPF5189Z -> mixer LO
-                                         (5th harmonic, 720 MHz)
-   SI5351 CLK2,  25 MHz -> divider -> Si4732 RCLK (pin 13)
+There was NO IF LOW-PASS in the setup that received satellite signals.
+SAW filters, a 3 dB pad, a proposed IF low-pass and an IF amplifier are separate
+experiments, not established prerequisites for that reception. See
+HANDOVER_PEGEL.md for measurements and limits of the current beacon identification.
+An LTE-800 filter needs a measured passband at 19-20 MHz before use after the mixer.
 
-Both from the PICO's SI5351, so the receiver needs no second board: the Pro
-Micro GPSDO is not part of the receive chain at all.
-
-RMS-11X pins: 1 = LO, 4 = IF, 5 = RF, 2/3/6 = ground. Verify with an ohmmeter
-before soldering: pins 2, 3 and 6 read 0 ohm to each other, pins 1 and 5 read a
-few ohms to ground through their transformer windings, and pin 4 reads much
-higher because it is the diode ring. That identifies IF unambiguously; LO versus
-RF needs the package's pin-1 marker. RF/LO cover 5-1900 MHz and IF 5-1000 MHz,
-so every frequency here is comfortably in range. Maximum RF input is 200 mW and
-the IF port tolerates 40 mA of DC — if the receiver on the IF side has a bias
-tee, switch it OFF.
-
-The mixer LO is GPS-disciplined, and so is the Si4732's reference clock, which
-takes 25 MHz from the second GPSDO. THE LNB IS NOT: the Bullseye runs on its own
-TCXO and cannot accept an external reference, because the 25 MHz on its red
-connector is an output. Its +-2 ppm, roughly +-10 kHz at room temperature, is
-therefore the accuracy limit of the whole receive side and is calibrated out with
-"rx cal" against the beacon.
+The optional internal mixer LO is SI5351 CLK0 at 144 MHz; the mixer uses its
+5th harmonic at 720 MHz. Its reported -9 dBm level is not equivalent to the
+external TinySA's +7 dBm. In the successful 32768 Hz reference configuration
+this internal LO is OFF; an external LO is required for conversion.
 
 Si4732-A10 pin assignment (16-pin SOP):
 
@@ -162,225 +150,140 @@ Si4732-A10 pin assignment (16-pin SOP):
     8  AMI              9  RST
 
 --------------------------------------------------------------------------------
-CONTROL BUS — shares I2C0 with the SI5351, no extra pins
+CONTROL BUS -- I2C0 shared with the SI5351
 --------------------------------------------------------------------------------
 
-    Si4732  12  SDIO  <--->  GPIO 0   (Pin 1)    with the SI5351
-    Si4732  11  SCLK  <----  GPIO 1   (Pin 2)    with the SI5351
-    Si4732   9  RST   <----  GPIO 13  (Pin 17)
-    Si4732  10  SENB  ----   see below
+    Si4732  12  SDIO  <---> GPIO 0   (Pin 1)
+    Si4732  11  SCLK  <---- GPIO 1   (Pin 2)
+    Si4732   9  RST   <---- GPIO 13  (Pin 17)
+    Si4732  10  SENB  ----  strap for the intended I2C address
 
-SENB sets the I2C address. The polarity is documented inconsistently between
-the Si4732-A10 and the Si4735-D60 that most application notes describe, so the
-driver probes BOTH 0x11 and 0x63 and reports which one answered ("rx diag").
-Strap SENB either way; 0x11 is preferable because gpsdo.c scans 0x60..0x63 for
-the SI5351 and would mistake a device at 0x63 for the clock generator if the
-SI5351 ever failed to answer.
-
-Pull-ups are already on the bus for the SI5351 (internal, weak). The patch
-upload is 15832 bytes and takes roughly 2-3 s at 100 kHz. External 4.7 kOhm
-pull-ups would allow 400 kHz and cut that to well under a second, but the bus
-speed is shared with the SI5351 — do not raise it without checking that the
-clock generator still configures reliably.
+The driver probes 0x11 and 0x63. 0x11 is the observed address here.
+The GPO1/GPO2 control-bus straps are sampled at reset; retain the validated
+2-wire setup (GPO1/GPO2 open on this build). Ordinary UI changes do not
+change those hardware straps.
 
 --------------------------------------------------------------------------------
-BUS MODE — the one thing a bare chip needs and a module does not
+REFERENCE CLOCK -- successful SSB configuration: true 32768 Hz on CLK2
 --------------------------------------------------------------------------------
 
-    Si4732   4  GPO1  ----  leave OPEN
-    Si4732   3  GPO2  ----  leave OPEN
+    SI5351 CLK2 --------------------> Si4732 13 RCLK
+    rclk freq 32k                      pin 2 (GPO3) stays open
 
-The chip latches its control-bus mode from GPO1 and GPO2 on the RISING edge of
-RST. Left open, the internal pull-up on GPO1 and pull-down on GPO2 select
-2-wire (I2C) mode, which is what we want — but only if RST stays low long
-enough for them to settle (100 us minimum with the pins high-impedance).
+This is the functional connection, not a claim about the exact current coupling
+components. A 1 kOhm / 2.2 nF RCLK RC was tried; noise/wobble remained.
+Record the actual clock wiring and measured waveform before further changes.
 
-Two further conditions, both handled in si_hw_reset():
-  - SCLK must be HIGH across the rising edge of RST. Because the SI5351 shares
-    this bus, the driver takes GPIO 1 away from the I2C block and drives it
-    high by hand for the duration, otherwise a transfer in flight could leave
-    SCL low at exactly the wrong moment and the chip would come up in SPI mode.
-  - No I2C start condition in the 300 ns before that edge.
+The successful external reference is 32768 Hz with prescaler 1. The earlier
+36 MHz / 1125 = 32000 Hz configuration received AM but not the injected carrier
+in SSB. The internal reason is unresolved; "the patch ignores REFCLK_FREQ" is
+a hypothesis, not a demonstrated device requirement.
 
-If "rx diag" reports the chip answering but GET_REV failing, the bus mode
-latched wrong — that is the first thing to check.
+    rclk freq 25  : CLK2 25 MHz, /800 -> 31250 Hz; PLL B 864 MHz
+    rclk freq 36  : CLK2 36 MHz, /1125 -> 32000 Hz; PLL B 864 MHz
+    rclk freq 32k : CLK2 32768 Hz, /1; PLL B 786.432 MHz; CLK0 OFF
+    rclk freq 32m : CLK2 32.768 MHz, /1000; PLL B 864 MHz; CLK0 possible
 
---------------------------------------------------------------------------------
-REFERENCE CLOCK — 25 MHz from SI5351 CLK2
---------------------------------------------------------------------------------
-
-    SI5351 CLK2 ──[ 1 nF ]──> Si4732  13  RCLK
-    (25 MHz, 8 mA)
-                                        pin 2 (GPO3) stays OPEN
-
-NO VOLTAGE DIVIDER. Coupling capacitor only, and drive the output hard.
-
-This was wrong in an earlier version of these notes, which put a 1 kOhm / 220 Ohm
-divider here on the strength of a "0.3 to 1.5 V" input range recalled from
-AN332. That figure describes a crystal-style input fed with a sine wave, not a
-25 MHz CMOS clock. With the divider and 2 mA drive the chip behaved exactly as
-if it had no reference at all: it answered on I2C, reported part 32 and firmware
-1.0, accepted commands — and refused to tune, returning "tune did not complete"
-and 0 kHz read back from AM_TUNE_STATUS. Raising the drive to 8 mA fixed it
-immediately: tune complete, correct frequency, real RSSI readings.
-
-Use "rclk drive 2|4|6|8" to set it from the console; 8 mA is the value that
-works. The 1 nF rather than 100 pF is for margin — 6 ohms of reactance at
-25 MHz instead of 64.
-
-Same SI5351 as everything else, PLL B through a fractional MultiSynth:
-864 / (34 + 14/25) = 25.000000 MHz exactly, divided by 800 inside the Si4732 to
-31250 Hz. Enable it with "rclk 1"; "rx on" does that for you.
-
-VERIFIED, not assumed: AN332's SSB amendment supports RCLK from 31130 Hz to
-40 MHz, so 25 MHz is in range, and 31250 Hz sits inside the 31130..34406 Hz
-REFCLK window. Prescaler 800 with RCLKSEL = 0 selects the RCLK pin.
-
-Fractional is fine here. The Si4732 divides the 25 MHz down by 800 and
-multiplies back up internally, so the two roughly cancel, and the chip is built
-to run off a 32.768 kHz watch crystal at +-20 ppm — its tolerance for reference
-jitter is orders of magnitude above the SX1280's. The fraction is exact, so the
-frequency is exact.
-
-This used to come from the second GPSDO on the Pro Micro, which was built to
-feed the LNB a 25 MHz reference. The Bullseye cannot accept one, so that board
-has no job in the receiver any more and is free for the LNB-disciplining idea
-instead.
-
-THE THREE OUTPUTS, all on the Pico's SI5351:
-
-    CLK0  144 MHz, 8 mA, PLL B integer      mixer LO         "lo 0|1"
-    CLK1   52 MHz, 4 mA, PLL A fractional   SX1280 XTA       never switched
-    CLK2   25 MHz, 8 mA, PLL B fractional   Si4732 RCLK      "rclk 0|1"
-
-CLK1 is the SX1280's only clock. si_write_oeb() clears its enable bit
-unconditionally, so no combination of "lo" and "rclk" can take it away, and
-PLL A must never be reset at runtime. Both receive-side outputs come up OFF:
-gpsdo_init() runs before the boot gate that waits for a locked 52 MHz, and
-nothing on the receive side may keep the transmitter from starting.
-
-A CHIP THAT TALKS BUT WILL NOT TUNE IS A REFERENCE-CLOCK FAULT. "rx diag" shows
-it plainly: part number and firmware come back fine, while "tuner reports 0 kHz,
-tune complete=0". Nothing about the signal path can cause that.
+"32m" is available for investigation; successful SSB reception with it is not
+documented here. PLL A and CLK1 remain the transmitter's 52 MHz source.
+Moving CLK2 onto PLL A is a proposed separate change, not implemented here.
+"rx am"/"rx usb"/"rx on" enable the reference when needed.
 
 --------------------------------------------------------------------------------
-IF INPUT — AMI, not FMI
+RF INPUT AND GROUND
 --------------------------------------------------------------------------------
 
-                                  120 nH
-    mixer IF out ──[ 3 dB pad ]────(((((((──┬──[ 10 nF ]──> Si4732  8  AMI
-                              │             │
-                            27 pF         27 pF
-                              │             │
-                             GND           GND
+    mixer IF out --------------------> Si4732 8 AMI
+    Si4732 7 RFGND -------------------> local RF ground return
+    Si4732 6 FMI ---------------------> leave open
 
-    Si4732   7  RFGND  ----  GND (keep this separate from digital ground)
-    Si4732   6  FMI    ----  leave OPEN
-
-SSB runs through the AM path, so the 19.5 MHz IF goes to AMI. Keep the lead
-short. A weak QO-100 signal lands around -80 dBm here, roughly 30 dB above the
-receiver's sensitivity, so there is margin — but only behind that low-pass.
-
-THE LOW-PASS IS NOT OPTIONAL. A double balanced mixer leaks its local
-oscillator into the IF port; LO-to-IF isolation is typically 20 to 30 dB. With
--5 dBm at the LO port that puts -25 to -35 dBm of 720 MHz on the IF line, which
-is 49 to 59 dB STRONGER than the beacon you are trying to hear. Any receiver
-with an AGC locks onto that instead, and on an 8-bit SDR the wanted signal
-disappears into quantisation noise because the converter only spans about 48 dB.
-Measured on the bench: without the filter, nothing below roughly -55 dBm at the
-IF was audible, which is a dynamic-range limit, not a sensitivity limit.
-
-    19.5 - 20.0 MHz   0.0 dB     720 MHz (LO leak)    46 dB
-    144 MHz           5   dB     739.5 MHz (RF leak)  47 dB
-
-Component values suit a 50 ohm system and are what happened to be in the parts
-bin; the design is forgiving. Two 27 pF in parallel with 15 pF each (42 pF)
-raises the 720 MHz rejection to 54 dB for the same effort. A 2.2 uH inductor
-would put the corner at 7 MHz and kill the IF itself — 120 nH is the right one.
-
-ORDER MATTERS: the pad goes BEFORE the low-pass. That way the mixer sees a
-resistive load rather than the filter's reactance, and the filter gets a defined
-source impedance.
+AMI is the AM/SSB input; FMI is not used for this IF. Keep the RF lead short
+and give RF/audio local ground returns a common reference without routing
+digital switching currents through them. A weak reaction to ANTCAP does not
+prove a failed input or a need for a resonant transformer. Any added coupling,
+termination or filter must be documented and measured in its actual circuit.
 
 --------------------------------------------------------------------------------
-AUDIO INTO THE PICO — GPIO 27 / ADC1
+AUDIO TO THE PICO -- LOUT -> biased ADC1 -> monitor -> headphone PWM
 --------------------------------------------------------------------------------
 
                              3V3 (Pin 36)
-                                  │
+                                  |
                               [ 10 kOhm ]
-                                  │
-    Si4732  1  LOUT ──[ 10 uF ]───┼──[ 1 kOhm ]──> GPIO 27 (Pin 32)  ADC1
-                       (+ to          │                  │
-                        Si4732)  [ 10 kOhm ]        [ 47 nF ]
-                                      │                  │
-                                     GND                GND
+                                  |
+    Si4732 1 LOUT --[ 10 uF ]------o--[ 1 kOhm ]--o--> GPIO27 (Pin 32), ADC1
+                                  |             |
+                              [ 10 kOhm ]    [ 47 nF ]
+                                  |             |
+                                 GND           GND
 
-    Si4732  16  ROUT  ----  leave OPEN (AM/SSB audio is mono)
+    Si4732 16 ROUT remains open (AM/SSB audio is mono).
+    Pico AGND is physical pin 33, the analog ground reference.
 
-Same arrangement as the microphone on ADC0: the divider sets the operating
-point to 1.65 V, the 10 uF blocks DC. The 1 kOhm with 47 nF is the anti-alias
-filter at 3.4 kHz, matched to the 8 kHz sample rate.
+The divider should give approximately 1.65 V DC. The 10 uF blocks DC.
+The originally drawn "+ towards Si4732" is NOT an unconditional polarity rule:
+Si47xx LOUT is reported near 0.7 V DC, below the ADC bias. Measure both sides
+with respect to ground. A polarized capacitor's positive terminal belongs on
+the higher-DC side; alternatively use an appropriate nonpolar capacitor.
+No capacitor-polarity correction has yet been proven to cure this build's noise.
 
-USED BY THE FIRMWARE since stage R2a: 'rx mon 1' feeds this into the headphone
-jack. The samples are levelled on core 0 (DC removal, AGC, hard limiter) and
-mixed into the same PWM stream that carries the sidetone, so NOTHING changes on
-the headphone wiring - this one connection is the whole hardware change.
+1 kOhm / 47 nF is a first-order input low-pass, nominally about 3.4 kHz when
+driven by a low-impedance source. The bias/source impedance changes its response;
+this is not a high-order anti-alias filter. Keep the ADC/bias wiring short.
+The reported strong tone change when touching the divider is a useful symptom,
+not proof of one particular reference-clock, supply or grounding fault.
 
-    rx mon [0|1]          receiver into the headphones
-    rx mon vol <0..100>   level
-    rx mon agc [0|1]      audio AGC, on by default
+The firmware samples ADC1 at 8 kHz; processing on Core0 removes DC and can apply
+a CW audio filter, AGC and limiter. The headphone PWM on GP12 runs at 48 kHz
+sample rate with a higher-frequency carrier. RF AGC and this audio AGC are
+separate. "rx mon agc 0" sets monitor gain to unity for comparisons.
 
-The AGC turns down fast and comes back slowly, so a station that suddenly booms
-in cannot hurt, and a pause between words does not pump. Its range is -26 to
-+36 dB and a hard limiter sits after it, because the AGC follows an envelope
-and a transient outruns any envelope.
-
-THE ADC IS SHARED. There is one sample-and-hold and one FIFO on the chip, and
-the microphone on ADC0 already owns them. Round-robin over both inputs would
-interleave them into a single stream whose phase holds only as long as no
-sample is ever dropped, and a slipped phase would feed receive audio into the
-transmit modulator. So the input is switched instead: while the monitor runs it
-has ADC1, and the transmit audio source is forced to PC. 'rx mon 1' says so
-when it does that. Microphone monitoring - the third part of this stage - needs
-that round-robin and is not built yet.
+A local pulse remained with the Si4732 off and the monitor on. In one 19.4 s
+comparison RX underruns stayed at 84, ring level about 80/256. That pulse was
+not accompanied by new RX ring underruns. "in_peak 0.076" is a software peak
+after DC removal, not an independently measured RMS voltage.
 
 --------------------------------------------------------------------------------
-POWER
+POWER AND DIAGNOSTICS
 --------------------------------------------------------------------------------
 
-    Si4732  14  VDD  <----  3V3(OUT) (Pin 36)   + 100 nF close to the chip
-    Si4732  15  GND  ----   GND                 + 10 uF bulk
-    Si4732   5  NC   ----   leave OPEN
+    Si4732 14 VDD <---- 3V3(OUT), Pico Pin 36; 100 nF close to the IC
+    Si4732 15 GND ---- local ground return; nearby bulk decoupling
+    Si4732  5 NC  ---- leave open
 
-There is no separate VIO pin on the 16-pin package; VDD supplies both.
+Pin 36 is supplied by the Pico's switching regulator. The firmware defaults
+to fixed PWM on the standard Pico 2 via GPIO23; "smps pwm 0|1" compares modes.
+This setting does not prove that the analog supply or ADC reference is quiet.
+Do not confuse physical pin 23 with GPIO23 (an internal board-control GPIO).
 
---------------------------------------------------------------------------------
-CONSOLE COMMANDS
---------------------------------------------------------------------------------
+    version                  firmware version, build time and Git ID
+    rclk freq 32k            successful reference frequency
+    lo 0                     internal mixer LO off; TinySA must supply the LO
+    rx usb | lsb | am        receiver mode/start
+    rx freq <kHz>            requested IF; decimals allowed; applies rx cal once
+    rx cal <Hz>              additive correction, saved to flash
+    rx bfo <Hz>              raw BFO override; next rx freq recalculates it
+    rx mute 0|1              Si4732 audio mute
+    rx mon 0|1               Pico monitor on/off
+    rx mon                   monitor diagnostic; clears held peaks, not underruns
+    rx mon agc 0|1           Pico audio AGC
+    rx mon cw 0              CW audio filter off for general signal tests
+    rx mon poll 0|1          periodic Si4732 RSSI readout
+    oled freeze 0|1          stop/start display transfers with panel still lit
+    oled off | on            panel/charge pump and refresh off/on
+    rx | rx diag             requested/configured frequency, cal, BFO, mute, RSQ
 
-    i2c                  scan both buses; shows what actually answers
-    rclk [0|1]           25 MHz on CLK2 -> Si4732 pin 13. OFF at boot.
-    lo [0|1]             144 MHz on CLK0 -> mixer LO. OFF at boot.
-    rx                   receiver status (!R line)
-    rx diag              detailed report, including which address answered
-    rx on | off          power up / down. Enables rclk first, then uploads
-                         the SSB patch — the chip cannot tune without its
-                         reference clock.
-    rx cal <Hz>          LNB oscillator error, saved to flash
-    rx usb | lsb | am    demodulation mode
-    rx freq <kHz>        2300..26100
-    rx vol <0..63>
-    rx bw <Hz>           nearest available filter
-    rx bfo <Hz>          fine tuning, 8 Hz steps
-    rx mute 0|1
+Calibration default is -4300 Hz for this device. Valid flash values, including
+zero, are preserved. With mixer LO 720.137 MHz, 10489.540 MHz maps to:
+    cal 0,     rx freq 19398.7
+or: cal -4300, rx freq 19403
+These are alternatives. Do not include the LNB error both in the requested IF
+and in rx cal. For a known direct IF test source use rx cal 0.
 
-SSB needs a patch that is not in this repository — run
-
+SSB needs the separately fetched patch:
     sh tools/fetch_ssb_patch.sh
-
-once before building, or the receiver is AM only. CMake says which at configure
-time, and "rx usb" refuses with an explanatory error if it is missing.
+CMake reports whether it is present. Patch ID/CTS alone are not RF proof.
+The full historical diagnostic handover is in HANDOVER_PEGEL.md.
 
 ================================================================================
 GPIO SUMMARY (this fork)
