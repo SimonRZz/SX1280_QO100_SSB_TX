@@ -118,7 +118,9 @@ class SerialWorker:
         self.lock = threading.Lock()
 
     def is_connected(self):
-        return self.ser is not None and self.ser.is_open
+        port, reader = self.ser, self.thread
+        return (port is not None and port.is_open
+                and reader is not None and reader.is_alive())
 
     def connect(self, port, baud=115200):
         if not HAS_SERIAL:
@@ -127,8 +129,11 @@ class SerialWorker:
             if self.is_connected():
                 return
             self.ser = serial.Serial(port=port, baudrate=baud, timeout=0.1, write_timeout=0.5)
-            self.stop_evt.clear()
-            self.thread = threading.Thread(target=self._rx_loop, daemon=True)
+            # Each reader owns its port and stop event. Reconnecting must not
+            # revive an old reader by clearing the event it was waiting on.
+            self.stop_evt = threading.Event()
+            self.thread = threading.Thread(target=self._rx_loop,
+                                           args=(self.ser, self.stop_evt), daemon=True)
             self.thread.start()
 
     def disconnect(self):
@@ -136,6 +141,7 @@ class SerialWorker:
             self.stop_evt.set()
             s = self.ser
             self.ser = None
+            self.thread = None
         if s:
             try: s.close()
             except: pass
@@ -151,27 +157,45 @@ class SerialWorker:
             self.ser.write(data)
             self.ser.flush()
 
-    def _rx_loop(self):
+    def _rx_loop(self, port, stop_evt):
         buf = bytearray()
-        while not self.stop_evt.is_set():
-            with self.lock:
-                s = self.ser
-            if not s:
-                break
-            try:
-                chunk = s.read(256)
+        try:
+            while not stop_evt.is_set():
+                chunk = port.read(256)
+                with self.lock:
+                    if self.ser is not port or self.stop_evt is not stop_evt:
+                        break
                 if chunk:
                     buf.extend(chunk)
                     while b"\n" in buf:
                         line, _, rest = buf.partition(b"\n")
                         buf = bytearray(rest)
                         txt = line.decode("utf-8", errors="replace").rstrip("\r")
-                        self.rx_queue.put(txt)
+                        with self.lock:
+                            if self.ser is not port or self.stop_evt is not stop_evt:
+                                return
+                            self.rx_queue.put(txt)
                 else:
                     time.sleep(0.01)
-            except Exception as e:
-                self.rx_queue.put(f"[SERIAL ERROR] {e}")
-                break
+        except Exception as e:
+            with self.lock:
+                # A late error from an old reader must not disconnect a newer
+                # port or mark its connection as failed.
+                if self.ser is port and self.stop_evt is stop_evt:
+                    self.ser = None
+                    self.thread = None
+                    stop_evt.set()
+                    self.rx_queue.put(f"[SERIAL ERROR] {e}")
+        finally:
+            with self.lock:
+                if self.ser is port and self.stop_evt is stop_evt:
+                    self.ser = None
+                    self.thread = None
+                    stop_evt.set()
+            try:
+                port.close()
+            except Exception:
+                pass
 
 
 class AudioEngine:
@@ -1417,6 +1441,7 @@ class SX1280ControlApp(ttk.Frame):
         self.rx_rssi_var  = tk.StringVar(value="—")
         self.rx_snr_var   = tk.StringVar(value="—")
         self.rx_state_var = tk.StringVar(value="kein Status")
+        self.rx_fresh_var = tk.StringVar(value="noch keine RX-Antwort")
         self.rx_scan_from = tk.StringVar(value="19350")
         self.rx_scan_to   = tk.StringVar(value="19366")
         self.rx_scan_step = tk.StringVar(value="1")
@@ -1449,6 +1474,8 @@ class SX1280ControlApp(ttk.Frame):
         ttk.Button(bf, text="Abfragen", command=lambda: self._send_cmd_safe("rx")).pack(side="left", padx=6)
         ttk.Button(bf, text="Diagnose", command=lambda: self._send_cmd_safe("rx diag")).pack(side="left")
         ttk.Label(bf, text="  (Diagnose erscheint im Console-Reiter)", foreground="gray").pack(side="left")
+        ttk.Label(st, textvariable=self.rx_fresh_var, foreground="gray").grid(
+            row=4, column=0, columnspan=3, sticky="w", pady=(4, 0))
 
         # --- receiver ---
         rf = ttk.LabelFrame(tab, text="Empfänger", padding=10)
@@ -1595,6 +1622,8 @@ class SX1280ControlApp(ttk.Frame):
                   foreground="gray").grid(row=1, column=0, columnspan=7, sticky="w", pady=(4, 0))
 
         self._rx_last_on = None
+        self._rx_last_status_at = None
+        self._rx_next_poll_at = 0.0
         self.master.after(1000, self._rx_live_tick)
 
     def _rx_set_mode(self):
@@ -1660,16 +1689,41 @@ class SX1280ControlApp(ttk.Frame):
         self._rx_set_freq()
 
     def _rx_live_tick(self):
+        now = time.monotonic()
         try:
-            # Not while the receiver is known to be off: the firmware then
-            # adds a "receiver is OFF" note to every answer, once a second.
             if (self.rx_live_var.get() and self.worker.is_connected()
-                    and self._rx_last_on is not False
-                    and self.notebook.tab(self.notebook.select(), "text") == "RX"):
-                self.worker.send_line("rx")          # silent: not echoed to the console
-        except Exception:
-            pass
+                    and self.notebook.tab(self.notebook.select(), "text") == "RX"
+                    and now >= self._rx_next_poll_at):
+                self.worker.send_line("rx")
+                # Recheck OFF receivers too: they can be started externally.
+                self._rx_next_poll_at = now + (5.0 if self._rx_last_on is False else 1.0)
+        except Exception as e:
+            self._log(f"[RX POLL ERROR] {e}", "error")
+        self._rx_update_freshness(now)
         self.master.after(1000, self._rx_live_tick)
+
+    def _rx_reset_status(self):
+        self._rx_last_on = None
+        self._rx_last_status_at = None
+        self._rx_next_poll_at = 0.0
+        self.rx_state_var.set("kein aktueller RX-Status")
+        self.rx_rssi_var.set("—")
+        self.rx_snr_var.set("—")
+        self.rx_rssi_bar["value"] = 0
+        self.rx_snr_bar["value"] = 0
+        self.rx_fresh_var.set("noch keine RX-Antwort")
+
+    def _rx_update_freshness(self, now):
+        if not self.worker.is_connected():
+            self.rx_fresh_var.set("RX-Daten: nicht verbunden")
+        elif self._rx_last_status_at is None:
+            self.rx_fresh_var.set("RX-Daten: noch keine Antwort")
+        else:
+            age = max(0.0, now - self._rx_last_status_at)
+            stale_after = 7.0 if self._rx_last_on is False else 3.0
+            prefix = "VERALTET — " if age > stale_after else ""
+            live = "" if self.rx_live_var.get() else "Live aus; "
+            self.rx_fresh_var.set(f"{prefix}{live}letzte RX-Antwort vor {age:.0f} s")
 
     def _handle_rx_status(self, line):
         kv = dict(t.split("=", 1) for t in line[3:].split() if "=" in t)
@@ -1678,6 +1732,10 @@ class SX1280ControlApp(ttk.Frame):
             except ValueError: return d
         on = kv.get("on") == "1"
         self._rx_last_on = on
+        now = time.monotonic()
+        self._rx_last_status_at = now
+        self._rx_next_poll_at = now + (1.0 if on else 5.0)
+        self._rx_update_freshness(now)
         hz = num("hz")
         mode = kv.get("mode", "?")
         rssi, snr = num("rssi", -1), num("snr", -1)
@@ -1792,7 +1850,7 @@ class SX1280ControlApp(ttk.Frame):
         self.log_count_var       = tk.StringVar(value="0 lines")
         ttk.Checkbutton(tb, text="Timestamps", variable=self.log_timestamps_var,
                         command=self._rerender_log).pack(side="left")
-        ttk.Checkbutton(tb, text="!S status pushes", variable=self.log_show_status_var,
+        ttk.Checkbutton(tb, text="Push-Meldungen (!S/!K/!M)", variable=self.log_show_status_var,
                         command=self._rerender_log).pack(side="left", padx=(8, 0))
         ttk.Checkbutton(tb, text="GPSDO lines", variable=self.log_show_gpsdo_var,
                         command=self._rerender_log).pack(side="left", padx=(8, 0))
@@ -2178,9 +2236,11 @@ class SX1280ControlApp(ttk.Frame):
         self._send_cmd_safe(f"gpsgate {1 if self.gps_gate_var.get() else 0}")
 
     def _parse_fw_line(self, line):
-        m = re.search(r'\b(?:fw=|FW[: ]\s*)(\S+)\s+built[= ]\s*(.+?)(?:\.\s*Type|\s*$)', line)
+        m = re.search(r'\b(?:fw=|FW[:\] ]\s*)(\S+)\s+'
+                      r'(?:git=(\S+)\s+)?built[= ]\s*(.+?)(?:\.\s*Type|\s*$)', line)
         if m:
-            self.fw_version_var.set(f"FW {m.group(1)}  ({m.group(2).strip()})")
+            revision = f" git={m.group(2)}" if m.group(2) else ""
+            self.fw_version_var.set(f"FW {m.group(1)}{revision}  ({m.group(3).strip()})")
 
     def _on_mode_change(self):
         if self._status_updating:
@@ -2221,6 +2281,7 @@ class SX1280ControlApp(ttk.Frame):
             return
         try:
             self.worker.connect(port)
+            self._rx_reset_status()
             self.status_var.set(f"🟢 Connected: {port}")
             self._log(f"Connected to {port} @ 115200 8N1 — requesting 'get' and 'status'", "info")
             self.master.after(500, lambda: self._send_cmd_safe("get"))
@@ -2235,6 +2296,8 @@ class SX1280ControlApp(ttk.Frame):
             self.master.after_cancel(self._heartbeat_id)
             self._heartbeat_id = None
         self.worker.disconnect()
+        self._rx_reset_status()
+        self._rx_update_freshness(time.monotonic())
         self.status_var.set("⚫ Disconnected")
         self._log("Disconnected", "info")
 
@@ -2600,10 +2663,15 @@ class SX1280ControlApp(ttk.Frame):
                         self._log(line, "recv")
                 elif line.startswith("!R "):
                     self._handle_rx_status(line)
-                    if self.log_show_status_var.get():
-                        self._log(line, "recv")
+                    # Command replies stay visible, including manual queries.
+                    # The push-message checkbox controls only !S/!K/!M.
+                    self._log(line, "recv")
                 else:
                     self._log(line, "recv")
+                    if line.startswith("[SERIAL ERROR]") and not self.worker.is_connected():
+                        self.status_var.set("🔴 Verbindung unterbrochen — erneut verbinden")
+                        self._rx_reset_status()
+                        self._rx_update_freshness(time.monotonic())
                     # Sync CW keyer TX button when firmware reports tune/CW stopped.
                     # _cw_test_stop_pending suppresses this for test-carrier stops.
                     if "OK tune=OFF" in line or "TX stopped" in line:
@@ -2618,8 +2686,14 @@ class SX1280ControlApp(ttk.Frame):
                         self._parse_fw_line(line)
         except queue.Empty:
             pass
+        except Exception as e:
+            # A malformed line must not permanently stop the receive timer.
+            self._log(f"[RX PARSE ERROR] {e}", "error")
         if latest_status is not None:
-            self._handle_status_push(latest_status)
+            try:
+                self._handle_status_push(latest_status)
+            except Exception as e:
+                self._log(f"[STATUS PARSE ERROR] {e}", "error")
         delay = 10 if processed >= 20 else 50
         self.master.after(delay, self._poll_rx)
 

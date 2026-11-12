@@ -40,7 +40,26 @@ ZF-Einspeisung `rx cal 0` verwenden. Die −4300 Hz sind ein bisheriger
 Messwert; RTL-SDR-/TinySA-Fehler und LNB-Temperatur können beitragen.
 Ein GPS-gebundener Mischer-LO allein kalibriert noch nicht den LNB.
 
-## Bereits vorher enthalten
+## GUI-Korrektur nach Firmware-Flash
+
+Die GUI behandelt einen abgebrochenen USB-Lesethread jetzt als getrennte
+Verbindung und verhindert, dass ein alter Thread eine neue Verbindung
+beeinflusst. Nach dem Flashen den aktuellen Port neu verbinden. RX-Antworten
+(`!R`) erscheinen auch bei ausgeblendeten Push-Meldungen in der Konsole.
+Der Versionsparser versteht alte Ausgaben und die neue `git=`-Kennung.
+
+Die Live-Abfrage prüft auch einen zuvor ausgeschalteten Empfänger erneut;
+beim Verbinden werden alte RX-Daten verworfen. Eine Altersanzeige macht
+ausbleibende Antworten sichtbar. Dafür muss **gui.py aktualisiert werden**;
+das reine Flashen einer UF2 ändert die PC-GUI nicht. Die USB-Deskriptoren
+und die Firmware-Konsolenbefehle wurden für diese Korrektur nicht geändert.
+
+Automatische GUI-Tests verwenden simulierte serielle Verbindungen. Sie
+ersetzen keinen Test mit dem angeschlossenen Pico. Falls auch `version`
+und `help` nach erneutem Verbinden unbeantwortet bleiben, sind die
+Verbindung und ein möglicher blockierter Firmware-Hauptablauf weiter zu prüfen.
+
+## Bereits zuvor enthaltene Empfangsfunktionen
 
 * Seit `3bb1596`: BFO-Vorzeichen auf `-Rest` korrigiert und der BFO beim
   Laden gespeicherter Einstellungen wiederhergestellt.
@@ -67,6 +86,12 @@ Ein GPS-gebundener Mischer-LO allein kalibriert noch nicht den LNB.
 * **Baken eindeutig identifizieren:** die Angaben „CW bei 19360 kHz“ und
   später „BPSK bei 19360 kHz“ widersprechen sich. Träger-/Spektrumszuordnung
   bei protokollierten LO-Werten messen.
+* **Mögliche unbeabsichtigte Encoder-Abstimmung prüfen:** Kabelbewegungen
+  verändern den Ton, erneutes Anklicken der Bake stellt den Empfang wieder her.
+  Vor und nach dem Fehler frische `rx`-Antworten vergleichen, bevor erneut
+  abgestimmt wird. Auf der OLED-RX-Seite können Encoder-Flanken RX-Tunes
+  auslösen; der GUI-RX-Reiter ist davon unabhängig. Ein Fehler durch den
+  Encoder ist noch nicht nachgewiesen.
 
 ## Keine feste BFO-500-Hz-Vorgabe
 
