@@ -13,8 +13,12 @@ import queue
 import re
 import ctypes
 import ctypes.util
+import math
 import sys
+from collections import deque
+from contextlib import ExitStack
 from dataclasses import dataclass
+from statistics import median
 from typing import Optional
 
 try:
@@ -80,6 +84,666 @@ MORSE_CODE[' '] = ' '  # word space
 READABLE_PINS = ['CTS', 'DSR', 'RI', 'CD']
 
 QO100_LO_HZ = 8_089_500_100  # Measured QO-100 transponder LO offset, nominal 8089.5 MHz
+
+
+@dataclass
+class RxScanChunk:
+    frequencies: range
+    deadline: float
+    started: bool = False
+    finished: bool = False
+
+    _HEADER = re.compile(r"Scanning (\d+)\.\.(\d+) kHz in (\d+) kHz steps, \d+ reads each")
+    _ROW = re.compile(r"\s*(\d+)\s+(\d+)\s*/\s*\d+\s+(\d+)\s*#*")
+    _FAILED = re.compile(r"\s*\d+\s+-- measurement failed:.*")
+
+    def consume(self, line, points):
+        header = self._HEADER.fullmatch(line)
+        if header:
+            self.started = tuple(map(int, header.groups())) == (
+                self.frequencies[0], self.frequencies[-1], self.frequencies.step)
+            return self.started
+        if not self.started:
+            return False
+        row = self._ROW.fullmatch(line)
+        if row:
+            khz, rssi, snr = map(int, row.groups())
+            if khz in self.frequencies and rssi <= 255 and snr <= 255:
+                points[khz] = (rssi, snr)
+            return True
+        if line.startswith("Highest average:"):
+            self.finished = True
+            return True
+        return (self._FAILED.fullmatch(line) is not None or
+                line.startswith(("  kHz    rssi", "A 500 kHz run of high readings")))
+
+
+class RxWaterfall(ttk.LabelFrame):
+    _CHUNK_SIZE = 6
+    _TRACE_HEIGHT = 76
+    _ROW_HEIGHT = 4
+    _BACKGROUND = "#0b1425"
+    _EMPTY = bytes.fromhex("192436")
+    _STOPS = ("071121", "20316b", "22638b", "2a9d94", "b3c658", "ffdf85", "fff5e5")
+    _SCAN_RANGE = ("19342", "19366", "1")
+    _CLICK_PITCH_HZ = 600
+    _AUDIO_SPANS = (3800, 3000, 2000, 1000, 500, 250)
+
+    def __init__(self, parent, app):
+        super().__init__(parent, text="RX-Wasserfall", padding=10)
+        self.app = app
+        self.frequencies = range(0)
+        self.history = deque(maxlen=90)
+        self.points = {}
+        self.chunk = None
+        self.running = False
+        self.next_index = 0
+        self.next_at = 0.0
+        self.audio_view = False
+        self.audio_session = None
+        self.last_spectrum = None
+        self.audio_frequencies, self.audio_center_hz = self.audio_range(3000, self._CLICK_PITCH_HZ)
+        self.tx_idle = False
+        self.scan_context = None
+        self.dial_khz = None
+        self.nominal_if_hz = None
+        self.bfo_override = None
+        self.restore_bfo = None
+        self.pending_tune = None
+        self.image = None
+        self.palette = self._make_palette()
+        self.scale = (15.0, 65.0)
+        self.audio_scale = (-95.0, -65.0)
+
+        self.start_khz, self.stop_khz, self.step_khz = [tk.StringVar(value=value) for value in self._SCAN_RANGE]
+        self.metric = tk.StringVar(value="RSSI")
+        self.auto_scale = tk.BooleanVar(value=True)
+        self.low = tk.StringVar(value="15")
+        self.high = tk.StringVar(value="65")
+        self.status = tk.StringVar(value="Live-Audio nutzt den Ton der aktuell eingestellten Frequenz.")
+        self.latest = tk.StringVar(value="")
+
+        sweep = ttk.Frame(self)
+        sweep.pack(fill="x")
+        for label, var, width in (("Von (kHz)", self.start_khz, 8),
+                                  ("Bis (kHz)", self.stop_khz, 8),
+                                  ("Schritt", self.step_khz, 4)):
+            ttk.Label(sweep, text=label).pack(side="left")
+            ttk.Entry(sweep, textvariable=var, width=width).pack(side="left", padx=(4, 10))
+        ttk.Button(sweep, text="Um aktuelle ZF", command=self._center_scan).pack(side="left", padx=(0, 6))
+        self.scan_button = ttk.Button(sweep, text="ZF-Einzelscan", command=self._toggle_scan)
+        self.scan_button.pack(side="left")
+
+        display = ttk.Frame(self)
+        display.pack(fill="x", pady=(7, 6))
+        self.live_button = ttk.Button(display, text="Live-Audio starten", command=self._toggle_live)
+        self.live_button.pack(side="left", padx=(0, 12))
+        self.metric_box = ttk.Combobox(display, textvariable=self.metric, values=("RSSI", "SNR"),
+                                       width=6, state="readonly")
+        self.metric_box.pack(side="left", padx=(0, 10))
+        self.metric_box.bind("<<ComboboxSelected>>", self._metric_changed)
+        ttk.Checkbutton(display, text="Auto-Kontrast", variable=self.auto_scale,
+                        command=self._scale_mode_changed).pack(side="left", padx=(0, 10))
+        self.scale_entries = []
+        for label, var in (("Min.", self.low), ("Max.", self.high)):
+            ttk.Label(display, text=label).pack(side="left")
+            entry = ttk.Entry(display, textvariable=var, width=5)
+            entry.pack(side="left", padx=(4, 10))
+            self.scale_entries.append(entry)
+            entry.state(["disabled"])
+            entry.bind("<Return>", self._apply_scale)
+            entry.bind("<FocusOut>", self._apply_scale)
+        ttk.Button(display, text="Verlauf löschen", command=self._clear_history).pack(side="right")
+
+        audio_controls = ttk.Frame(self)
+        audio_controls.pack(fill="x", pady=(0, 6))
+        self.audio_span_var = tk.StringVar(value="3000")
+        self.audio_center_var = tk.StringVar(value=str(self.audio_center_hz))
+        self.filter_var = tk.StringVar(value="")
+        ttk.Label(audio_controls, text="Ansicht (Hz)").pack(side="left")
+        span = ttk.Combobox(audio_controls, textvariable=self.audio_span_var, values=self._AUDIO_SPANS,
+                            state="readonly", width=6)
+        span.pack(side="left", padx=(4, 12))
+        span.bind("<<ComboboxSelected>>", self._apply_audio_view)
+        ttk.Label(audio_controls, text="Mitte (Hz)").pack(side="left")
+        center = ttk.Entry(audio_controls, textvariable=self.audio_center_var, width=6)
+        center.pack(side="left", padx=(4, 12))
+        center.bind("<Return>", self._apply_audio_view)
+        center.bind("<FocusOut>", self._apply_audio_view)
+        ttk.Label(audio_controls, text="RX-Filter (Hz)").pack(side="left")
+        self.filter_box = ttk.Combobox(audio_controls, textvariable=self.filter_var, width=6, state="disabled")
+        self.filter_box.pack(side="left", padx=(4, 0))
+        self.filter_box.bind("<<ComboboxSelected>>", lambda _event: self._set_filter(self.filter_var.get()))
+
+        self.canvas = tk.Canvas(self, height=220, bg=self._BACKGROUND, highlightthickness=0,
+                                cursor="crosshair")
+        self.canvas.pack(fill="x")
+        self.canvas.bind("<Configure>", self._draw)
+        self.canvas.bind("<Button-1>", self._click)
+        self.canvas.bind("<Shift-Button-1>", self._click_filter)
+        ttk.Label(self, textvariable=self.status, wraplength=660).pack(anchor="w", pady=(6, 0))
+        ttk.Label(self, textvariable=self.latest, wraplength=660).pack(anchor="w")
+        ttk.Label(self, text="Klick stimmt auf die Mitte ab. Umschalt+Klick setzt im Live-Audio den RX-Filter (USB/LSB).",
+                  foreground="gray", wraplength=660).pack(anchor="w", pady=(3, 0))
+        self.after(100, self._tick)
+
+    @classmethod
+    def _make_palette(cls):
+        stops = [bytes.fromhex(color) for color in cls._STOPS]
+        result = []
+        for index in range(256):
+            section, weight = divmod(index * (len(stops) - 1), 256)
+            result.append(bytes((a * (256 - weight) + b * weight) // 256
+                                for a, b in zip(stops[section], stops[section + 1])))
+        return result
+
+    @property
+    def busy(self):
+        return self.chunk is not None
+
+    @staticmethod
+    def sweep_range(start, stop, step):
+        start, stop, step = int(start), int(stop), int(step)
+        if not 2300 <= start < stop <= 26100 or not 1 <= step <= stop - start:
+            raise ValueError("ZF-Bereich 2300–26100 kHz, mindestens zwei Messpunkte.")
+        frequencies = range(start, stop + 1, step)
+        if len(frequencies) > 512:
+            raise ValueError("Maximal 512 Punkte. Schrittweite erhöhen oder den Bereich verkleinern.")
+        return frequencies
+
+    def _toggle_live(self):
+        if self.audio_session is not None:
+            self._stop_live("Live-Audio pausiert.")
+            return
+        if self.running or self.busy:
+            self.status.set("Live-Audio ist nach dem ZF-Einzelscan verfügbar.")
+            return
+        if not self.app.worker.is_connected() or self.app._rx_last_on is not True or not self.tx_idle:
+            self.status.set("Für Live-Audio RX einschalten und TX auf OFF stellen.")
+            return
+        if not self.app._rx_start_capture():
+            self.status.set(self.app.rx_pc_audio_status.get())
+            return
+        self._select_view(True, self.audio_frequencies)
+        self._restart_spectrum()
+        self.live_button.config(text="Live-Audio pausieren")
+        self.status.set("Live-Audio · Frequenzen im aktuellen Empfangston")
+
+    def _stop_live(self, message):
+        if self.audio_session is None:
+            return
+        self.audio_session = self.app.rx_playback.spectrum_session = None
+        self.last_spectrum = None
+        self.status.set(message)
+        self.live_button.config(text="Live-Audio starten")
+        self.app._rx_stop_capture_if_idle()
+
+    def _restart_spectrum(self):
+        self.audio_session = self.app.rx_playback.spectrum_session = self.frequencies[:]
+        self.last_spectrum = None
+
+    @classmethod
+    def audio_range(cls, span, center):
+        if span not in cls._AUDIO_SPANS:
+            raise ValueError("Eine angebotene Ansichtsbreite wählen.")
+        if not 210 <= center <= 3990:
+            raise ValueError("Die Mitte muss zwischen 210 und 3.990 Hz liegen.")
+        step = 2 if span <= 1000 else (5 if span <= 2000 else 10)
+        center = round(center / step) * step
+        low = max(200, min(4000 - span, (center - span // 2) // step * step))
+        return range(low, low + span + 1, step), center
+
+    def _apply_audio_view(self, _event=None):
+        try:
+            frequencies, center = self.audio_range(int(self.audio_span_var.get()), int(self.audio_center_var.get()))
+        except ValueError:
+            self.status.set("Mitte zwischen 210 und 3.990 Hz eingeben.")
+            return
+        self.audio_center_var.set(str(center))
+        if (frequencies, center) == (self.audio_frequencies, self.audio_center_hz):
+            return
+        self.audio_frequencies, self.audio_center_hz = frequencies, center
+        if self.audio_view:
+            if frequencies == self.frequencies:
+                self._draw()
+            else:
+                self._select_view(True, frequencies)
+                if self.audio_session is not None:
+                    self._restart_spectrum()
+
+    def _filter_choices(self, mode):
+        return self.app._RX_BW_AM if mode == "am" else self.app._RX_BW_SSB
+
+    def _set_filter(self, value):
+        if not self.scan_context:
+            return
+        mode, bandwidth, _ = self.scan_context
+        if (self.busy or self.running or not self.tx_idle or self.app._rx_last_on is not True or
+                not self.app.worker.is_connected() or value not in self._filter_choices(mode)):
+            self.filter_var.set(bandwidth)
+            return
+        if value != bandwidth:
+            self.app._send_cmd_safe(f"rx bw {value}")
+
+    def _center_scan(self):
+        if self.dial_khz is None:
+            self.status.set("Für den ZF-Bereich zuerst den Empfänger verbinden.")
+            return
+        center = round(self.dial_khz)
+        self.start_khz.set(str(max(2300, min(26076, center - 12))))
+        self.stop_khz.set(str(int(self.start_khz.get()) + 24))
+
+    def _select_view(self, audio, frequencies):
+        if audio == self.audio_view and frequencies == self.frequencies:
+            return
+        self.audio_view, self.frequencies = audio, frequencies
+        self.metric_box.config(state="disabled" if audio else "readonly")
+        low, high = self.audio_scale if audio else self.scale
+        self.low.set(f"{low:g}")
+        self.high.set(f"{high:g}")
+        self._clear_history()
+
+    def _toggle_scan(self):
+        if self.running:
+            self.pause("ZF-Suchlauf abgebrochen.")
+        else:
+            self.start_scan()
+
+    def start_scan(self):
+        if self.running or self.chunk is not None:
+            return
+        if not self.app.worker.is_connected() or self.app._rx_last_on is not True or not self.tx_idle:
+            self.status.set("Für einen Suchlauf verbinden, RX einschalten und TX auf OFF stellen.")
+            return
+        values = self.start_khz.get(), self.stop_khz.get(), self.step_khz.get()
+        if values == self._SCAN_RANGE and self.dial_khz is not None and not 19342 <= self.dial_khz <= 19366:
+            self._center_scan()
+            values = self.start_khz.get(), self.stop_khz.get(), self.step_khz.get()
+        try:
+            frequencies = self.sweep_range(*values)
+        except ValueError as error:
+            self.status.set(str(error))
+            return
+        self._stop_live("Live-Audio pausiert.")
+        self._select_view(False, frequencies)
+        self.running = True
+        self.app.rx_playback.scan_muted = True
+        self.scan_button.config(text="Scan abbrechen")
+        self.points.clear()
+        self.next_index = 0
+        self.next_at = 0.0
+        self.restore_bfo = self.bfo_override
+        self._send_chunk(time.monotonic())
+
+    def _send_chunk(self, now):
+        frequencies = self.frequencies[self.next_index:self.next_index + self._CHUNK_SIZE]
+        self.chunk = RxScanChunk(frequencies, now + 12.0)
+        try:
+            self.app.worker.send_line(f"rx scan {frequencies[0]} {frequencies[-1]} {frequencies.step}")
+        except Exception as error:
+            self.chunk = None
+            self.pause(f"Suchlauf fehlgeschlagen: {error}")
+            return
+        self.status.set(f"Suchlauf · {self.next_index + 1}–{self.next_index + len(frequencies)} "
+                        f"von {len(self.frequencies)} Punkten")
+
+    def _tick(self):
+        now = time.monotonic()
+        if self.chunk is not None and now >= self.chunk.deadline:
+            self.chunk = None
+            self.pause("Zeitüberschreitung beim Suchlauf.")
+        if self.running:
+            if (not self.app.worker.is_connected() or self.app._rx_last_on is not True or
+                    self.app.notebook.tab(self.app.notebook.select(), "text") != "RX"):
+                self.pause("Suchlauf pausiert.")
+            elif self.chunk is None and now >= self.next_at:
+                self._send_chunk(now)
+        if self.audio_session is not None:
+            if not self.app.worker.is_connected() or self.app._rx_last_on is not True:
+                self._stop_live("Live-Audio pausiert · RX oder USB-Audio aus.")
+            elif self.app.notebook.tab(self.app.notebook.select(), "text") == "RX":
+                frame = self.app.rx_playback.spectrum_frame
+                if frame is not None and frame[0] is self.audio_session and frame is not self.last_spectrum:
+                    self.last_spectrum = frame
+                    self.history.appendleft(frame[1])
+                    self._draw()
+        self.after(100, self._tick)
+
+    def pause(self, message="Suchlauf pausiert.", discard_bfo=False):
+        self.running = False
+        if discard_bfo:
+            self.restore_bfo = None
+        self.status.set(message)
+        self.scan_button.config(text="ZF-Einzelscan")
+        if self.chunk is None:
+            self._restore_tuning()
+
+    def _restore_tuning(self):
+        tune, bfo = self.pending_tune, self.restore_bfo
+        self.pending_tune = self.restore_bfo = None
+        if self.app.worker.is_connected():
+            if tune is not None:
+                self.app.rx_freq_var.set(str(tune))
+                self.app._rx_set_freq()
+                self.status.set(f"ZF {tune} kHz gewählt · Suchlauf pausiert.")
+            elif bfo is not None:
+                self.app._send_cmd_safe(f"rx bfo {bfo}")
+        self.app.rx_playback.scan_muted = False
+
+    def reset(self):
+        self._stop_live("")
+        self.chunk = None
+        self.pending_tune = self.bfo_override = self.dial_khz = None
+        self.nominal_if_hz = None
+        self.scan_context = None
+        self.filter_var.set("")
+        self.filter_box.config(state="disabled")
+        self.tx_idle = False
+        self.pause("Für einen Suchlauf RX einschalten und TX auf OFF stellen.", discard_bfo=True)
+        self._select_view(False, range(0))
+
+    def command(self, command):
+        args = command.lower().split()
+        tx_command = bool(args and args[0] in ("tx", "tune", "cw", "key", "mode", "src", "stop"))
+        if tx_command:
+            self.tx_idle = False
+        if not (self.running or self.chunk is not None):
+            return
+        rx_command = args[1] if len(args) > 1 and args[0] == "rx" else None
+        if (tx_command or (args and args[0] in ("rclk", "lo")) or
+                rx_command in ("freq", "bfo", "cal", "bw", "on", "off", "am", "usb", "lsb",
+                               "scan", "agc", "antcap", "raw")):
+            self.pending_tune = None
+            self.pause(discard_bfo=rx_command in ("freq", "bfo", "cal"))
+
+    def observe(self, line):
+        if line.startswith("!S "):
+            fields = dict(part.split("=", 1) for part in line.split() if "=" in part)
+            self.tx_idle = all(fields.get(key) == "0" for key in ("tx", "tune", "key"))
+            if self.running and not self.tx_idle:
+                self.pause("Suchlauf pausiert · TX oder Tastung aktiv.")
+            if not self.tx_idle:
+                self._stop_live("Live-Audio pausiert · TX oder Tastung aktiv.")
+            return False
+        if line.startswith("!R "):
+            fields = dict(part.split("=", 1) for part in line.split() if "=" in part)
+            context = tuple(fields.get(key) for key in ("mode", "bw", "cal"))
+            mode, bandwidth, _ = context
+            if self.scan_context is None or mode != self.scan_context[0]:
+                self.filter_box.config(values=self._filter_choices(mode), state="readonly")
+            if bandwidth and bandwidth != self.filter_var.get():
+                self.filter_var.set(bandwidth)
+            changed = self.scan_context is not None and context != self.scan_context
+            if changed:
+                if not self.audio_view:
+                    self._clear_history()
+                if self.running:
+                    self.pause("Suchlauf pausiert · RX-Einstellungen geändert.")
+            self.scan_context = context
+            hz = fields.get("hz", "")
+            dial_changed = hz.isdecimal() and int(hz) / 1000 != self.dial_khz
+            if dial_changed:
+                self.dial_khz = int(hz) / 1000
+                self._draw_marker()
+            bfo = fields.get("bfo", "")
+            override = int(bfo) if fields.get("bfo_override") == "1" and bfo.lstrip("-").isdecimal() else None
+            nominal = fields.get("actual_hz", hz if override is None else "")
+            nominal_hz = int(nominal) if nominal.isdecimal() else None
+            nominal_changed = nominal_hz != self.nominal_if_hz
+            self.nominal_if_hz = nominal_hz
+            if self.audio_view and (changed or dial_changed or nominal_changed or override != self.bfo_override):
+                self._clear_history()
+                if self.audio_session is not None:
+                    self._restart_spectrum()
+            self.bfo_override = override
+            if self.chunk is not None and self.chunk.finished:
+                self._complete_chunk()
+                return True
+            if self.running and fields.get("on") == "0":
+                self.pause("Suchlauf pausiert · RX ist aus.")
+            return False
+        if self.chunk is None:
+            return False
+        if not self.chunk.started and line.startswith("ERR:"):
+            self.chunk = None
+            self.pause(f"Suchlauf fehlgeschlagen · {line[4:].strip()}")
+            return False
+        return self.chunk.consume(line, self.points)
+
+    def _complete_chunk(self):
+        self.next_index += len(self.chunk.frequencies)
+        self.chunk = None
+        if not self.running:
+            self._restore_tuning()
+            return
+        if self.next_index < len(self.frequencies):
+            self.next_at = time.monotonic() + 0.15
+            return
+        if not self.points:
+            self.pause("Der Suchlauf hat keine gültigen Messwerte geliefert.")
+            return
+        self.history.appendleft(tuple(self.points.get(khz) for khz in self.frequencies))
+        count = len(self.points)
+        self._draw()
+        self.next_index = 0
+        self.points.clear()
+        self.pause(f"ZF-Scan fertig · {count}/{len(self.frequencies)} Messpunkte")
+
+    def _clear_history(self):
+        self.history.clear()
+        self._draw()
+
+    def _metric_changed(self, _event):
+        low, high = (15, 65) if self.metric.get() == "RSSI" else (0, 35)
+        self.low.set(str(low))
+        self.high.set(str(high))
+        self._apply_scale()
+
+    def _scale_mode_changed(self):
+        for entry in self.scale_entries:
+            entry.state(["disabled"] if self.auto_scale.get() else ["!disabled"])
+        self._draw()
+
+    @staticmethod
+    def _automatic_scale(rows, metric_index):
+        values = sorted(point[metric_index] for row in rows for point in row if point is not None)
+        if not values:
+            return None
+        low = 0 if metric_index == 1 else min(252, max(0, values[(len(values) - 1) // 4] - 0.5))
+        upper = values[(len(values) - 1) * 90 // 100] + 1
+        return low, min(255, max(low + 3, upper))
+
+    def _apply_scale(self, _event=None):
+        try:
+            low, high = (float(var.get().replace(",", ".")) for var in (self.low, self.high))
+            bounds = (-110, 0) if self.audio_view else (0, 255)
+            if not bounds[0] <= low < high <= bounds[1]:
+                raise ValueError
+        except ValueError:
+            self.status.set(f"Farbskala {bounds[0]} bis {bounds[1]}, Minimum kleiner als Maximum.")
+            return
+        if self.audio_view:
+            self.audio_scale = low, high
+        else:
+            self.scale = low, high
+        self._draw()
+
+    def _plot(self):
+        return 10, 29, max(1, self.canvas.winfo_width() - 20), self.canvas.winfo_height() - 37
+
+    def _bin_fraction(self, index):
+        count = len(self.frequencies)
+        position = index + 0.5
+        if not self.audio_view:
+            return position / count
+        # Stretch the audio ranges on either side of the tuning pitch to
+        # half the view each. The FFT bins and their frequencies stay the same.
+        middle = self.frequencies.index(self.audio_center_hz) + 0.5
+        if position <= middle:
+            return position / (2 * middle)
+        return 0.5 + (position - middle) / (2 * (count - middle))
+
+    def _bin_at_fraction(self, fraction):
+        count = len(self.frequencies)
+        if not self.audio_view:
+            return min(count - 1, int(fraction * count))
+        middle = self.frequencies.index(self.audio_center_hz) + 0.5
+        if fraction <= 0.5:
+            return int(2 * fraction * middle)
+        return min(count - 1, int(middle + (2 * fraction - 1) * (count - middle)))
+
+    def _draw(self, _event=None):
+        left, top, width, height = self._plot()
+        if height < 1:
+            return
+        self.canvas.delete("all")
+        self.image = None
+        metric = "Audio (Hz)" if self.audio_view else self.metric.get()
+        metric_index = int(metric == "SNR")
+        low, high = self.audio_scale if self.audio_view else self.scale
+        if self.auto_scale.get() and self.history:
+            recent = list(self.history)[:8]
+            if self.audio_view:
+                floor = round(median(point[0] for row in recent for point in row))
+                low = max(-110, min(-20, floor - 3))
+                high = low + 20
+            else:
+                low, high = self._automatic_scale(recent, metric_index) or self.scale
+        unit = "dBFS" if self.audio_view else ("dB" if metric_index else "dBµV")
+        scale_text = "Auto" if self.auto_scale.get() else "Fest"
+        resolution = f" · {self.frequencies.step} Hz pro FFT-Bin" if self.audio_view else ""
+        self.canvas.create_text(left, 12, anchor="w", fill="#b8cbe1",
+                                text=f"{metric}{resolution} · {scale_text} {low:g} bis {high:g} {unit}")
+        gradient_x = left + width - 110
+        for index in range(32):
+            color = self.palette[index * 255 // 31].hex()
+            x = gradient_x + 3 * index
+            self.canvas.create_rectangle(x, 8, x + 3, 16, fill=f"#{color}", outline="")
+        count = len(self.frequencies)
+        if not self.history:
+            self.latest.set("")
+            message = ("Warte auf USB-Audiodaten …" if self.audio_view else
+                       "Live-Audio starten oder einen ZF-Einzelscan ausführen.")
+            self.canvas.create_text(left + width / 2, top + height / 2, fill="#91a8c4", text=message)
+        else:
+            if self.audio_view:
+                row = self.history[0]
+                idx = max(range(len(row)), key=lambda i: row[i][0])
+                self.latest.set(f"Audio-Maximum {self.frequencies[idx]} Hz · {row[idx][0]} dBFS · "
+                                f"ZF {self.dial_khz:.3f} kHz")
+            else:
+                rssi, snr = zip(*(point for point in self.history[0] if point is not None))
+                self.latest.set(f"Letzter Suchlauf · RSSI {min(rssi)}–{max(rssi)} dBµV · "
+                                f"SNR {min(snr)}–{max(snr)} dB")
+            trace_height = min(self._TRACE_HEIGHT, height // 2)
+            self._draw_trace(left, top, width, trace_height, low, high, metric_index)
+            waterfall_top = top + trace_height + 5
+            levels = range(-110, 1) if self.audio_view else range(256)
+            colors = {value: self.palette[max(0, min(255, round((value - low) * 255 / (high - low))))]
+                      for value in levels}
+            pixel_bins = [self._bin_at_fraction(x / width) for x in range(width)]
+            pixels = bytearray()
+            row_height = 2 if self.audio_view else self._ROW_HEIGHT
+            visible_rows = (height - trace_height - 5) // row_height
+            for row in list(self.history)[:max(0, visible_rows)]:
+                bins = [self._EMPTY if value is None else colors[value[metric_index]] for value in row]
+                pixels.extend(b"".join(bins[index] for index in pixel_bins) * row_height)
+            rows = len(pixels) // (3 * width)
+            if rows:
+                ppm = f"P6\n{width} {rows}\n255\n".encode("ascii") + pixels
+                self.image = tk.PhotoImage(master=self, data=ppm, format="PPM")
+                self.canvas.create_image(left, waterfall_top, image=self.image, anchor="nw")
+        if not count:
+            return
+        fractions = (0.0, 0.25, 0.5, 0.75, 1.0)
+        indices = {self._bin_at_fraction(fraction) for fraction in fractions}
+        for index in sorted(indices):
+            x = left + self._bin_fraction(index) * width
+            x = max(left + 23, min(left + width - 23, x))
+            self.canvas.create_text(x, top - 3, anchor="s", fill="#b8cbe1",
+                                    text=str(self.frequencies[index]))
+        self._draw_marker()
+
+    def _draw_trace(self, left, top, width, height, low, high, metric_index):
+        bottom = top + height
+        for y in (top, top + height / 2, bottom):
+            self.canvas.create_line(left, y, left + width, y, fill="#24415a")
+        row = self.history[0]
+        segment = []
+        # Keep gaps as gaps. Drawing a line across them would imply data
+        # where the Si4732 did not return a measurement.
+        for index, point in enumerate((*row, None)):
+            if point is None:
+                if len(segment) >= 4:
+                    self.canvas.create_line(*segment, fill="#6fdfcc", width=2)
+                elif segment:
+                    x, y = segment
+                    self.canvas.create_oval(x - 2, y - 2, x + 2, y + 2, fill="#6fdfcc", outline="")
+                segment.clear()
+                continue
+            value = min(high, max(low, point[metric_index]))
+            segment.extend((left + self._bin_fraction(index) * width,
+                            bottom - (value - low) * height / (high - low)))
+
+    def _draw_marker(self):
+        self.canvas.delete("dial")
+        self.canvas.delete("rx_filter")
+        if not self.frequencies or self.dial_khz is None:
+            return
+        if self.audio_view and (not self.scan_context or self.scan_context[0] not in ("usb", "lsb")):
+            return
+        marker = self.audio_center_hz if self.audio_view else self.dial_khz
+        left, top, width, height = self._plot()
+        index = (marker - self.frequencies[0]) / self.frequencies.step
+        fraction = self._bin_fraction(index)
+        if 0 <= fraction <= 1:
+            x = left + fraction * width
+            self.canvas.create_line(x, top, x, top + height, fill="#e4f4ff", dash=(4, 3), tags="dial")
+        if self.audio_view and (self.scan_context[1] or "").isdecimal():
+            index = (int(self.scan_context[1]) - self.frequencies[0]) / self.frequencies.step
+            if 0 <= index < len(self.frequencies):
+                x = left + self._bin_fraction(index) * width
+                self.canvas.create_line(x, top, x, top + height, fill="#ffba59", dash=(3, 3), tags="rx_filter")
+
+    def _click_filter(self, event):
+        if not self.audio_view or not self.scan_context or self.scan_context[0] not in ("usb", "lsb"):
+            return "break"
+        left, top, width, height = self._plot()
+        if left <= event.x < left + width and top <= event.y < top + height:
+            index = self._bin_at_fraction((event.x - left) / width)
+            value = min(self._filter_choices(self.scan_context[0]), key=lambda bw: abs(int(bw) - self.frequencies[index]))
+            self._set_filter(value)
+        return "break"
+
+    def _click(self, event):
+        left, top, width, height = self._plot()
+        if (not self.frequencies or not self.app.worker.is_connected() or
+                not (left <= event.x < left + width and top <= event.y < top + height)):
+            return
+        index = self._bin_at_fraction((event.x - left) / width)
+        frequency = self.frequencies[index]
+        if self.audio_view:
+            mode = self.scan_context[0] if self.scan_context else None
+            if mode not in ("usb", "lsb"):
+                self.status.set("Klick-Abstimmung im Live-Audio ist für USB und LSB verfügbar.")
+                return
+            if (not self.history or not self.tx_idle or self.app._rx_last_on is not True or
+                    self.nominal_if_hz is None):
+                return
+            # Audio measures the offset above the carrier in USB and below it in LSB.
+            offset = frequency - self.audio_center_hz
+            target_hz = self.nominal_if_hz + (offset if mode == "usb" else -offset)
+            if not 2_300_000 <= target_hz <= 26_100_000:
+                self.status.set("Gewählte ZF liegt außerhalb des Empfängerbereichs.")
+            elif offset:
+                khz = f"{target_hz / 1000:.3f}"
+                self.app.rx_freq_var.set(khz)
+                self.app._rx_set_freq()
+                self.status.set(f"ZF {khz} kHz angefordert · Ton auf {self.audio_center_hz} Hz")
+            return
+        self.pending_tune = frequency
+        label = "Abstimmung nach dem laufenden Scanabschnitt" if self.busy else "Abstimmung"
+        self.pause(f"{label} · {self.pending_tune} kHz", discard_bfo=True)
 
 
 @dataclass
@@ -196,6 +860,160 @@ class SerialWorker:
                 port.close()
             except Exception:
                 pass
+
+
+class RxUsbPlayback:
+    """Route the radio's USB capture stream to a computer output."""
+    RATE = 48000
+    BLOCK = 960
+    HIGHPASS_HZ = 180
+    _SPECTRUM_BLOCKS_PER_ROW = RATE // BLOCK // 10
+
+    # Bilinear transform of a second-order Butterworth high-pass.
+    _warp = math.tan(math.pi * HIGHPASS_HZ / RATE)
+    _b0 = 1.0 / (1.0 + math.sqrt(2.0) * _warp + _warp ** 2)
+    _a1 = 2.0 * (_warp ** 2 - 1.0) * _b0
+    _a2 = (1.0 - math.sqrt(2.0) * _warp + _warp ** 2) * _b0
+
+    def __init__(self):
+        self.thread = None
+        self.stop_event = threading.Event()
+        self.messages = queue.Queue()
+        self.output_enabled = False
+        self.gain = 1.0
+        self.highpass = False
+        self.scan_muted = False
+        self.spectrum_session = None
+        self.spectrum_frame = None
+
+    def set_gain_db(self, db):
+        self.gain = 10.0 ** (db / 20.0)
+
+    @classmethod
+    def _highpass_block(cls, samples, state):
+        first, second = state
+        b0, a1, a2 = cls._b0, cls._a1, cls._a2
+        filtered = np.empty(len(samples), dtype=np.float64)
+        for index, sample in enumerate(samples.tolist()):
+            scaled = b0 * sample
+            output = scaled + first
+            first = second - 2.0 * scaled - a1 * output
+            second = scaled - a2 * output
+            filtered[index] = output
+        return filtered, (first, second)
+
+    @classmethod
+    def _audio_spectrum(cls, samples, window, bins):
+        levels = np.abs(np.fft.rfft(samples * window))
+        amplitude = levels[bins.start // bins.step:bins[-1] // bins.step + 1] * (2 / (32768 * window.sum()))
+        dbfs = np.clip(np.rint(20 * np.log10(np.maximum(amplitude, 1e-6))), -110, 0).astype(int)
+        return tuple((value, 0) for value in dbfs.tolist())
+
+    @staticmethod
+    def devices(audio, include_output=True):
+        devices = [audio.get_device_info_by_index(i) for i in range(audio.get_device_count())]
+        def is_radio(device):
+            name = device["name"].casefold()
+            return "sx1280" in name or "qo-100 usb audio" in name
+
+        capture = [device for device in devices if is_radio(device) and device["maxInputChannels"] >= 1]
+        if len(capture) != 1:
+            raise RuntimeError("Genau einen SX1280-USB-Audioeingang verbinden.")
+        if not include_output:
+            return capture[0], None
+        speakers = next((device for device in devices if device["maxOutputChannels"] >= 1
+                         and "macbook" in device["name"].casefold()
+                         and any(word in device["name"].casefold()
+                                 for word in ("speaker", "lautsprecher"))), None)
+        output = speakers if speakers is not None else audio.get_default_output_device_info()
+        if is_radio(output):
+            raise RuntimeError("Einen Computer-Lautsprecher als Systemausgabe wählen.")
+        return capture[0], output
+
+    def start(self):
+        if self.thread is not None and self.thread.is_alive():
+            return False
+        self.stop_event.clear()
+        while not self.messages.empty():
+            self.messages.get_nowait()
+        self.thread = threading.Thread(target=self._play, daemon=True)
+        self.thread.start()
+        return True
+
+    def stop(self):
+        self.stop_event.set()
+
+    def _play(self):
+        try:
+            with ExitStack() as cleanup:
+                audio = pyaudio.PyAudio()
+                cleanup.callback(audio.terminate)
+                source, _ = self.devices(audio, include_output=False)
+                if self.stop_event.is_set():
+                    return
+                capture = audio.open(format=pyaudio.paInt16, channels=1, rate=self.RATE,
+                                     input=True, input_device_index=source["index"], frames_per_buffer=self.BLOCK)
+                cleanup.callback(capture.close)
+                output_stream = cleanup.enter_context(ExitStack())
+                speaker = None
+                last_gain = 0.0 if self.scan_muted else self.gain
+                last_highpass = self.highpass
+                filter_state = (0.0, 0.0)
+                spectrum_session = None
+                spectrum_blocks = None
+                while not self.stop_event.is_set():
+                    if self.output_enabled and speaker is None:
+                        _, output = self.devices(audio)
+                        channels = min(2, output["maxOutputChannels"])
+                        speaker = audio.open(format=pyaudio.paInt16, channels=channels, rate=self.RATE,
+                                             output=True, output_device_index=output["index"], frames_per_buffer=self.BLOCK)
+                        output_stream.callback(speaker.close)
+                        self.messages.put((True, output["name"]))
+                    elif not self.output_enabled and speaker is not None:
+                        output_stream.close()
+                        speaker = None
+                    samples = capture.read(self.BLOCK, exception_on_overflow=False)
+                    gain = 0.0 if self.scan_muted else self.gain
+                    highpass = self.highpass
+                    samples = np.frombuffer(samples, dtype=np.int16)
+                    session = self.spectrum_session
+                    if session is not spectrum_session:
+                        spectrum_session = session
+                        if session is not None:
+                            window = np.hanning(self.RATE // session.step)
+                            spectrum_blocks = deque(maxlen=len(window) // self.BLOCK)
+                            blocks_since_row = 0
+                        else:
+                            spectrum_blocks = None
+                    if session is not None:
+                        spectrum_blocks.append(samples)
+                        blocks_since_row += 1
+                        if (len(spectrum_blocks) == spectrum_blocks.maxlen and
+                                blocks_since_row >= self._SPECTRUM_BLOCKS_PER_ROW):
+                            spectrum = self._audio_spectrum(np.concatenate(spectrum_blocks), window, session)
+                            self.spectrum_frame = (session, spectrum)
+                            blocks_since_row = 0
+                    if speaker is None:
+                        continue
+                    # Keep filter history while bypassed and crossfade on toggles.
+                    filtered, filter_state = self._highpass_block(samples, filter_state)
+                    if highpass != last_highpass:
+                        mix = np.linspace(float(last_highpass), float(highpass), len(samples))
+                        samples = samples + mix * (filtered - samples)
+                    elif highpass:
+                        samples = filtered
+                    if gain != 1.0 or last_gain != 1.0:
+                        ramp = gain if gain == last_gain else np.linspace(last_gain, gain, len(samples))
+                        samples = samples * ramp
+                    if samples.dtype != np.int16:
+                        samples = np.clip(samples, -32768, 32767).astype(np.int16)
+                    last_highpass = highpass
+                    last_gain = gain
+                    if channels == 2:
+                        samples = np.repeat(samples, 2)
+                    speaker.write(samples.tobytes(), exception_on_underflow=False)
+        except Exception as error:
+            self.messages.put((False, str(error)))
 
 
 class AudioEngine:
@@ -714,6 +1532,7 @@ class SX1280ControlApp(ttk.Frame):
         self._cmd_hist_idx   = None
 
         self.audio       = AudioEngine()
+        self.rx_playback = RxUsbPlayback()
         self.keyer       = Keyer()
         self.key_reader  = None
         self._cw_running      = False
@@ -1442,9 +2261,10 @@ class SX1280ControlApp(ttk.Frame):
         self.rx_snr_var   = tk.StringVar(value="—")
         self.rx_state_var = tk.StringVar(value="kein Status")
         self.rx_fresh_var = tk.StringVar(value="noch keine RX-Antwort")
-        self.rx_scan_from = tk.StringVar(value="19350")
-        self.rx_scan_to   = tk.StringVar(value="19366")
-        self.rx_scan_step = tk.StringVar(value="1")
+        self.rx_pc_audio_var = tk.BooleanVar(value=False)
+        self.rx_pc_audio_status = tk.StringVar(value="")
+        self.rx_pc_gain_var = tk.StringVar(value="0 dB")
+        self.rx_pc_highpass_var = tk.BooleanVar(value=False)
         self.rx_ref_var   = tk.StringVar(value="19360.2")
         self.rx_cw_var    = tk.BooleanVar(value=False)
         self.rx_cwbw_var  = tk.StringVar(value="150")
@@ -1476,6 +2296,19 @@ class SX1280ControlApp(ttk.Frame):
         ttk.Label(bf, text="  (Diagnose erscheint im Console-Reiter)", foreground="gray").pack(side="left")
         ttk.Label(st, textvariable=self.rx_fresh_var, foreground="gray").grid(
             row=4, column=0, columnspan=3, sticky="w", pady=(4, 0))
+        pc_audio = ttk.Frame(st)
+        pc_audio.grid(row=5, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        ttk.Checkbutton(pc_audio, text="Ton über Computer-Lautsprecher", variable=self.rx_pc_audio_var,
+                        command=self._rx_toggle_pc_audio).pack(side="left")
+        ttk.Label(pc_audio, text="PC-Pegel").pack(side="left", padx=(14, 4))
+        gain = ttk.Combobox(pc_audio, textvariable=self.rx_pc_gain_var, state="readonly",
+                            values=("0 dB", "+3 dB", "+6 dB", "+9 dB", "+12 dB"), width=6)
+        gain.pack(side="left")
+        gain.bind("<<ComboboxSelected>>", self._rx_pc_gain_changed)
+        ttk.Checkbutton(pc_audio, text=f"Hochpass {RxUsbPlayback.HIGHPASS_HZ} Hz",
+                        variable=self.rx_pc_highpass_var,
+                        command=self._rx_pc_highpass_changed).pack(side="left", padx=(10, 0))
+        ttk.Label(pc_audio, textvariable=self.rx_pc_audio_status, wraplength=300).pack(side="left", padx=(10, 0))
 
         # --- receiver ---
         rf = ttk.LabelFrame(tab, text="Empfänger", padding=10)
@@ -1530,9 +2363,12 @@ class SX1280ControlApp(ttk.Frame):
                      lambda v: self._send_cmd_safe(f"rx vol {int(v)}"), "{:.0f}").grid(
             row=5, column=0, columnspan=6, sticky="ew", pady=(8, 0))
 
+        self.rx_waterfall = RxWaterfall(tab, self)
+        self.rx_waterfall.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+
         # --- beacons ---
         bk = ttk.LabelFrame(tab, text="QO-100-Baken (USB)", padding=10)
-        bk.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+        bk.grid(row=3, column=0, sticky="ew", pady=(0, 8))
         ttk.Label(bk, text="Untere CW-Bake gehört bei (kHz):").grid(row=0, column=0, columnspan=2, sticky="w")
         ttk.Entry(bk, textvariable=self.rx_ref_var, width=10).grid(row=0, column=2, sticky="w", padx=4)
         for i, (name, off) in enumerate(self._RX_BEACONS):
@@ -1547,7 +2383,7 @@ class SX1280ControlApp(ttk.Frame):
 
         # --- monitor ---
         mf = ttk.LabelFrame(tab, text="Kopfhörer-Monitor", padding=10)
-        mf.grid(row=3, column=0, sticky="ew", pady=(0, 8))
+        mf.grid(row=4, column=0, sticky="ew", pady=(0, 8))
         mf.columnconfigure(0, weight=1)
         top = ttk.Frame(mf)
         top.grid(row=0, column=0, sticky="w")
@@ -1592,7 +2428,7 @@ class SX1280ControlApp(ttk.Frame):
 
         # --- clocks ---
         kf = ttk.LabelFrame(tab, text="Takte", padding=10)
-        kf.grid(row=4, column=0, sticky="ew", pady=(0, 8))
+        kf.grid(row=5, column=0, sticky="ew", pady=(0, 8))
         ttk.Label(kf, text="Referenz (RCLK):").grid(row=0, column=0, sticky="w")
         rc = ttk.Combobox(kf, textvariable=self.rx_rclk_var, values=["32k", "32m", "36", "25"],
                           state="readonly", width=6)
@@ -1605,21 +2441,6 @@ class SX1280ControlApp(ttk.Frame):
                         ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
         ttk.Label(kf, text="Aus lassen, wenn der TinySA den LO liefert.", foreground="gray").grid(
             row=2, column=0, columnspan=3, sticky="w")
-
-        # --- scan ---
-        scf = ttk.LabelFrame(tab, text="Suchlauf", padding=10)
-        scf.grid(row=5, column=0, sticky="ew", pady=(0, 8))
-        ttk.Label(scf, text="von").grid(row=0, column=0)
-        ttk.Entry(scf, textvariable=self.rx_scan_from, width=8).grid(row=0, column=1, padx=4)
-        ttk.Label(scf, text="bis").grid(row=0, column=2)
-        ttk.Entry(scf, textvariable=self.rx_scan_to, width=8).grid(row=0, column=3, padx=4)
-        ttk.Label(scf, text="Schritt (kHz)").grid(row=0, column=4)
-        ttk.Entry(scf, textvariable=self.rx_scan_step, width=4).grid(row=0, column=5, padx=4)
-        ttk.Button(scf, text="Start", command=lambda: self._send_cmd_safe(
-            f"rx scan {self.rx_scan_from.get().strip()} {self.rx_scan_to.get().strip()} "
-            f"{self.rx_scan_step.get().strip()}")).grid(row=0, column=6, padx=(8, 0))
-        ttk.Label(scf, text="Ergebnis im Console-Reiter. Für Träger in AM suchen, in USB hören.",
-                  foreground="gray").grid(row=1, column=0, columnspan=7, sticky="w", pady=(4, 0))
 
         self._rx_last_on = None
         self._rx_last_status_at = None
@@ -1643,7 +2464,7 @@ class SX1280ControlApp(ttk.Frame):
         if khz is None or not (2300.0 <= khz <= 26100.0):
             self._log("[RX] Frequenz 2300..26100 kHz", "error")
             return
-        self.rx_freq_var.set(f"{khz:.2f}".rstrip("0").rstrip("."))
+        self.rx_freq_var.set(f"{khz:.3f}".rstrip("0").rstrip("."))
         self._send_cmd_safe(f"rx freq {khz:.3f}")
 
     def _rx_step(self, direction):
@@ -1651,7 +2472,7 @@ class SX1280ControlApp(ttk.Frame):
         if khz is None:
             return
         step = dict(self._RX_STEPS).get(self.rx_step_var.get(), 1.0)
-        self.rx_freq_var.set(f"{khz + direction * step:.2f}")
+        self.rx_freq_var.set(f"{khz + direction * step:.3f}")
         self._rx_set_freq()
 
     def _rx_set_bfo(self):
@@ -1690,8 +2511,10 @@ class SX1280ControlApp(ttk.Frame):
 
     def _rx_live_tick(self):
         now = time.monotonic()
+        self._rx_playback_status()
         try:
             if (self.rx_live_var.get() and self.worker.is_connected()
+                    and not self.rx_waterfall.busy
                     and self.notebook.tab(self.notebook.select(), "text") == "RX"
                     and now >= self._rx_next_poll_at):
                 self.worker.send_line("rx")
@@ -1702,7 +2525,68 @@ class SX1280ControlApp(ttk.Frame):
         self._rx_update_freshness(now)
         self.master.after(1000, self._rx_live_tick)
 
+    def _rx_toggle_pc_audio(self):
+        if not self.rx_pc_audio_var.get():
+            self.rx_playback.output_enabled = False
+            self.rx_pc_audio_status.set("")
+            self._rx_stop_capture_if_idle()
+            return
+        if self._rx_start_capture():
+            self.rx_playback.output_enabled = True
+            self.rx_pc_audio_status.set("Lautsprecher werden geöffnet …")
+        else:
+            self.rx_pc_audio_var.set(False)
+
+    def _rx_start_capture(self):
+        if not HAS_AUDIO or not self.worker.is_connected():
+            self.rx_pc_audio_status.set("PyAudio und NumPy installieren." if not HAS_AUDIO
+                                        else "Zuerst den TRX verbinden.")
+            return False
+        worker = self.rx_playback.thread
+        if worker is not None and worker.is_alive() and not self.rx_playback.stop_event.is_set():
+            return True
+        if not self.rx_playback.start():
+            self.rx_pc_audio_status.set("Audio wird geschlossen. Gleich erneut versuchen.")
+            return False
+        self._send_cmd_safe("rx usbaudio 1")
+        return True
+
+    def _rx_stop_capture_if_idle(self):
+        if self.rx_waterfall.audio_session is None and not self.rx_pc_audio_var.get():
+            self.rx_playback.stop()
+            if self.worker.is_connected():
+                self._send_cmd_safe("rx usbaudio 0")
+
+    def _rx_pc_gain_changed(self, _event=None):
+        self.rx_playback.set_gain_db(int(self.rx_pc_gain_var.get().split()[0]))
+
+    def _rx_pc_highpass_changed(self):
+        self.rx_playback.highpass = self.rx_pc_highpass_var.get()
+
+    def _rx_playback_status(self):
+        while True:
+            try:
+                ok, message = self.rx_playback.messages.get_nowait()
+            except queue.Empty:
+                return
+            if ok:
+                if self.rx_pc_audio_var.get():
+                    self.rx_pc_audio_status.set(message)
+            elif self.rx_pc_audio_var.get() or self.rx_waterfall.audio_session is not None:
+                self.rx_pc_audio_var.set(False)
+                self.rx_playback.output_enabled = False
+                self.rx_pc_audio_status.set(message)
+                if self.rx_waterfall.audio_session is not None:
+                    self.rx_waterfall._stop_live(message)
+                else:
+                    self._rx_stop_capture_if_idle()
+
     def _rx_reset_status(self):
+        self.rx_waterfall.reset()
+        self.rx_playback.stop()
+        self.rx_playback.output_enabled = False
+        self.rx_pc_audio_var.set(False)
+        self.rx_pc_audio_status.set("")
         self._rx_last_on = None
         self._rx_last_status_at = None
         self._rx_next_poll_at = 0.0
@@ -1753,7 +2637,7 @@ class SX1280ControlApp(ttk.Frame):
         if mode in ("am", "usb", "lsb"):
             self.rx_mode_var.set(mode)
         if hz and not isinstance(focus, (ttk.Entry, tk.Entry)):
-            self.rx_freq_var.set(f"{hz/1000:.2f}".rstrip("0").rstrip("."))
+            self.rx_freq_var.set(f"{hz/1000:.3f}".rstrip("0").rstrip("."))
             self.rx_bfo_var.set(kv.get("bfo", self.rx_bfo_var.get()))
             self.rx_cal_var.set(kv.get("cal", self.rx_cal_var.get()))
         if kv.get("bw", "").isdigit():
@@ -2292,6 +3176,8 @@ class SX1280ControlApp(ttk.Frame):
             self.status_var.set("🔴 Connection failed")
 
     def _disconnect(self):
+        if self.worker.is_connected() and (self.rx_pc_audio_var.get() or self.rx_waterfall.audio_session is not None):
+            self._send_cmd_safe("rx usbaudio 0")
         if self._heartbeat_id is not None:
             self.master.after_cancel(self._heartbeat_id)
             self._heartbeat_id = None
@@ -2307,7 +3193,8 @@ class SX1280ControlApp(ttk.Frame):
             self._heartbeat_id = None
             return
         try:
-            self.worker.send_line("status")
+            if not self.rx_waterfall.busy:
+                self.worker.send_line("status")
         except Exception:
             pass
         self._heartbeat_id = self.master.after(2000, self._start_heartbeat)
@@ -2317,6 +3204,7 @@ class SX1280ControlApp(ttk.Frame):
             if not self.worker.is_connected():
                 self._log(f"[NOT CONNECTED] {cmd}", "error")
                 return
+            self.rx_waterfall.command(cmd)
             self.worker.send_line(cmd)
             self._log(cmd, "sent")
         except Exception as e:
@@ -2647,6 +3535,7 @@ class SX1280ControlApp(ttk.Frame):
             while processed < 20:
                 line = self.rx_queue.get_nowait()
                 processed += 1
+                sweep_reply = self.rx_waterfall.observe(line)
                 if line.startswith("!S "):
                     latest_status = line  # keep only the newest status push
                     # Only buffered when enabled — otherwise the 2 s heartbeat
@@ -2665,9 +3554,17 @@ class SX1280ControlApp(ttk.Frame):
                     self._handle_rx_status(line)
                     # Command replies stay visible, including manual queries.
                     # The push-message checkbox controls only !S/!K/!M.
+                    if not sweep_reply:
+                        self._log(line, "recv")
+                elif not sweep_reply:
                     self._log(line, "recv")
-                else:
-                    self._log(line, "recv")
+                    if line.startswith("ERR: USB RX audio"):
+                        self.rx_playback.stop()
+                        self.rx_playback.output_enabled = False
+                        self.rx_pc_audio_var.set(False)
+                        message = "TX-Mikrofon belegt den ADC. Sendequelle PC wählen."
+                        self.rx_pc_audio_status.set(message)
+                        self.rx_waterfall._stop_live(message)
                     if line.startswith("[SERIAL ERROR]") and not self.worker.is_connected():
                         self.status_var.set("🔴 Verbindung unterbrochen — erneut verbinden")
                         self._rx_reset_status()

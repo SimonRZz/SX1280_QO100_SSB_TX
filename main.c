@@ -95,7 +95,7 @@
 // ===============================================
 
 // ================== FIRMWARE VERSION ==================
-#define FW_VERSION      "2.3.1-rx"
+#define FW_VERSION      "2.3.3-rx"
 #define FW_BUILD        __DATE__ " " __TIME__
 // ======================================================
 
@@ -164,7 +164,7 @@ static volatile double g_target_freq_hz = (double)BASE_FREQ_HZ;
 static volatile float g_ppm_correction = 0.0f;
 static volatile uint8_t g_cw_test_mode = 0;  // 1 = CW test active (blocks normal Core1 operation)
 static volatile int8_t g_tx_power_max_dbm = PWR_MAX_DBM;  // Runtime TX power limit
-static volatile uint8_t g_tx_enabled = 1;  // TX enable flag (for GUI TX button)
+static volatile uint8_t g_tx_enabled = QO100_TX_ENABLED_AT_BOOT;
 static volatile uint8_t g_tx_mode = 0;     // 0 = USB (SSB), 1 = CW
 static volatile uint8_t g_tune_active = 0; // 1 = TUNE carrier active
 static volatile uint8_t g_ptt_key = 0;     // 1 = dit or dah paddle pressed (live)
@@ -210,8 +210,13 @@ static void mic_diag_print(void);
 // --- Receive audio monitor (Si4732 LOUT on GP27 / ADC1 -> headphones) ---
 // Defined down with the microphone, which owns the ADC it borrows.
 static void    rxmon_task(void);
+static void    rx_audio_task(void);
 static void    rxmon_set(bool on);
 static bool    rxmon_is_on(void);
+static void    rx_usb_pump(void);
+static void    rx_usb_flush(void);
+static bool    g_usb_capture_open = false;
+static bool    g_rx_usb_enabled = false;
 static void    rxmon_set_vol(uint8_t pct);
 static bool    rxmon_set_cw(long width_hz, long centre_hz);   // width 0 = off; centre 0 = keep
 static void    rxmon_set_level(uint8_t pct);
@@ -554,14 +559,25 @@ static int16_t  g_volume[CFG_TUD_AUDIO_FUNC_1_N_CHANNELS_RX + 1]; // 1/256 dB
 
 bool tud_audio_set_itf_cb(uint8_t rhport, tusb_control_request_t const *p_request) {
     (void)rhport;
-    (void)p_request;
+    if (TU_U16_LOW(p_request->wIndex) == ITF_NUM_AUDIO_CAPTURE) {
+        g_usb_capture_open = TU_U16_LOW(p_request->wValue) != 0;
+        rx_usb_flush();
+    }
     return true;
 }
 
 bool tud_audio_set_itf_close_ep_cb(uint8_t rhport, tusb_control_request_t const *p_request) {
     (void)rhport;
-    (void)p_request;
+    if (TU_U16_LOW(p_request->wIndex) == ITF_NUM_AUDIO_CAPTURE) {
+        g_usb_capture_open = false;
+        rx_usb_flush();
+    }
     return true;
+}
+
+void tud_umount_cb(void) {
+    g_usb_capture_open = false;
+    rx_usb_flush();
 }
 
 // EP sampling freq (UAC1)
@@ -980,7 +996,7 @@ static void carrier_poll(void) {
     bool key         = (bool)(g_keyer_key | g_soft_ptt_key);
 
     bool need_idle    = mode_cw || tune;
-    bool need_carrier = tx_allowed() && (tune || (mode_cw && key));
+    bool need_carrier = g_tx_enabled && tx_allowed() && (tune || (mode_cw && key));
     if (need_carrier) tx_activity_mark();
 
     uint32_t now = to_ms_since_boot(get_absolute_time());
@@ -1536,6 +1552,7 @@ static void cmd_help(void) {
         "  rx mon maxgain <0..36> - AGC gain ceiling in dB (default 36)\r\n"
         "  rx mon hang <0..3000>  - AGC hold after a signal, ms (default 400)\r\n"
         "  rx mon poll 0|1      - 5 Hz RSSI polling for the display (crackle test)\r\n"
+        "  rx usbaudio [0|1]    - Si4732 audio to the USB recording input\r\n"
         "  rx agc [on|off|<n>]  - front-end attenuator. The index is attenuation, so 0\r\n"
         "                         is full gain. 'off' pins it open for measuring.\r\n"
         "  rx xosc <0|1>        - POWER_UP crystal-oscillator bit; 0 = external RCLK\r\n"
@@ -2116,6 +2133,24 @@ static void cdc_handle_line(char *line) {
             return;
         }
         if (argc < 2) { rx_status_print(); return; }
+
+        if (streqi(argv[1], "usbaudio")) {
+            if (argc >= 3) {
+                uint8_t enabled;
+                if (!parse_bool(argv[2], &enabled)) {
+                    cdc_write_str("ERR: rx usbaudio 0|1\r\n");
+                    return;
+                }
+                if (enabled && g_audio_src == AUDIO_SRC_MIC) {
+                    cdc_write_str("ERR: USB RX audio shares the ADC with the TX microphone; select 'src pc' first\r\n");
+                    return;
+                }
+                g_rx_usb_enabled = enabled != 0;
+                rx_usb_flush();
+            }
+            cdc_printf("OK rx usbaudio=%d stream=%d\r\n", g_rx_usb_enabled, g_usb_capture_open);
+            return;
+        }
 
         // rx raw <resp_bytes> <hex> [hex ...]
         if (streqi(argv[1], "raw") && argc >= 3) {
@@ -3742,6 +3777,86 @@ static volatile float s_rx_peak   = 0.0f;   // after the AGC, for the meter
 static volatile float s_rx_clip   = 0.0f;   // before it, to show headroom
 static uint8_t       s_adc_input  = 0;      // 0 = mic GP26, 1 = monitor GP27
 
+// Core 0 owns this queue. TinyUSB consumes the separate endpoint FIFO.
+#define RX_USB_QUEUE_SIZE 128u
+#define RX_USB_QUEUE_MASK (RX_USB_QUEUE_SIZE - 1u)
+#define RX_USB_ADC_SAMPLES_PER_MS (WAV_SAMPLE_RATE / 1000u)
+static int16_t s_rx_usb_queue[RX_USB_QUEUE_SIZE];
+static uint32_t s_rx_usb_wr, s_rx_usb_rd;
+static int16_t s_rx_usb_previous;
+
+static void rx_usb_flush(void)
+{
+    s_rx_usb_rd = s_rx_usb_wr;
+    s_rx_usb_previous = 0;
+}
+
+static bool rx_usb_receiving(void)
+{
+    return g_rx_usb_enabled && g_usb_capture_open && tud_ready() &&
+           g_audio_src == AUDIO_SRC_PC && si4732_is_on();
+}
+
+static void rx_usb_push(int16_t sample)
+{
+    const uint32_t next = (s_rx_usb_wr + 1u) & RX_USB_QUEUE_MASK;
+    if (next == s_rx_usb_rd) s_rx_usb_rd = (s_rx_usb_rd + 1u) & RX_USB_QUEUE_MASK;
+    s_rx_usb_queue[s_rx_usb_wr] = sample;
+    s_rx_usb_wr = next;
+}
+
+static void rx_usb_pump(void)
+{
+    if (!g_usb_capture_open || !tud_ready()) return;
+    tu_fifo_t *fifo = tud_audio_get_ep_in_ff();
+    if (!fifo) return;
+    const uint16_t queued = tu_fifo_count(fifo);
+    if (queued >= 8u * CFG_TUD_AUDIO_FUNC_1_EP_IN_SZ_MAX) return;
+
+    int16_t packet[USB_RX_AUDIO_SAMPLES_PER_MS] = {0};
+    const bool tx_recent = g_tx_enabled &&
+                           (to_ms_since_boot(get_absolute_time()) - g_tx_activity_ms < 30u);
+    if (!rx_usb_receiving() || g_tune_active || g_keyer_key || tx_recent) {
+        rx_usb_flush();
+    } else {
+        uint32_t available = (s_rx_usb_wr - s_rx_usb_rd) & RX_USB_QUEUE_MASK;
+        const uint32_t target = 3u * RX_USB_ADC_SAMPLES_PER_MS;
+        if (available > 2u * target) {
+            s_rx_usb_rd = (s_rx_usb_wr - target) & RX_USB_QUEUE_MASK;
+            s_rx_usb_previous = s_rx_usb_queue[(s_rx_usb_rd - 1u) & RX_USB_QUEUE_MASK];
+            available = target;
+        }
+        // Track the independent ADC clock by occasionally consuming one
+        // fewer or one extra input sample for the fixed-size USB packet.
+        uint32_t count = RX_USB_ADC_SAMPLES_PER_MS;
+        if (available > target + count) ++count;
+        if (available < target - count) --count;
+        if (available >= count) {
+            int16_t input[RX_USB_ADC_SAMPLES_PER_MS + 2u];
+            input[0] = s_rx_usb_previous;
+            for (uint32_t i = 1; i <= count; ++i) {
+                input[i] = s_rx_usb_queue[s_rx_usb_rd];
+                s_rx_usb_rd = (s_rx_usb_rd + 1u) & RX_USB_QUEUE_MASK;
+            }
+            for (uint32_t i = 0; i < USB_RX_AUDIO_SAMPLES_PER_MS; ++i) {
+                const uint32_t pos = i * count;
+                const uint32_t idx = pos / USB_RX_AUDIO_SAMPLES_PER_MS;
+                const int32_t frac = (int32_t)(pos % USB_RX_AUDIO_SAMPLES_PER_MS);
+                const int32_t delta = input[idx + 1u] - input[idx];
+                packet[i] = (int16_t)(input[idx] + delta * frac / (int32_t)USB_RX_AUDIO_SAMPLES_PER_MS);
+            }
+            s_rx_usb_previous = input[count];
+        } else if (queued != 0u) {
+            // Wait for the next ADC samples while the endpoint still has a
+            // packet. Padding early would insert audible gaps in good audio.
+            return;
+        } else {
+            s_rx_usb_previous = 0;
+        }
+    }
+    tud_audio_write(packet, sizeof(packet));
+}
+
 static inline uint32_t rx_available(void) {
     return (mic_wr_index() - s_rx_rd) & MIC_RB_MASK;
 }
@@ -3792,15 +3907,27 @@ static void rxmon_task(void)
         }
     }
 
-    if (!s_rxmon_on || s_adc_input != 1u) return;
+    rx_audio_task();
+}
+
+// This part must also run inside the SSB processing loop. Keeping tuning
+// and RSSI I2C work in rxmon_task lets it service the ADC without blocking.
+static void rx_audio_task(void)
+{
+    const bool usb = rx_usb_receiving();
+    const bool local = s_rxmon_on && g_audio_src != AUDIO_SRC_MIC;
+    adc_select_source(local || usb ? 1u : 0u);
+    if (!local && !usb) return;
     mic_dma_rearm_if_done();
 
     // If core 0 was away for a long time the ring holds stale audio. Playing
     // it out would only turn the gap into permanent delay, so skip it.
     if (rx_available() > (MIC_RB_SAMPLES / 2u)) s_rx_rd = mic_wr_index();
 
-    while (rx_available() != 0u &&
-           (((s_rxo_wr - s_rxo_rd) & RXO_MASK) < (RXO_MASK - 1u))) {
+    const bool pwm = local && s_rxmon_vol > 0;
+    while (rx_available() != 0u) {
+        const bool pwm_room = ((s_rxo_wr - s_rxo_rd) & RXO_MASK) < (RXO_MASK - 1u);
+        if (pwm && !pwm_room && !usb) break;
         const uint16_t raw = s_mic_rb[s_rx_rd];
         s_rx_rd = (s_rx_rd + 1u) & MIC_RB_MASK;
 
@@ -3846,8 +3973,12 @@ static void rxmon_task(void)
         const float ay = fabsf(y);
         if (ay > s_rx_peak) s_rx_peak = ay;
 
-        s_rxo[s_rxo_wr] = (int16_t)(y * 32767.0f);
-        s_rxo_wr = (s_rxo_wr + 1u) & RXO_MASK;
+        const int16_t sample = (int16_t)(y * 32767.0f);
+        if (pwm && pwm_room) {
+            s_rxo[s_rxo_wr] = sample;
+            s_rxo_wr = (s_rxo_wr + 1u) & RXO_MASK;
+        }
+        if (usb) rx_usb_push(sample);
     }
 }
 
@@ -3862,7 +3993,7 @@ static void rxmon_set(bool on)
         adc_select_source(1u);
     } else {
         s_rxmon_on = false;      // the interrupt fades out on its own ramp
-        adc_select_source(0u);
+        adc_select_source(rx_usb_receiving() ? 1u : 0u);
     }
 }
 
@@ -4475,6 +4606,8 @@ static void usb_audio_pump(void) {
     tud_task();
     // CDC command handling (if present)
     cdc_task();
+    if (g_usb_capture_open && g_rx_usb_enabled) rx_audio_task();
+    rx_usb_pump();
 
     const uint32_t frame_bytes =
         (uint32_t)CFG_TUD_AUDIO_FUNC_1_N_CHANNELS_RX *

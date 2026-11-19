@@ -16,6 +16,7 @@ enum
 {
   ITF_NUM_AUDIO_CONTROL = 0,
   ITF_NUM_AUDIO_STREAMING,
+  ITF_NUM_AUDIO_CAPTURE,
 
   ITF_NUM_CDC_COMM,
   ITF_NUM_CDC_DATA,
@@ -33,25 +34,12 @@ enum
 #define UAC1_ENTITY_INPUT_TERMINAL      0x01
 #define UAC1_ENTITY_FEATURE_UNIT        0x02
 #define UAC1_ENTITY_OUTPUT_TERMINAL     0x03
+#define UAC1_ENTITY_RX_INPUT_TERMINAL   0x11
+#define UAC1_ENTITY_RX_OUTPUT_TERMINAL  0x13
 
 //--------------------------------------------------------------------+
 // UAC1 DESCRIPTOR TEMPLATES
 //--------------------------------------------------------------------+
-
-// Version WITHOUT feedback endpoint (Windows compatible) - includes IAD
-#define TUD_AUDIO10_SPEAKER_STEREO_NOFB_DESC_LEN(_nfreqs) (\
-    8 /* IAD */\
-  + TUD_AUDIO10_DESC_STD_AC_LEN\
-  + TUD_AUDIO10_DESC_CS_AC_LEN(1)\
-  + TUD_AUDIO10_DESC_INPUT_TERM_LEN\
-  + TUD_AUDIO10_DESC_OUTPUT_TERM_LEN\
-  + TUD_AUDIO10_DESC_FEATURE_UNIT_LEN(2)\
-  + TUD_AUDIO10_DESC_STD_AS_LEN\
-  + TUD_AUDIO10_DESC_STD_AS_LEN\
-  + TUD_AUDIO10_DESC_CS_AS_INT_LEN\
-  + TUD_AUDIO10_DESC_TYPE_I_FORMAT_LEN(_nfreqs)\
-  + TUD_AUDIO10_DESC_STD_AS_ISO_EP_LEN\
-  + TUD_AUDIO10_DESC_CS_AS_ISO_EP_LEN)
 
 // Version WITH feedback endpoint (original)
 #define TUD_AUDIO10_SPEAKER_STEREO_FB_DESC_LEN(_nfreqs) (\

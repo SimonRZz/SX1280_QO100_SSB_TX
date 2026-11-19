@@ -360,6 +360,26 @@ The GUI provides:
   until a valid GPS fix is confirmed, and a lost fix is reported.
 - **CW keyer tab**: PC-side keyer via TTL-to-USB adapter, plus settings and a live view
   of the on-device keyer — paddle contacts, key state and decoded text
+- **RX waterfall**: `Live-Audio starten` shows a spectrum of the demodulated
+  USB audio while the receiver stays on the selected frequency. Speaker playback
+  can be toggled independently. Use `Ansicht (Hz)` to zoom and `Mitte (Hz)` to
+  set the center. Views of 1,000 Hz or less use 2 Hz FFT bins. In USB and LSB,
+  a click retunes so the selected tone moves to the center line. Each side can
+  use a different scale when the view reaches an audio-band limit. Use the
+  `RX-Filter (Hz)` menu or Shift-click in a live USB/LSB view to choose a
+  Si4732 filter. The amber line marks its nominal upper edge when visible. For a wider IF
+  range, use `ZF-Einzelscan` with TX off. Choose the IF limits and step, or use
+  `Um aktuelle ZF` to center the range on the dial. A sweep adds one RSSI/SNR row
+  and temporarily silences computer playback. Click a scan column to tune to
+  that IF. Both views offer automatic contrast and manual color limits.
+- **RX audio over USB**: with firmware 2.3.2-rx or later, switch on RX and select
+  `Ton über Computer-Lautsprecher` in the RX tab. The GUI uses PyAudio and NumPy
+  and prefers the built-in MacBook speakers when available. `PC-Pegel` sets
+  listening gain for that output. `Hochpass 180 Hz` attenuates low-frequency
+  rumble in the GUI playback. Other applications
+  can use the 48 kHz mono `QO-100 USB Audio` capture device after enabling `rx usbaudio 1`.
+  The TX source must be set to `pc` because the receiver and TX microphone share
+  the Pico ADC. The headphone monitor has its own switch.
 - **Console**: timestamped send/receive log with colour coding, filters, command history
   and log export — the first place to look when something misbehaves
 

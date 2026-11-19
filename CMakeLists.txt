@@ -61,7 +61,7 @@ pico_sdk_init()
 # --------------------------------------------------------------------
 # TinyUSB (vendored as subdirectory)
 # --------------------------------------------------------------------
-set(TINYUSB_DIR ${CMAKE_CURRENT_LIST_DIR}/external/tinyusb)
+set(TINYUSB_DIR ${CMAKE_CURRENT_LIST_DIR}/external/tinyusb CACHE PATH "TinyUSB source directory")
 set(TINYUSB_FAMILY_DIR ${TINYUSB_DIR}/hw/bsp/rp2040)
 
 # Add executable
@@ -133,6 +133,9 @@ target_compile_definitions(SX1280SDR PRIVATE
     CFG_TUSB_MCU=OPT_MCU_RP2040
     CFG_TUSB_OS=OPT_OS_PICO
 )
+
+option(QO100_TX_ENABLED_AT_BOOT "Arm TX at boot" ON)
+target_compile_definitions(SX1280SDR PRIVATE QO100_TX_ENABLED_AT_BOOT=$<BOOL:${QO100_TX_ENABLED_AT_BOOT}>)
 
 # Link pico hardware libraries required by TinyUSB rp2040 BSP (family.c)
 target_link_libraries(SX1280SDR

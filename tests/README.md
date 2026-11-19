@@ -17,3 +17,5 @@ Python's Tkinter module must be available, but no display or serial/audio
 hardware is used. The checks cover reader failures and reconnect isolation,
 legacy/Git version messages, visible command replies, live polling after OFF,
 meter freshness, and receive-timer recovery after malformed status messages.
+They also cover waterfall scan assembly, missing bins, stopping on errors,
+click-to-tune after the active scan chunk, and restoration of a manual BFO.

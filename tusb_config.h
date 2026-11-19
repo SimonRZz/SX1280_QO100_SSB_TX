@@ -91,12 +91,16 @@ extern "C" {
 #endif
 
 //--------------------------------------------------------------------+
-// AUDIO CLASS DRIVER CONFIGURATION (UAC1 Speaker OUT + Feedback)
+// AUDIO CLASS DRIVER CONFIGURATION (UAC1 stereo OUT and mono IN)
 //--------------------------------------------------------------------+
 
 #define CFG_TUD_AUDIO_FUNC_1_N_CHANNELS_RX              2
 #define CFG_TUD_AUDIO_FUNC_1_N_BYTES_PER_SAMPLE_RX      2
 #define CFG_TUD_AUDIO_FUNC_1_RESOLUTION_RX              16
+#define USB_RX_AUDIO_RATE                             48000u
+#define USB_RX_AUDIO_SAMPLES_PER_MS                   (USB_RX_AUDIO_RATE / 1000u)
+#define CFG_TUD_AUDIO_FUNC_1_EP_IN_SZ_MAX              (2u * USB_RX_AUDIO_SAMPLES_PER_MS)
+#define CFG_TUD_AUDIO_FUNC_1_EP_IN_SW_BUF_SZ           (9u * CFG_TUD_AUDIO_FUNC_1_EP_IN_SZ_MAX)
 
 // UAC1 Full-Speed endpoint size: 48kHz * 2ch * 2bytes / 1000 = 192 bytes per frame
 #define CFG_TUD_AUDIO_FUNC_1_MAX_SAMPLE_RATE_FS     48000
@@ -112,6 +116,8 @@ extern "C" {
 
 // Enable OUT EP, DISABLE feedback EP (Windows compatible)
 #define CFG_TUD_AUDIO_ENABLE_EP_OUT                 1
+#define CFG_TUD_AUDIO_ENABLE_EP_IN                  1
+#define CFG_TUD_AUDIO_EP_IN_FLOW_CONTROL            0 // application produces USB-paced packets
 #define CFG_TUD_AUDIO_ENABLE_FEEDBACK_EP            0
 
 #ifdef __cplusplus

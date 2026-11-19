@@ -77,8 +77,6 @@ Verbindung und ein möglicher blockierter Firmware-Hauptablauf weiter zu prüfen
   PLL A und der 52-MHz-TX-Ausgang sollen unverändert bleiben. Getrennt
   implementieren und am Gerät prüfen. Die Rechnung beweist weder
   störungsfreien Empfang noch ausreichenden eigenen Mischer-LO-Pegel.
-* **Empfangs-Audio als USB-Mikrofon:** bisher besteht der UAC1-Lautsprecherweg
-  PC → Gerät. ADC1 → PC ist eine eigene Aufgabe.
 * **Versorgung/Analogaufbau untersuchen:** Referenztakt, Bias-Spannung,
   Audioauskopplung, Masseführung und ADC/PWM mit anderen DIY-SSB-Projekten
   vergleichen. Berühren des Teilers verändert den Ton; die Quelle ist noch

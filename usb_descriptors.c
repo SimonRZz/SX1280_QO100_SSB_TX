@@ -29,7 +29,7 @@ static tusb_desc_device_t const desc_device =
     .bMaxPacketSize0    = CFG_TUD_ENDPOINT0_SIZE,
     .idVendor           = 0xCafe,
     .idProduct          = USB_PID,
-    .bcdDevice          = 0x0100,
+    .bcdDevice          = 0x0101,
 
     .iManufacturer      = 0x01,
     .iProduct           = 0x02,
@@ -113,10 +113,20 @@ uint8_t const * tud_hid_descriptor_report_cb(uint8_t itf)
 // Configuration Descriptor (UAC1 + CDC (+ optional HID))
 //--------------------------------------------------------------------+
 
+#define EPNUM_AUDIO_CAPTURE 0x86u
+#define AUDIO_CONTROL_TERMINALS_LEN (2 * TUD_AUDIO10_DESC_INPUT_TERM_LEN + \
+                                    2 * TUD_AUDIO10_DESC_OUTPUT_TERM_LEN + \
+                                    TUD_AUDIO10_DESC_FEATURE_UNIT_LEN(2))
+#define AUDIO_STREAM_LEN (2 * TUD_AUDIO10_DESC_STD_AS_LEN + TUD_AUDIO10_DESC_CS_AS_INT_LEN + \
+                          TUD_AUDIO10_DESC_TYPE_I_FORMAT_LEN(1) + \
+                          TUD_AUDIO10_DESC_STD_AS_ISO_EP_LEN + TUD_AUDIO10_DESC_CS_AS_ISO_EP_LEN)
+#define AUDIO_DUPLEX_LEN (8 + TUD_AUDIO10_DESC_STD_AC_LEN + TUD_AUDIO10_DESC_CS_AC_LEN(2) + \
+                          AUDIO_CONTROL_TERMINALS_LEN + 2 * AUDIO_STREAM_LEN)
+
 #if CFG_AUDIO_DEBUG
-  #define CONFIG_TOTAL_LEN (TUD_CONFIG_DESC_LEN + TUD_AUDIO10_SPEAKER_STEREO_NOFB_DESC_LEN(1) + TUD_CDC_DESC_LEN + TUD_HID_DESC_LEN)
+  #define CONFIG_TOTAL_LEN (TUD_CONFIG_DESC_LEN + AUDIO_DUPLEX_LEN + TUD_CDC_DESC_LEN + TUD_HID_DESC_LEN)
 #else
-  #define CONFIG_TOTAL_LEN (TUD_CONFIG_DESC_LEN + TUD_AUDIO10_SPEAKER_STEREO_NOFB_DESC_LEN(1) + TUD_CDC_DESC_LEN)
+  #define CONFIG_TOTAL_LEN (TUD_CONFIG_DESC_LEN + AUDIO_DUPLEX_LEN + TUD_CDC_DESC_LEN)
 #endif
 
 uint8_t const desc_configuration[] =
@@ -125,16 +135,41 @@ uint8_t const desc_configuration[] =
   // Attribute: 0x80 = bus powered
   TUD_CONFIG_DESCRIPTOR(1, ITF_NUM_TOTAL, 0, CONFIG_TOTAL_LEN, 0x80, 100),
 
-  // ---- UAC1 Speaker stereo (NO feedback - Windows compatible), 48kHz only ----
-  TUD_AUDIO10_SPEAKER_STEREO_NOFB_DESCRIPTOR(
-    ITF_NUM_AUDIO_CONTROL,
-    2,
-      CFG_TUD_AUDIO_FUNC_1_N_BYTES_PER_SAMPLE_RX,
-      CFG_TUD_AUDIO_FUNC_1_RESOLUTION_RX,
-      EPNUM_AUDIO,
-      CFG_TUD_AUDIO_FUNC_1_EP_OUT_SZ_FS,
-      48000
-  ),
+  // One UAC1 function with independent 48 kHz playback and capture streams.
+  8, TUSB_DESC_INTERFACE_ASSOCIATION, ITF_NUM_AUDIO_CONTROL, 3, TUSB_CLASS_AUDIO, 0, 0, 5,
+  TUD_AUDIO10_DESC_STD_AC(ITF_NUM_AUDIO_CONTROL, 0, 5),
+  TUD_AUDIO10_DESC_CS_AC(0x0100, AUDIO_CONTROL_TERMINALS_LEN,
+                        ITF_NUM_AUDIO_STREAMING, ITF_NUM_AUDIO_CAPTURE),
+  TUD_AUDIO10_DESC_INPUT_TERM(UAC1_ENTITY_INPUT_TERMINAL, AUDIO_TERM_TYPE_USB_STREAMING, 0, 2,
+                              AUDIO10_CHANNEL_CONFIG_LEFT_FRONT | AUDIO10_CHANNEL_CONFIG_RIGHT_FRONT, 0, 0),
+  TUD_AUDIO10_DESC_FEATURE_UNIT(UAC1_ENTITY_FEATURE_UNIT, UAC1_ENTITY_INPUT_TERMINAL, 0,
+                               AUDIO10_FU_CONTROL_BM_MUTE | AUDIO10_FU_CONTROL_BM_VOLUME,
+                               AUDIO10_FU_CONTROL_BM_MUTE | AUDIO10_FU_CONTROL_BM_VOLUME,
+                               AUDIO10_FU_CONTROL_BM_MUTE | AUDIO10_FU_CONTROL_BM_VOLUME),
+  TUD_AUDIO10_DESC_OUTPUT_TERM(UAC1_ENTITY_OUTPUT_TERMINAL, AUDIO_TERM_TYPE_OUT_DESKTOP_SPEAKER,
+                               0, UAC1_ENTITY_FEATURE_UNIT, 0),
+  TUD_AUDIO10_DESC_INPUT_TERM(UAC1_ENTITY_RX_INPUT_TERMINAL, AUDIO_TERM_TYPE_IN_GENERIC_MIC,
+                              0, 1, AUDIO10_CHANNEL_CONFIG_NON_PREDEFINED, 0, 6),
+  TUD_AUDIO10_DESC_OUTPUT_TERM(UAC1_ENTITY_RX_OUTPUT_TERMINAL, AUDIO_TERM_TYPE_USB_STREAMING,
+                               0, UAC1_ENTITY_RX_INPUT_TERMINAL, 0),
+
+  TUD_AUDIO10_DESC_STD_AS_INT(ITF_NUM_AUDIO_STREAMING, 0, 0, 0),
+  TUD_AUDIO10_DESC_STD_AS_INT(ITF_NUM_AUDIO_STREAMING, 1, 1, 0),
+  TUD_AUDIO10_DESC_CS_AS_INT(UAC1_ENTITY_INPUT_TERMINAL, 0, AUDIO10_DATA_FORMAT_TYPE_I_PCM),
+  TUD_AUDIO10_DESC_TYPE_I_FORMAT(2, CFG_TUD_AUDIO_FUNC_1_N_BYTES_PER_SAMPLE_RX,
+                                 CFG_TUD_AUDIO_FUNC_1_RESOLUTION_RX, 48000),
+  TUD_AUDIO10_DESC_STD_AS_ISO_EP(EPNUM_AUDIO, TUSB_XFER_ISOCHRONOUS | TUSB_ISO_EP_ATT_SYNCHRONOUS,
+                                CFG_TUD_AUDIO_FUNC_1_EP_OUT_SZ_FS, 1, 0),
+  TUD_AUDIO10_DESC_CS_AS_ISO_EP(0, AUDIO10_CS_AS_ISO_DATA_EP_LOCK_DELAY_UNIT_UNDEFINED, 0),
+
+  TUD_AUDIO10_DESC_STD_AS_INT(ITF_NUM_AUDIO_CAPTURE, 0, 0, 6),
+  TUD_AUDIO10_DESC_STD_AS_INT(ITF_NUM_AUDIO_CAPTURE, 1, 1, 6),
+  TUD_AUDIO10_DESC_CS_AS_INT(UAC1_ENTITY_RX_OUTPUT_TERMINAL, 0, AUDIO10_DATA_FORMAT_TYPE_I_PCM),
+  TUD_AUDIO10_DESC_TYPE_I_FORMAT(1, 2, 16, USB_RX_AUDIO_RATE),
+  TUD_AUDIO10_DESC_STD_AS_ISO_EP(EPNUM_AUDIO_CAPTURE,
+                                TUSB_XFER_ISOCHRONOUS | TUSB_ISO_EP_ATT_SYNCHRONOUS,
+                                CFG_TUD_AUDIO_FUNC_1_EP_IN_SZ_MAX, 1, 0),
+  TUD_AUDIO10_DESC_CS_AS_ISO_EP(0, AUDIO10_CS_AS_ISO_DATA_EP_LOCK_DELAY_UNIT_UNDEFINED, 0),
 
   // ---- CDC ACM (Serial) ----
   // stridx = 4 (patrz stringi poniżej)
@@ -173,6 +208,7 @@ enum {
   STRID_SERIAL,
   STRID_CDC,       // 4
   STRID_UAC1,      // 5
+  STRID_RX_AUDIO,  // 6
 };
 
 static char const *string_desc_arr[] =
@@ -182,7 +218,8 @@ static char const *string_desc_arr[] =
   "SX1280 QO-100 SSB TX",               // 2: Product
   NULL,                                 // 3: Serial (generated)
   "TX Console",                     // 4: CDC interface string
-  "SSB Audio Input",                    // 5: UAC1 (optional use)
+  "QO-100 USB Audio",                   // 5: UAC1 function
+  "Si4732 RX Audio",                    // 6: receive audio capture
 };
 
 static uint16_t _desc_str[32 + 1];
