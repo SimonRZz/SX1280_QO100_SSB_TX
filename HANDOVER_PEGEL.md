@@ -180,3 +180,83 @@ ZF-Träger ein/aus vergleichen, einen definierten ADC-Eingang gegen den
 LOUT-/Biasweg prüfen und Referenz, Display sowie Versorgung einzeln variieren.
 Dabei tatsächliche Analogauskopplung, Taktbeschaltung und Layout anderer
 DIY-Projekte berücksichtigen. Der Hardwareerfolg dieser Revision steht noch aus.
+
+## Stand 13.–19.11.2026: Boot-Fehler, Vergleich mit IC-705, Ausrichtung
+
+### „Waiting for clock / SI5351: PLL unlocked“
+
+Tritt auch mit dem älteren Stand `f811ff1` auf, ohne Änderung an der
+Hardware. Die Firmware ist damit als Ursache unwahrscheinlich. Taktweg:
+Pico-UART sendet `CFG-TP5` → GPS-TIMEPULSE2 = 24 MHz → SI5351 XA → PLL A.
+Die Boot-Schleife sendet nur die SI5351-Konfiguration erneut, nicht `CFG-TP5`.
+Verdächtig: GPS nimmt die Konfiguration nicht an (Leitung Pico-TX → GPS-RX,
+hängendes Modul, nur vollständiges Stromlosmachen hilft), Kontakt der
+24-MHz-Leitung, Versorgung des GPS. Noch nicht eingegrenzt. Nächster Schritt:
+die alle 2 s ausgegebene Zeile `GPSDO: sig=… clk1=…` ablesen
+(`clk1=los`: keine 24 MHz an XA; `lol`: Signal da, aber falsch;
+`sig=wait utc=--:--:--`: auch kein NMEA vom GPS) und TIMEPULSE/XA mit dem
+TinySA auf einen 24-MHz-Träger prüfen. Ergebnis steht aus.
+
+SI5351 selbst: Chip nur 2,5–3,6 V. Breakout mit Regler an 5 V ändert den
+Ausgangspegel nicht, kann aber je nach Board die I²C-Pull-ups auf 5 V legen.
+Die Pico-Pins vertragen das nicht. Vor 5-V-Betrieb SDA/SCL messen.
+8 mA Drive ≈ +10 dBm an 50 Ω unterhalb ~30 MHz (Praxiswert, kein
+Datenblattwert), bei 144 MHz eher +5 bis +8 dBm.
+
+### Gemessen: Mischer mit IC-705 statt Si4732
+
+Aufbau: Bullseye-LNB, 37-cm-Schüssel, RMS-11X, TinySA als LO auf
+**309 MHz, +9 dBm** (Grundwelle), ZF-Ausgang an IC-705 auf 70 cm,
+Preamp 1, RF-Gain 70 %.
+
+* Rauschen S7, CW-Bake S7–8. Grob 3–6 dB Signal-Rausch-Abstand in
+  SSB-Bandbreite (S-Stufen des IC-705 nicht als 6 dB kalibriert).
+* Mit 30 dB Dämpfungsglied am ZF-Ausgang: kein Signal mehr sichtbar.
+
+Deutung (nicht gemessen, abgeleitet): Das LNB-Rauschen lag am IC-705
+weniger als 30 dB über dessen Eigenrauschen. Die 30 dB vor dem
+70-cm-Empfänger im OE1IAH-Projekt lassen sich deshalb nicht auf diesen
+Aufbau übertragen; dort war mehr Überschuss vorhanden. Der Si4732 hat
+an 50 Ω eine deutlich schlechtere Rauschzahl als der IC-705 mit
+Vorverstärker (Wert nicht gemessen). Wahrscheinlich ist er deshalb
+selbst der rauschbegrenzende Teil. Das stützt den ZF-Vorverstärker
+(~20 dB) vor dem Si4732, ist aber noch nicht bewiesen.
+
+Entscheidender Test, noch offen: Rauschen mit Si4732 anhören und
+LNB-Versorgung abziehen. Wird es um mehr als 10 dB leiser, hört der
+Si4732 das LNB. Ändert es sich kaum, begrenzt der Si4732. Denselben
+Test am IC-705 als Vergleich (RF-Gain 100 %). Weitere Vergleiche:
+IC-705 auf 19,36 MHz hinter dem Mischer mit 720-MHz-LO (trennt LO von
+Si4732/Audioweg); 10–20 dB Dämpfung vor dem Si4732 (bleibt das Knistern
+gleich laut, während das Signal sinkt, entsteht es hinter dem Eingang).
+
+Der TinySA erzeugt je nach Modell oberhalb ~350–800 MHz nicht mehr
+direkt, also schwächer und unsauberer. 720 MHz ist damit ein
+schlechterer LO als 103/309 MHz. Nicht gemessen.
+
+### Schüssel und Ausrichtung
+
+37 cm ≈ 30 dBi (60 cm ≈ 34, 80 cm ≈ 37). Die Schüsselgröße senkt den
+Signal-Rausch-Abstand, nicht den Gesamtpegel des LNB; das Rauschen kommt
+vom LNB. Erwartet bei 37 cm grob 10–15 dB auf der Bake in 2,4 kHz. Die
+gemessenen 3–6 dB lassen also vermutlich Reserve bei Ausrichtung oder
+Polarisation.
+
+Zu prüfen: NB-Transponder ist **vertikal** → LNB-Versorgung **13 V**
+(18 V = horizontal, ~20 dB Verlust). Ausrichtung in Deutschland grob
+Azimut 150–160°, Elevation 28–32°; Offset-Schüssel steht fast
+senkrecht. Feinabgleich mit TinySA (DC-Blocker!) auf den Buckel des
+Breitband-Transponders 741–749 MHz oder IC-705 CW 500 Hz auf die Bake.
+Skew: bei 13 V das LNB auf **Minimum** des (horizontalen)
+Breitband-Buckels drehen, das Minimum ist schärfer als ein Maximum.
+Danach den Test mit abgezogener LNB-Versorgung wiederholen.
+
+### Vergleich mit ATS-Mini (Quellcode gelesen)
+
+ATS-Mini: Quarz 32,768 kHz, LOUT direkt auf analogen NF-Verstärker,
+SSB-AVC an (`setSSBConfig(bw,1,0,1,0,1)`), BFO mit Minus
+(`setSSBBfo(-(fein+cal))`, hier seit `3bb1596` übernommen).
+Unterschiede hier: Rechteck-Referenz aus SI5351, NF über ADC (8 kHz) →
+AGC bis +36 dB → PWM, Mischer mit TinySA-LO ohne ZF-Filter. Welcher davon
+das Rauschen und Knistern verursacht, ist offen. Test: Kopfhörer bzw.
+PAM8302A über 10 µF direkt an LOUT, am Pico vorbei.
