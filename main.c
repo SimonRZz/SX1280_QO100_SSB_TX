@@ -1451,7 +1451,8 @@ static void cfg_print(void) {
     fmt_freq(corr_str, sizeof(corr_str), corrected);
 
     cdc_printf("CFG:\r\n");
-    cdc_printf("  fw=" FW_VERSION "  git=" FW_GIT_ID "  built=" FW_BUILD "\r\n");
+    cdc_printf("  fw=" FW_VERSION "%s  git=" FW_GIT_ID "  built=" FW_BUILD "\r\n",
+               BENCH_MINIMAL ? "  *** BENCH (Pico + Si4732 only) ***" : "");
     cdc_printf("  freq=%s Hz (target)  ppm=%.3f  tx=%s  txpwr=%d dBm\r\n",
                freq_str, g_ppm_correction, g_tx_enabled ? "ON" : "OFF", g_tx_power_max_dbm);
     cdc_printf("  mode=%s  tune=%s  gps=%s  gpsgate=%s  config=%s\r\n",
@@ -2140,7 +2141,10 @@ static void cdc_handle_line(char *line) {
     }
     // Receiver: rx [diag|on|off|usb|lsb|am|freq|vol|bw|bfo|mute]
     if (streqi(argv[0], "rx")) {
-        if (!si4732_present()) {
+        // The monitor and the PC stream work on the ADC alone, so they must
+        // stay usable with no receiver fitted: that is bench step 1.
+        const bool adc_only = (argc >= 2 && (streqi(argv[1], "stream") || streqi(argv[1], "mon")));
+        if (!si4732_present() && !adc_only) {
             cdc_write_str("ERR: no Si4732 on the bus — try 'rx diag'\r\n");
             if (argc >= 2 && streqi(argv[1], "diag")) si4732_diag_print();
             return;
