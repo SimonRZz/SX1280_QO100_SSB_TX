@@ -2031,7 +2031,7 @@ class SX1280ControlApp(ttk.Frame):
         ttk.Button(fr, text="Status", command=lambda: self._send_cmd_safe("rx")).grid(row=2, column=5, padx=4)
         ttk.Button(fr, text="Diag", command=lambda: self._send_cmd_safe("rx diag")).grid(row=2, column=6, padx=4)
         ttk.Label(fr, foreground="gray",
-                  text="Bench-FW: Quarz am Si4732, rx cal 0. 40 m abends in LSB, oder KW-Rundfunk in AM.").grid(
+                  text="Bench-FW: Takt vom Pico (GP8), rx cal 0. 40 m abends in LSB, oder KW-Rundfunk in AM.").grid(
             row=3, column=0, columnspan=7, sticky="w", padx=6, pady=4)
 
         if not HAS_AUDIO:

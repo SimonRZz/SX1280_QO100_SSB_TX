@@ -240,6 +240,9 @@ static void rxmon_set(bool on);
 static bool rxmon_is_on(void);
 static void hpout_set(bool on);
 static bool g_hpout = true;
+// Bench build without a crystal: the Pico itself puts ~32.77 kHz on GP8 for
+// the Si4732's RCLK (see bench_rclk_start()).
+static bool g_pico_rclk = false;
 static uint8_t rxmon_vol_pct(void);
 static void    rxmon_set_agc(bool on);
 static bool    rxmon_agc_on(void);
@@ -1945,6 +1948,7 @@ static bool rx_ensure_rclk(void)
     // With XOSCEN the chip runs its own 32.768 kHz crystal on pins 13/2, and
     // CLK2 must stay off: it would fight the crystal on the same pin.
     if (si4732_get_xoscen()) return true;
+    if (g_pico_rclk) return true;
     if (gpsdo_rclk_enabled()) return true;
     if (gpsdo_set_rclk_enabled(true)) {
         cdc_printf("NOTE: reference clock was off — CLK2 (%lu Hz) enabled\r\n",
@@ -4694,12 +4698,38 @@ static void oled_draw_boot_wait(uint32_t elapsed_ms) {
 // display refresh, no autosave - every one of those is a candidate source of
 // noise, and this build exists to add them back one at a time. What remains:
 // USB (console), the receiver, the ADC monitor and the PWM headphone output.
+// RCLK from the Pico: PWM slice 4 on GP8, integer divider, 50 % duty. At
+// 250 MHz system clock that is 250e6 / 7629 = 32769.7 Hz with no jitter (an
+// integer count, not a fractional divider). The Si4732 is told 32770 Hz, so
+// the remaining error is 9 ppm, about 65 Hz at 7 MHz - irrelevant on the
+// bench. Weak drive and slow slew keep the harmonics down; a 1 kOhm series
+// resistor at the chip helps further.
+#define BENCH_RCLK_PIN 8u
+static void bench_rclk_start(void)
+{
+    const uint32_t fs = clock_get_hz(clk_sys);
+    const uint32_t n  = (fs + 16384u) / 32768u;
+    gpio_set_function(BENCH_RCLK_PIN, GPIO_FUNC_PWM);
+    gpio_set_drive_strength(BENCH_RCLK_PIN, GPIO_DRIVE_STRENGTH_2MA);
+    gpio_set_slew_rate(BENCH_RCLK_PIN, GPIO_SLEW_RATE_SLOW);
+    const uint sl = pwm_gpio_to_slice_num(BENCH_RCLK_PIN);
+    pwm_config c = pwm_get_default_config();
+    pwm_config_set_clkdiv_int(&c, 1);
+    pwm_config_set_wrap(&c, (uint16_t)(n - 1u));
+    pwm_init(sl, &c, true);
+    pwm_set_gpio_level(BENCH_RCLK_PIN, (uint16_t)(n / 2u));
+    si4732_set_rclk_hz((fs + n / 2u) / n);
+    g_pico_rclk = true;
+}
+
 static void bench_main(void)
 {
     si4732_set_log(si4732_log_sink);
     si4732_init();
-    si4732_set_xoscen(true);
-    si4732_set_xoscen_patch(true);
+    // No crystal: external clock from the Pico on RCLK. 'rx xosc 1' switches
+    // to a crystal on pins 13/2 if one is fitted later (then GP8 off pin 13).
+    bench_rclk_start();
+    si4732_set_xoscen(false);
     // The QO-100 LNB offset makes no sense on a bench antenna.
     si4732_set_cal_hz(0);
     // No headphones on the bench: audio goes to the PC ('rx stream'), and the
@@ -4714,12 +4744,14 @@ static void bench_main(void)
         if (!greeted && tud_cdc_connected()) {
             greeted = true;
             cdc_write_str("\r\n*** BENCH FIRMWARE (minimal) " FW_VERSION " git=" FW_GIT_ID " ***\r\n"
-                          "Si4732 on its own 32.768 kHz crystal (pins 13/2), SI5351 CLK2 not used.\r\n"
+                          "Si4732 RCLK from the Pico: GP8 (pin 11) -> 1k -> Si4732 pin 13. SI5351 not used.\r\n"
                           "No SX1280, GPS, OLED refresh, core 1. Settings are NOT autosaved.\r\n"
                           "Audio to the PC: rx stream 1 (raw) or 2 (processed); hpout is OFF\r\n"
                           "Pico path only : rx mon thru 1, rx stream 1\r\n"
                           "With receiver  : rx lsb, rx freq 7100, rx stream 1   (or rx am)\r\n");
-            cdc_printf("Si4732: %s\r\n", si4732_present() ? "found" : "NOT FOUND on I2C0 (GP0/GP1)");
+            cdc_printf("Si4732: %s, RCLK %lu Hz on GP8 (sys %lu Hz)\r\n",
+                       si4732_present() ? "found" : "NOT FOUND on I2C0 (GP0/GP1)",
+                       (unsigned long)si4732_rclk_hz(), (unsigned long)clock_get_hz(clk_sys));
             bootlog_flush();
         }
         tight_loop_contents();
