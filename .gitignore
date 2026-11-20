@@ -20,3 +20,4 @@ __pycache__/
 # Si473x SSB patch — a third-party Silicon Labs blob, not ours to redistribute.
 # Fetch it with: sh tools/fetch_ssb_patch.sh
 ssb_patch.h
+build-bench/

@@ -474,7 +474,13 @@ static bool si_power_up(bool with_patch)
     // The library waits 50 ms here before touching the chip again, and the
     // patch upload that follows is unforgiving about being rushed.
     sleep_ms(50);
-    if (si_wait_cts(500u)) return true;
+    if (si_wait_cts(500u)) {
+        // Real crystal (operating XOSCEN set): AN332 asks for up to 500 ms
+        // for the oscillator to settle before the first tune. With an
+        // external clock on RCLK there is nothing to wait for.
+        if (s_xoscen) sleep_ms(500);
+        return true;
+    }
 
     // The reference powers up a SECOND time after the patch, onto a part that
     // is already running, and AN332 says a POWER_UP in that state is refused.

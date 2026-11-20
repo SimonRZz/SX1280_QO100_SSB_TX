@@ -34,6 +34,11 @@
 #include "si4732.h"
 #include "fw_build_info.h"
 
+// Minimal bench build (cmake -DBENCH_MINIMAL=ON): see bench_main().
+#ifndef BENCH_MINIMAL
+#define BENCH_MINIMAL 0
+#endif
+
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -220,6 +225,10 @@ static void    rxmon_set_hang(uint16_t ms);
 // Display RSSI/SNR polling over I2C, 5 Hz. Switchable to test it as a
 // source of crackle in the headphones. Not persisted.
 static volatile bool g_rx_rsq_poll = true;
+// rx mon thru 1: play the ADC (GP27) even while the Si4732 is off. Normally
+// the monitor is silenced then; for the bench this is how the Pico's own audio
+// path (bias divider, ADC, AGC, PWM) is listened to with nothing in front.
+static volatile bool g_rx_thru = false;
 static uint8_t rxmon_vol_pct(void);
 static void    rxmon_set_agc(bool on);
 static bool    rxmon_agc_on(void);
@@ -1536,6 +1545,7 @@ static void cmd_help(void) {
         "  rx mon maxgain <0..36> - AGC gain ceiling in dB (default 36)\r\n"
         "  rx mon hang <0..3000>  - AGC hold after a signal, ms (default 400)\r\n"
         "  rx mon poll 0|1      - 5 Hz RSSI polling for the display (crackle test)\r\n"
+        "  rx mon thru 0|1      - ADC GP27 to headphones even with the Si4732 off\r\n"
         "  rx agc [on|off|<n>]  - front-end attenuator. The index is attenuation, so 0\r\n"
         "                         is full gain. 'off' pins it open for measuring.\r\n"
         "  rx xosc <0|1>        - POWER_UP crystal-oscillator bit; 0 = external RCLK\r\n"
@@ -1919,6 +1929,9 @@ static void bootlog_flush(void) {
 // every point where the receiver is about to be used.
 static bool rx_ensure_rclk(void)
 {
+    // With XOSCEN the chip runs its own 32.768 kHz crystal on pins 13/2, and
+    // CLK2 must stay off: it would fight the crystal on the same pin.
+    if (si4732_get_xoscen()) return true;
     if (gpsdo_rclk_enabled()) return true;
     if (gpsdo_set_rclk_enabled(true)) {
         cdc_printf("NOTE: reference clock was off — CLK2 (%lu Hz) enabled\r\n",
@@ -2300,6 +2313,12 @@ static void cdc_handle_line(char *line) {
                 long v = strtol(argv[3], NULL, 10);
                 if (v < 0 || v > 3000) { cdc_write_str("ERR: rx mon hang 0..3000 (ms)\r\n"); return; }
                 rxmon_set_hang((uint16_t)v);
+            } else if (argc >= 4 && streqi(argv[2], "thru")) {
+                uint8_t v;
+                if (!parse_bool(argv[3], &v)) { cdc_write_str("ERR: rx mon thru 0|1\r\n"); return; }
+                g_rx_thru = (v != 0);
+                cdc_printf("OK rx mon thru=%d (1 = ADC GP27 audible even with the Si4732 off)\r\n",
+                           g_rx_thru ? 1 : 0);
             } else if (argc >= 4 && streqi(argv[2], "poll")) {
                 uint8_t v;
                 if (!parse_bool(argv[3], &v)) { cdc_write_str("ERR: rx mon poll 0|1\r\n"); return; }
@@ -2395,7 +2414,7 @@ static void cdc_handle_line(char *line) {
             // chip switches on its crystal amplifier and works against the
             // clock we feed into RCLK, with no crystal to settle it. It has
             // cost one round of "AM stopped working too", so say so every time.
-            if (si4732_get_xoscen())
+            if (si4732_get_xoscen() && !BENCH_MINIMAL)
                 cdc_write_str("WARN: xoscen=1 expects a crystal on pins 13/2. This board "
                               "has none,\r\n      so nothing will tune while it is set. "
                               "Back to normal: 'rx xosc 0'.\r\n");
@@ -3838,7 +3857,7 @@ static void rxmon_task(void)
         // Nothing to listen to while the Si4732 is powered down - and with no
         // signal the AGC winds up to +36 dB and plays the ADC's own noise and
         // the supply ripple on its bias divider. Silence instead.
-        if (!si4732_is_on()) { y = 0.0f; s_rx_gain = 1.0f; s_rx_env = 0.0f; }
+        if (!si4732_is_on() && !g_rx_thru) { y = 0.0f; s_rx_gain = 1.0f; s_rx_env = 0.0f; }
         // The AGC follows an envelope, and a transient outruns any envelope.
         // This limiter is what actually keeps a crash out of your ears.
         if (y >  0.98f) y =  0.98f;
@@ -4587,6 +4606,41 @@ static void oled_draw_boot_wait(uint32_t elapsed_ms) {
 // ==========================================================
 // MAIN (CORE0): init + DSP producer
 // ==========================================================
+#if BENCH_MINIMAL
+// Minimal bench build: Pico + Si4732 with its own 32.768 kHz crystal, nothing
+// else required. No clock gate, no SX1280, no core 1, no GPS service, no
+// display refresh, no autosave - every one of those is a candidate source of
+// noise, and this build exists to add them back one at a time. What remains:
+// USB (console), the receiver, the ADC monitor and the PWM headphone output.
+static void bench_main(void)
+{
+    si4732_set_log(si4732_log_sink);
+    si4732_init();
+    si4732_set_xoscen(true);
+    si4732_set_xoscen_patch(true);
+    // The QO-100 LNB offset makes no sense on a bench antenna.
+    si4732_set_cal_hz(0);
+
+    bool greeted = false;
+    while (true) {
+        tud_task();
+        cdc_task();
+        rxmon_task();
+        if (!greeted && tud_cdc_connected()) {
+            greeted = true;
+            cdc_write_str("\r\n*** BENCH FIRMWARE (minimal) " FW_VERSION " git=" FW_GIT_ID " ***\r\n"
+                          "Si4732 on its own 32.768 kHz crystal (pins 13/2), SI5351 CLK2 not used.\r\n"
+                          "No SX1280, GPS, OLED refresh, core 1. Settings are NOT autosaved.\r\n"
+                          "Pico path only : rx mon thru 1, rx mon 1\r\n"
+                          "With receiver  : rx lsb, rx freq 7100, rx mon 1   (or rx am)\r\n");
+            cdc_printf("Si4732: %s\r\n", si4732_present() ? "found" : "NOT FOUND on I2C0 (GP0/GP1)");
+            bootlog_flush();
+        }
+        tight_loop_contents();
+    }
+}
+#endif
+
 int main(void) {
     bool ok = set_sys_clock_khz(250000, false);
     if (!ok) set_sys_clock_khz(200000, true);
@@ -4665,6 +4719,9 @@ int main(void) {
     // Stage 2 (non-blocking): GPS discipline (UTC) only gates TX via
     // tx_allowed() — the UI, CDC and OLED run normally while GPS acquires.
     gpsdo_init();
+#if BENCH_MINIMAL
+    bench_main();      // never returns
+#endif
     {
         const uint32_t boot_ms = to_ms_since_boot(get_absolute_time());
         uint32_t last_status_ms  = 0u;

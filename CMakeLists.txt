@@ -157,4 +157,11 @@ target_sources(SX1280SDR PRIVATE
     ${TINYUSB_FAMILY_DIR}/family.c
 )
 
+# Bench build: Pico + Si4732 on its own crystal only. Separate build dir:
+#   cmake -B build-bench -DBENCH_MINIMAL=ON && cmake --build build-bench
+option(BENCH_MINIMAL "Minimal bench firmware (Si4732 crystal, no SX1280/GPS gate)" OFF)
+if(BENCH_MINIMAL)
+    target_compile_definitions(SX1280SDR PRIVATE BENCH_MINIMAL=1)
+endif()
+
 pico_add_extra_outputs(SX1280SDR)
