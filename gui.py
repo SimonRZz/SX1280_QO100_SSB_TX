@@ -26,9 +26,14 @@ except ImportError:
     HAS_SERIAL = False
 
 try:
-    import pyaudio
     import numpy as np
-    HAS_AUDIO = True
+    HAS_NUMPY = True
+except ImportError:
+    HAS_NUMPY = False
+
+try:
+    import pyaudio
+    HAS_AUDIO = HAS_NUMPY
 except ImportError:
     HAS_AUDIO = False
 
@@ -116,6 +121,9 @@ class SerialWorker:
         self.thread = None
         self.stop_evt = threading.Event()
         self.lock = threading.Lock()
+        # Called from the reader thread with the raw int16-LE bytes of each
+        # audio frame ('rx stream'). Must be quick and thread-safe.
+        self.audio_sink = None
 
     def is_connected(self):
         port, reader = self.ser, self.thread
@@ -157,16 +165,40 @@ class SerialWorker:
             self.ser.write(data)
             self.ser.flush()
 
+    def _split_frames(self, raw, text):
+        # Binary audio frames FF A5 <n> <n x int16 LE> sit between text lines.
+        # 0xFF never occurs in UTF-8, so the first FF starts a frame.
+        while True:
+            i = raw.find(b"\xff")
+            if i < 0:
+                text.extend(raw); raw.clear(); return
+            if i:
+                text.extend(raw[:i]); del raw[:i]
+            if len(raw) < 3:
+                return
+            if raw[1] != 0xA5:
+                del raw[0]; continue
+            need = 3 + 2 * raw[2]
+            if len(raw) < need:
+                return
+            data = bytes(raw[3:need]); del raw[:need]
+            sink = self.audio_sink
+            if sink is not None:
+                try: sink(data)
+                except Exception: pass
+
     def _rx_loop(self, port, stop_evt):
         buf = bytearray()
+        raw = bytearray()
         try:
             while not stop_evt.is_set():
-                chunk = port.read(256)
+                chunk = port.read(4096)
                 with self.lock:
                     if self.ser is not port or self.stop_evt is not stop_evt:
                         break
                 if chunk:
-                    buf.extend(chunk)
+                    raw.extend(chunk)
+                    self._split_frames(raw, buf)
                     while b"\n" in buf:
                         line, _, rest = buf.partition(b"\n")
                         buf = bytearray(rest)
@@ -587,6 +619,132 @@ class Keyer:
             pass
 
 
+class RxAudioPlayer:
+    """Receive audio from the Pico ('rx stream'), 8 kHz int16.
+
+    Plays it on the PC (upsampled to 48 kHz), keeps the last second for the
+    spectrum and level display, and can record a WAV. The Pico's 8000 Hz and
+    the sound card's 48000 Hz are two clocks, so the queue is kept between
+    40 and 300 ms by dropping or repeating, which is inaudible for this use.
+    """
+    FS = 8000
+    OUT_FS = 48000
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.q = bytearray()           # pending int16 at 8 kHz
+        self.hist = np.zeros(self.FS, dtype=np.float32)
+        self.samples_total = 0
+        self.gain = 1.0                # linear PC-side gain
+        self.volume = 0.5
+        self.play = True
+        self.wav = None
+        self.pa = None
+        self.stream = None
+        self.running = False
+        self.thread = None
+        self.underruns = 0
+        self._last = 0.0
+
+    def feed(self, data: bytes):
+        a = np.frombuffer(data, dtype="<i2")
+        with self.lock:
+            self.samples_total += len(a)
+            f = a.astype(np.float32) / 32768.0
+            self.hist = np.concatenate((self.hist[len(f):], f))
+            if self.play:
+                self.q.extend(data)
+                if len(self.q) > 2 * int(0.3 * self.FS):        # > 300 ms behind
+                    del self.q[:len(self.q) - 2 * int(0.1 * self.FS)]
+            if self.wav is not None:
+                try: self.wav.writeframes(data)
+                except Exception: pass
+
+    def snapshot(self):
+        with self.lock:
+            return self.hist.copy(), self.samples_total
+
+    def start(self):
+        if not HAS_AUDIO or self.running:
+            return   # without pyaudio: spectrum, level and recording still work
+        try:
+            if self.pa is None:
+                self.pa = pyaudio.PyAudio()
+            self.stream = self.pa.open(format=pyaudio.paInt16, channels=1,
+                                       rate=self.OUT_FS, output=True,
+                                       frames_per_buffer=960)
+        except Exception as e:
+            print(f"RX audio: {e}")
+            self.stream = None
+            return
+        self.running = True
+        self.thread = threading.Thread(target=self._loop, daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        self.running = False
+        if self.thread:
+            self.thread.join(timeout=1.0)
+        self.thread = None
+        if self.stream:
+            try: self.stream.stop_stream(); self.stream.close()
+            except Exception: pass
+        self.stream = None
+
+    def _loop(self):
+        n_in = 160                         # 20 ms at 8 kHz -> 960 at 48 kHz
+        x_src = np.arange(n_in + 1, dtype=np.float32)
+        x_dst = (np.arange(n_in * 6, dtype=np.float32) + 1.0) / 6.0
+        prime = 2 * int(0.04 * self.FS)    # wait for 40 ms before (re)starting
+        primed = False
+        while self.running:
+            blk = None
+            with self.lock:
+                have = len(self.q)
+                if have >= 2 * n_in and (primed or have >= prime):
+                    blk = np.frombuffer(bytes(self.q[:2 * n_in]), dtype="<i2").astype(np.float32)
+                    del self.q[:2 * n_in]
+                    primed = True
+                else:
+                    primed = False
+                g = self.gain * self.volume
+            if blk is None:
+                self.underruns += 1
+                out = np.zeros(n_in * 6, dtype=np.int16)
+            else:
+                # x6 linear interpolation, continuing from the previous block
+                src = np.concatenate(([self._last], blk))
+                y = np.interp(x_dst, x_src, src)
+                self._last = float(blk[-1])
+                out = np.clip(y * g, -32767, 32767).astype(np.int16)
+            try:
+                self.stream.write(out.tobytes(), exception_on_underflow=False)
+            except Exception:
+                time.sleep(0.02)
+
+    def record_start(self, path):
+        import wave
+        w = wave.open(path, "wb")
+        w.setnchannels(1); w.setsampwidth(2); w.setframerate(self.FS)
+        with self.lock:
+            self.wav = w
+
+    def record_stop(self):
+        with self.lock:
+            w, self.wav = self.wav, None
+        if w:
+            try: w.close()
+            except Exception: pass
+
+    def close(self):
+        self.record_stop()
+        self.stop()
+        if self.pa:
+            try: self.pa.terminate()
+            except Exception: pass
+        self.pa = None
+
+
 def list_serial_ports():
     if not HAS_SERIAL:
         return []
@@ -714,6 +872,9 @@ class SX1280ControlApp(ttk.Frame):
         self._cmd_hist_idx   = None
 
         self.audio       = AudioEngine()
+        self.rxaudio     = RxAudioPlayer() if HAS_NUMPY else None
+        if self.rxaudio is not None:
+            self.worker.audio_sink = self.rxaudio.feed
         self.keyer       = Keyer()
         self.key_reader  = None
         self._cw_running      = False
@@ -847,6 +1008,7 @@ class SX1280ControlApp(ttk.Frame):
         self._build_tx_tab()
         self._build_rx_tab()
         self._build_cw_tab()
+        self._build_bench_tab()
         self._build_gpsdo_tab()
         self._build_console_tab()
 
@@ -1758,6 +1920,232 @@ class SX1280ControlApp(ttk.Frame):
             self.rx_cal_var.set(kv.get("cal", self.rx_cal_var.get()))
         if kv.get("bw", "").isdigit():
             self.rx_bw_var.set(kv["bw"])
+
+    # ------------------------------------------------------------------
+    # Bench / Audio: receive audio over USB, spectrum, level, recording,
+    # and the switches for the minimal noise hunt (bench firmware).
+    # ------------------------------------------------------------------
+    def _build_bench_tab(self):
+        sc = ScrollableFrame(self.notebook)
+        self.notebook.add(sc, text="Bench / Audio")
+        tab = sc.inner
+        tab.columnconfigure(0, weight=1)
+
+        self.bn_stream_var = tk.StringVar(value="0")
+        self.bn_play_var   = tk.BooleanVar(value=True)
+        self.bn_vol_var    = tk.DoubleVar(value=50)
+        self.bn_gain_var   = tk.DoubleVar(value=0)
+        self.bn_thru_var   = tk.BooleanVar(value=False)
+        self.bn_hp_var     = tk.BooleanVar(value=False)
+        self.bn_smps_var   = tk.BooleanVar(value=True)
+        self.bn_mode_var   = tk.StringVar(value="lsb")
+        self.bn_freq_var   = tk.StringVar(value="7100")
+        self.bn_sivol_var  = tk.StringVar(value="63")
+        self.bn_bw_var     = tk.StringVar(value="2200")
+        self.bn_agc_var    = tk.BooleanVar(value=True)
+        self.bn_level_var  = tk.StringVar(value="—")
+        self.bn_info_var   = tk.StringVar(value="")
+        self.bn_rec_var    = tk.StringVar(value="● Aufnahme")
+        self._bn_last_total = 0
+        self._bn_last_t = time.monotonic()
+
+        if self.rxaudio is None:
+            ttk.Label(tab, foreground="red",
+                      text="numpy fehlt: pip install numpy pyaudio").grid(
+                row=0, column=0, sticky="w", padx=8, pady=8)
+            return
+
+        # --- audio stream
+        fa = ttk.LabelFrame(tab, text="Audio vom Pico (USB-Seriell, 8 kHz)")
+        fa.grid(row=0, column=0, sticky="ew", padx=8, pady=4)
+        for i, (lbl, val) in enumerate([("Aus", "0"), ("Roh: ADC GP27 (ohne AGC)", "1"),
+                                        ("Verarbeitet (wie Kopfhörer)", "2")]):
+            ttk.Radiobutton(fa, text=lbl, value=val, variable=self.bn_stream_var,
+                            command=self._bn_set_stream).grid(row=0, column=i, sticky="w", padx=6)
+        ttk.Checkbutton(fa, text="am PC abspielen", variable=self.bn_play_var,
+                        command=self._bn_apply_audio).grid(row=1, column=0, sticky="w", padx=6)
+        ttk.Label(fa, text="Lautstärke").grid(row=1, column=1, sticky="e")
+        ttk.Scale(fa, from_=0, to=100, variable=self.bn_vol_var,
+                  command=lambda _v: self._bn_apply_audio()).grid(row=1, column=2, sticky="ew", padx=6)
+        ttk.Label(fa, text="PC-Verstärkung dB").grid(row=2, column=1, sticky="e")
+        ttk.Scale(fa, from_=0, to=40, variable=self.bn_gain_var,
+                  command=lambda _v: self._bn_apply_audio()).grid(row=2, column=2, sticky="ew", padx=6)
+        self.bn_rec_btn = ttk.Button(fa, textvariable=self.bn_rec_var, command=self._bn_toggle_rec)
+        self.bn_rec_btn.grid(row=2, column=0, sticky="w", padx=6, pady=4)
+        fa.columnconfigure(2, weight=1)
+
+        # --- level + spectrum
+        fs = ttk.LabelFrame(tab, text="Pegel und Spektrum (0–4 kHz, letzte Sekunde)")
+        fs.grid(row=1, column=0, sticky="ew", padx=8, pady=4)
+        ttk.Label(fs, textvariable=self.bn_level_var, font=("TkFixedFont", 10)).grid(
+            row=0, column=0, sticky="w", padx=6)
+        ttk.Label(fs, textvariable=self.bn_info_var, foreground="gray").grid(
+            row=1, column=0, sticky="w", padx=6)
+        self.bn_canvas = tk.Canvas(fs, height=240, background="#101418", highlightthickness=0)
+        self.bn_canvas.grid(row=2, column=0, sticky="ew", padx=6, pady=6)
+        fs.columnconfigure(0, weight=1)
+
+        # --- Pico switches
+        fp = ttk.LabelFrame(tab, text="Pico (Störquellen ein/aus)")
+        fp.grid(row=2, column=0, sticky="ew", padx=8, pady=4)
+        ttk.Checkbutton(fp, text="ADC durchreichen, auch wenn Si4732 aus (rx mon thru)",
+                        variable=self.bn_thru_var,
+                        command=lambda: self._send_cmd_safe(
+                            f"rx mon thru {int(self.bn_thru_var.get())}")).grid(row=0, column=0, sticky="w", padx=6)
+        ttk.Checkbutton(fp, text="Kopfhörer-PWM GP12 läuft (hpout)", variable=self.bn_hp_var,
+                        command=lambda: self._send_cmd_safe(
+                            f"hpout {int(self.bn_hp_var.get())}")).grid(row=1, column=0, sticky="w", padx=6)
+        ttk.Checkbutton(fp, text="SMPS im PWM-Modus (smps pwm)", variable=self.bn_smps_var,
+                        command=lambda: self._send_cmd_safe(
+                            f"smps pwm {int(self.bn_smps_var.get())}")).grid(row=2, column=0, sticky="w", padx=6)
+        ttk.Checkbutton(fp, text="Audio-AGC im Pico (nur 'Verarbeitet')", variable=self.bn_agc_var,
+                        command=lambda: self._send_cmd_safe(
+                            f"rx mon agc {int(self.bn_agc_var.get())}")).grid(row=3, column=0, sticky="w", padx=6)
+
+        # --- receiver
+        fr = ttk.LabelFrame(tab, text="Si4732")
+        fr.grid(row=3, column=0, sticky="ew", padx=8, pady=4)
+        for i, m in enumerate(["am", "lsb", "usb"]):
+            ttk.Radiobutton(fr, text=m.upper(), value=m, variable=self.bn_mode_var).grid(
+                row=0, column=i, sticky="w", padx=6)
+        ttk.Button(fr, text="Ein (Modus)", command=lambda: self._send_cmd_safe(
+            f"rx {self.bn_mode_var.get()}")).grid(row=0, column=3, padx=4)
+        ttk.Button(fr, text="Aus", command=lambda: self._send_cmd_safe("rx off")).grid(row=0, column=4, padx=4)
+        ttk.Label(fr, text="Frequenz kHz").grid(row=1, column=0, sticky="e")
+        e = ttk.Entry(fr, textvariable=self.bn_freq_var, width=10)
+        e.grid(row=1, column=1, sticky="w", padx=4)
+        e.bind("<Return>", lambda _e: self._bn_set_freq())
+        ttk.Button(fr, text="Setzen", command=self._bn_set_freq).grid(row=1, column=2, padx=4)
+        for j, (lbl, d) in enumerate([("−1k", -1.0), ("−0.1", -0.1), ("+0.1", 0.1), ("+1k", 1.0)]):
+            ttk.Button(fr, text=lbl, width=5, command=lambda d=d: self._bn_step(d)).grid(
+                row=1, column=3 + j, padx=2)
+        ttk.Label(fr, text="Vol 0..63").grid(row=2, column=0, sticky="e")
+        ve = ttk.Entry(fr, textvariable=self.bn_sivol_var, width=6)
+        ve.grid(row=2, column=1, sticky="w", padx=4)
+        ve.bind("<Return>", lambda _e: self._send_cmd_safe(f"rx vol {self.bn_sivol_var.get()}"))
+        ttk.Label(fr, text="Bandbreite Hz").grid(row=2, column=2, sticky="e")
+        bw = ttk.Combobox(fr, textvariable=self.bn_bw_var, width=7,
+                          values=["500", "1000", "1200", "2200", "3000", "4000", "6000"])
+        bw.grid(row=2, column=3, sticky="w", padx=4)
+        bw.bind("<<ComboboxSelected>>", lambda _e: self._send_cmd_safe(f"rx bw {self.bn_bw_var.get()}"))
+        ttk.Button(fr, text="Status", command=lambda: self._send_cmd_safe("rx")).grid(row=2, column=5, padx=4)
+        ttk.Button(fr, text="Diag", command=lambda: self._send_cmd_safe("rx diag")).grid(row=2, column=6, padx=4)
+        ttk.Label(fr, foreground="gray",
+                  text="Bench-FW: Quarz am Si4732, rx cal 0. 40 m abends in LSB, oder KW-Rundfunk in AM.").grid(
+            row=3, column=0, columnspan=7, sticky="w", padx=6, pady=4)
+
+        if not HAS_AUDIO:
+            ttk.Label(fa, foreground="red", text="pyaudio fehlt: kein Abspielen, "
+                      "Spektrum und Aufnahme gehen trotzdem (pip install pyaudio)").grid(
+                row=3, column=0, columnspan=3, sticky="w", padx=6)
+        self.master.after(200, self._bn_tick)
+
+    def _bn_set_stream(self):
+        v = self.bn_stream_var.get()
+        self._send_cmd_safe(f"rx stream {v}")
+        self._bn_apply_audio()
+
+    def _bn_apply_audio(self):
+        a = self.rxaudio
+        if a is None:
+            return
+        a.volume = self.bn_vol_var.get() / 100.0
+        a.gain = 10 ** (self.bn_gain_var.get() / 20.0)
+        a.play = bool(self.bn_play_var.get())
+        if self.bn_stream_var.get() != "0" and a.play:
+            a.start()
+        elif not a.play:
+            a.stop()
+
+    def _bn_set_freq(self):
+        f = self.bn_freq_var.get().strip().replace(",", ".")
+        try:
+            float(f)
+        except ValueError:
+            self._log(f"[BENCH] keine Frequenz: {f}", "error")
+            return
+        self._send_cmd_safe(f"rx freq {f}")
+
+    def _bn_step(self, d):
+        try:
+            f = float(self.bn_freq_var.get().replace(",", ".")) + d
+        except ValueError:
+            return
+        self.bn_freq_var.set(f"{f:.1f}")
+        self._bn_set_freq()
+
+    def _bn_toggle_rec(self):
+        a = self.rxaudio
+        if a.wav is None:
+            path = filedialog.asksaveasfilename(defaultextension=".wav",
+                                                filetypes=[("WAV", "*.wav")],
+                                                initialfile=time.strftime("rx_%Y%m%d_%H%M%S.wav"))
+            if not path:
+                return
+            a.record_start(path)
+            self.bn_rec_var.set("■ Stopp")
+            self._log(f"[BENCH] Aufnahme: {path}", "sent")
+        else:
+            a.record_stop()
+            self.bn_rec_var.set("● Aufnahme")
+            self._log("[BENCH] Aufnahme beendet", "sent")
+
+    def _bn_tick(self):
+        try:
+            self._bn_draw()
+        except Exception as e:
+            self._log(f"[BENCH] {e}", "error")
+        self.master.after(250, self._bn_tick)
+
+    def _bn_draw(self):
+        a = self.rxaudio
+        hist, total = a.snapshot()
+        now = time.monotonic()
+        rate = (total - self._bn_last_total) / max(1e-3, now - self._bn_last_t)
+        self._bn_last_total, self._bn_last_t = total, now
+        x = hist - float(np.mean(hist))
+        rms = float(np.sqrt(np.mean(x * x))) + 1e-9
+        pk = float(np.max(np.abs(x))) + 1e-9
+        self.bn_level_var.set(f"RMS {20*np.log10(rms):6.1f} dBFS   Spitze {20*np.log10(pk):6.1f} dBFS")
+        self.bn_info_var.set(f"{rate:5.0f} Samples/s empfangen (soll 8000)   "
+                             f"Aussetzer PC: {a.underruns}")
+        c = self.bn_canvas
+        w = max(200, c.winfo_width()); h = int(c["height"])
+        c.delete("all")
+        n = 1024
+        win = np.hanning(n).astype(np.float32)
+        segs = [x[i:i + n] * win for i in range(0, len(x) - n + 1, n // 2)]
+        if not segs or total == 0:
+            c.create_text(w // 2, h // 2, fill="#8899aa", text="kein Audio — Stream einschalten")
+            return
+        p = np.mean([np.abs(np.fft.rfft(sg)) ** 2 for sg in segs], axis=0)
+        db = 10 * np.log10(p / (np.sum(win) ** 2 / 4) + 1e-14)   # ~dBFS for a sine
+        top, bot = 0.0, -120.0
+        # grid
+        for d in range(0, -121, -20):
+            y = int((top - d) / (top - bot) * (h - 16))
+            c.create_line(30, y, w, y, fill="#26303a")
+            c.create_text(14, y, fill="#6a7a8a", text=str(d), font=("TkDefaultFont", 7))
+        for k in range(0, 4001, 500):
+            xx = 30 + int(k / 4000 * (w - 30))
+            c.create_line(xx, 0, xx, h - 16, fill="#26303a")
+            c.create_text(xx, h - 7, fill="#6a7a8a", text=f"{k}", font=("TkDefaultFont", 7))
+        f = np.arange(len(db)) * (8000 / n)
+        xs = 30 + (f / 4000 * (w - 30))
+        ys = np.clip((top - db) / (top - bot) * (h - 16), 0, h - 16)
+        pts = np.column_stack((xs, ys)).ravel().tolist()
+        c.create_line(*pts, fill="#58c4ff")
+        # strongest lines, labelled: hum, PWM/SMPS beats, whistles
+        # local maxima, at least 50 Hz apart, strongest first
+        idx = []
+        for i in np.argsort(db[4:])[::-1] + 4:
+            if all(abs(int(i) - j) > 6 for j in idx):
+                idx.append(int(i))
+            if len(idx) == 4:
+                break
+        for i in idx:
+            c.create_text(xs[i], max(8, ys[i] - 8), fill="#ffcc66",
+                          text=f"{f[i]:.0f} Hz", font=("TkDefaultFont", 7))
 
     def _build_gpsdo_tab(self):
         tab = ttk.Frame(self.notebook, padding=10)
@@ -2711,6 +3099,8 @@ def main():
     def on_close():
         app._cw_stop()
         app.audio.close()
+        if app.rxaudio is not None:
+            app.rxaudio.close()
         app._disconnect()
         root.destroy()
 

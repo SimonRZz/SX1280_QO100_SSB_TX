@@ -229,6 +229,17 @@ static volatile bool g_rx_rsq_poll = true;
 // the monitor is silenced then; for the bench this is how the Pico's own audio
 // path (bias divider, ADC, AGC, PWM) is listened to with nothing in front.
 static volatile bool g_rx_thru = false;
+// rx stream 0|1|2: the monitor's 8 kHz samples to the PC over the CDC port,
+// interleaved with the text as binary frames:  FF A5 <n> then n int16 LE.
+// 0xFF never occurs in UTF-8 text, so the host can find frames unambiguously.
+// 1 = raw ADC (DC removed, x16, before CW filter and AGC), 2 = what the
+// headphones get (after filter, AGC and limiter).
+static volatile uint8_t g_rx_stream = 0;
+static uint32_t g_rx_stream_drop = 0;
+static void rxmon_set(bool on);
+static bool rxmon_is_on(void);
+static void hpout_set(bool on);
+static bool g_hpout = true;
 static uint8_t rxmon_vol_pct(void);
 static void    rxmon_set_agc(bool on);
 static bool    rxmon_agc_on(void);
@@ -1546,6 +1557,8 @@ static void cmd_help(void) {
         "  rx mon hang <0..3000>  - AGC hold after a signal, ms (default 400)\r\n"
         "  rx mon poll 0|1      - 5 Hz RSSI polling for the display (crackle test)\r\n"
         "  rx mon thru 0|1      - ADC GP27 to headphones even with the Si4732 off\r\n"
+        "  rx stream 0|1|2      - monitor audio to the PC (1 raw ADC, 2 processed)\r\n"
+        "  hpout 0|1            - headphone PWM on GP12 running / stopped\r\n"
         "  rx agc [on|off|<n>]  - front-end attenuator. The index is attenuation, so 0\r\n"
         "                         is full gain. 'off' pins it open for measuring.\r\n"
         "  rx xosc <0|1>        - POWER_UP crystal-oscillator bit; 0 = external RCLK\r\n"
@@ -2292,6 +2305,21 @@ static void cdc_handle_line(char *line) {
             return;
         }
         // rx mon [0|1] | rx mon vol <0..100> | rx mon agc [0|1]
+        if (streqi(argv[1], "stream")) {
+            if (argc >= 3) {
+                long v = strtol(argv[2], NULL, 10);
+                if (v < 0 || v > 2) { cdc_write_str("ERR: rx stream 0|1|2 (off, raw ADC, processed)\r\n"); return; }
+                if (v && !rxmon_is_on()) {
+                    if (g_audio_src == AUDIO_SRC_MIC) g_audio_src = AUDIO_SRC_PC;
+                    rxmon_set(true);
+                }
+                g_rx_stream = (uint8_t)v;
+                g_rx_stream_drop = 0;
+            }
+            cdc_printf("OK rx stream=%u drops=%lu (8000 Hz int16, frames FF A5 n)\r\n",
+                       (unsigned)g_rx_stream, (unsigned long)g_rx_stream_drop);
+            return;
+        }
         if (streqi(argv[1], "mon")) {
             if (argc >= 4 && streqi(argv[2], "vol")) {
                 long v = strtol(argv[3], NULL, 10);
@@ -2584,6 +2612,18 @@ static void cdc_handle_line(char *line) {
     // switches in bursts at light load and puts a pulsing ripple on 3V3.
     // The RX audio ADC sits on a divider from 3V3, so that ripple goes
     // straight into the headphones. Not persisted.
+    // hpout 0|1 - headphone PWM on GP12. 0 makes the pin a plain low output,
+    // so the 10-bit PWM stops switching altogether (noise-source test).
+    if (streqi(argv[0], "hpout")) {
+        uint8_t v;
+        if (argc >= 2) {
+            if (!parse_bool(argv[1], &v)) { cdc_write_str("ERR: hpout 0|1\r\n"); return; }
+            hpout_set(v != 0);
+        }
+        cdc_printf("OK hpout=%d (GP12 headphone PWM %s)\r\n", g_hpout ? 1 : 0,
+                   g_hpout ? "running" : "stopped, pin held low");
+        return;
+    }
     if (streqi(argv[0], "smps")) {
         if (argc >= 3 && streqi(argv[1], "pwm")) {
             uint8_t v;
@@ -3779,6 +3819,43 @@ static void adc_select_source(uint8_t which)
     s_rx_rd = mic_wr_index();
 }
 
+// Frames of 64 samples (131 bytes). A frame is written whole or not at all:
+// half a frame would desynchronise the host, a dropped one is just a gap.
+#define RXS_N 64u
+static int16_t  s_rxs[RXS_N];
+static uint32_t s_rxs_n = 0;
+static void rx_stream_push(int16_t v)
+{
+    s_rxs[s_rxs_n++] = v;
+    if (s_rxs_n < RXS_N) return;
+    s_rxs_n = 0;
+#if CFG_TUD_CDC
+    if (!tud_cdc_connected()) return;
+    uint8_t f[3 + 2u * RXS_N];
+    f[0] = 0xFF; f[1] = 0xA5; f[2] = (uint8_t)RXS_N;
+    memcpy(&f[3], s_rxs, sizeof s_rxs);            // RP2350 is little-endian
+    if (tud_cdc_write_available() < sizeof f) {
+        tud_cdc_write_flush();
+        g_rx_stream_drop++;
+        return;
+    }
+    tud_cdc_write(f, sizeof f);
+    tud_cdc_write_flush();
+#endif
+}
+
+static void hpout_set(bool on)
+{
+    g_hpout = on;
+    if (on) {
+        gpio_set_function(PIN_AUDIO_OUT, GPIO_FUNC_PWM);
+    } else {
+        gpio_init(PIN_AUDIO_OUT);
+        gpio_set_dir(PIN_AUDIO_OUT, GPIO_OUT);
+        gpio_put(PIN_AUDIO_OUT, 0);
+    }
+}
+
 // Called from every service point on core 0. Consumes whatever the ADC has
 // produced, levels it, and hands finished 8 kHz samples to the interrupt.
 static void rxmon_task(void)
@@ -3819,7 +3896,8 @@ static void rxmon_task(void)
     if (rx_available() > (MIC_RB_SAMPLES / 2u)) s_rx_rd = mic_wr_index();
 
     while (rx_available() != 0u &&
-           (((s_rxo_wr - s_rxo_rd) & RXO_MASK) < (RXO_MASK - 1u))) {
+           (g_rx_stream || !g_hpout ||
+            (((s_rxo_wr - s_rxo_rd) & RXO_MASK) < (RXO_MASK - 1u)))) {
         const uint16_t raw = s_mic_rb[s_rx_rd];
         s_rx_rd = (s_rx_rd + 1u) & MIC_RB_MASK;
 
@@ -3829,6 +3907,7 @@ static void rxmon_task(void)
 
         // Clipping is judged on what the ADC delivered, before any filtering.
         if (fabsf(x) > s_rx_clip) s_rx_clip = fabsf(x);
+        if (g_rx_stream == 1u) rx_stream_push((int16_t)lrintf(x * 32767.0f));
         if (s_cw_on) x = cw_filter(x);
 
         const float ax = fabsf(x);
@@ -3865,8 +3944,11 @@ static void rxmon_task(void)
         const float ay = fabsf(y);
         if (ay > s_rx_peak) s_rx_peak = ay;
 
-        s_rxo[s_rxo_wr] = (int16_t)(y * 32767.0f);
-        s_rxo_wr = (s_rxo_wr + 1u) & RXO_MASK;
+        if (g_rx_stream == 2u) rx_stream_push((int16_t)(y * 32767.0f));
+        if (((s_rxo_wr - s_rxo_rd) & RXO_MASK) < (RXO_MASK - 1u)) {
+            s_rxo[s_rxo_wr] = (int16_t)(y * 32767.0f);
+            s_rxo_wr = (s_rxo_wr + 1u) & RXO_MASK;
+        }
     }
 }
 
@@ -4620,6 +4702,9 @@ static void bench_main(void)
     si4732_set_xoscen_patch(true);
     // The QO-100 LNB offset makes no sense on a bench antenna.
     si4732_set_cal_hz(0);
+    // No headphones on the bench: audio goes to the PC ('rx stream'), and the
+    // PWM is stopped so it cannot be the noise. 'hpout 1' brings it back.
+    hpout_set(false);
 
     bool greeted = false;
     while (true) {
@@ -4631,8 +4716,9 @@ static void bench_main(void)
             cdc_write_str("\r\n*** BENCH FIRMWARE (minimal) " FW_VERSION " git=" FW_GIT_ID " ***\r\n"
                           "Si4732 on its own 32.768 kHz crystal (pins 13/2), SI5351 CLK2 not used.\r\n"
                           "No SX1280, GPS, OLED refresh, core 1. Settings are NOT autosaved.\r\n"
-                          "Pico path only : rx mon thru 1, rx mon 1\r\n"
-                          "With receiver  : rx lsb, rx freq 7100, rx mon 1   (or rx am)\r\n");
+                          "Audio to the PC: rx stream 1 (raw) or 2 (processed); hpout is OFF\r\n"
+                          "Pico path only : rx mon thru 1, rx stream 1\r\n"
+                          "With receiver  : rx lsb, rx freq 7100, rx stream 1   (or rx am)\r\n");
             cdc_printf("Si4732: %s\r\n", si4732_present() ? "found" : "NOT FOUND on I2C0 (GP0/GP1)");
             bootlog_flush();
         }
